@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "ganache": "^7.0.2",
+    "hardhat": "^2.8.3"
+  }
+}
