@@ -13,58 +13,34 @@ Offset: 0
 function selector, kept at zero for obfuscation purposes
 > 00000000
 
--- uint256 [4:36] --
+# First 32 bytes:
+fffffff # block deadline
+       f # FLAGS
+        ffffffffffffffff # coinbase transfer
+                        ffffffffffffffffffffffffffffffffffffffff # flash swap addr
 
-Offset: 228 bits
-block deadline, 28 bits (3 bytes + 1 nybble)
-reverts if transaction occurs at block height higher than this value
-example, block 14_000_000
+FLAGS:
+_ _ _ _ _ _ _ _
+< RESRVED > | +------- flash swap: zeroForOne
+            +--------- 1 = auto-funded, 0 = manually-funded
 
-Offset: 224 bits
-MODE selector (1 nybble)
+# Next 32 bytes:
+<int256 amountOut, flash swap>
 
-Offset: 164 bits
-coinbase transfer amount, wei (7 bytes + 1 nybble)
+# Following: series of Action records
 
------ WHEN MODE & 0x1 = 0 ----
+f # FLAGS
+ fffffffffffffffffffffff # amountOut
+                        ffffffffffffffffffffffffffffffffffffffff # exchange address
+FLAGS:
+_ _ _ _ x x x x
+| | | +--- uniswap v2/v3 (0 = v2)
+| | +----- zeroForOne
+| +------- when uniswap v3, 1 = auto-funded, 0 = manually funded; when uniswap v2, 1 = extra data follows
++--------- (reserved for internal use; indicates auto-funding status of previous univ3 call)
 
-Offset: 0 bits
-Exchange 1 address: must be Uniswap v3, 20 bytes
-example, uniswap v3 wbtc-usdc
-> 99ac8ca7087fa4a2a1fb6357269965a2014abc35
+When Uniswap v2, followed by 32 bytes
+ffffffffffffffffffffffff # amountIn (NOTE: high bit must be zero if specifying this, otherwise default of 0, address(this) is used)
+                        ffffffffffffffffffffffffffffffffffffffff # address (recipient)
 
-Offset: 163 bits
-Exchange 1: 0-for-1 (1 bit)
-
-Offset: 162 bits
-Exchange 1: send to self? (1 bit)
-
-Offset: 161 bits (1 bit)
-  reserved
-
-Offset: 160 bits (1 bit)
-  reserved
-
--- int[36:68] --
-
-Offset: 0 bits
-exact input to exchange 1, uint256
-
--- reset offset --
-
-List of further exchange interactions, as follows:
-
-  Interaction:
-
-  Offset 0: exchange address (160 bits)
-  92 bits / reserved (for use among callbacks)
-  Offset 252: profit taking mode (1 bit)
-    0 = take profits by transfer to weth
-    1 = take profits by subtraction
-  Offset 253: exchange type (0 = uniswap v2, 1 = uniswap v3)
-  Offset 254: take profits now (1 bit)
-  Offset 255: send to self (1 bit)
-  IF take profits == 1:
-  -- reset offset --
-  Offset 0: uint256, amount to take
 ```
