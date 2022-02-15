@@ -13,8 +13,8 @@ contract Shooter is
     uint160 internal constant MIN_SQRT_RATIO = 4295128739;
     uint160 internal constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
     address internal constant UNISWAP_V3_FACTORY = 0x1F98431c8aD98523631AE4a59f267346ea31F984;
-    // below deployer is for example purposes; private key = 0xf5987d356f3dfbf28c0cd1ba4d3ae438cd2a115918f9150d09a180991ea2803b
-    address internal constant deployer = 0xA3dC6e48Ee8aBF19D3ee5f6aB799D566CC78F93e;
+    // below deployer is for example purposes; private key = 0x02f690498604807a0970b2c39634e3fe71e13920187c6a4c23b7a3a0b3fb4638
+    address internal constant deployer = 0xb8af261A6E3cB246215F252e82B9D2F3b1b5ccCc;
 
     constructor() {
         require(msg.sender == deployer);
