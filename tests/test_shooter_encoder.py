@@ -69,14 +69,15 @@ def parse_logs_for_net_profit(logs: typing.List[web3.types.LogReceipt]) -> typin
 def pretty_print_trace(parsed):
     print()
     print('-----------------------')
-    stack = [(0, x) for x in parsed['actions']]
+    stack = [(0, x) for x in reversed(parsed['actions'])]
     while len(stack) > 0:
         depth, item = stack.pop()
         padding = '    ' * depth
         if item == 'REVERT':
             print(padding + 'REVERT')
         elif 'CALL' in item['type']:
-            print(padding + item['type'] + ' ' + item['callee'])
+            gas_usage =  item['gasStart'] - item['gasEnd']
+            print(padding + item['type'] + ' ' + item['callee'] + f' gas consumed = {gas_usage:,}')
             method_sel = item['args'][:4].hex()
             if method_sel == '128acb08':
                 print(padding + 'UniswapV3Pool.swap()')
@@ -107,6 +108,7 @@ def pretty_print_trace(parsed):
 def decode_trace_calls(trace):
     ctx = {
         'type': 'root',
+        'gasStart': 0,
         'actions': [],
     }
     ctx_stack = [ctx]
@@ -114,41 +116,45 @@ def decode_trace_calls(trace):
         if sl['op'] == 'REVERT':
             ctx['actions'].append('REVERT')
         if sl['op'] == 'RETURN' or sl['op'] == 'STOP' or sl['op'] == 'REVERT':
+            ctx['gasEnd'] = sl['gas']
             ctx = ctx_stack.pop()
         if sl['op'] == 'STATICCALL':
-            dest = sl['stack'][-2]
+            dest = '0x' + sl['stack'][-2].replace('0x', '').lstrip('0').rjust(40, '0')
             arg_offset = int(sl['stack'][-3], base=16)
             arg_len = int(sl['stack'][-4], base=16)
             b = read_mem(arg_offset, arg_len, sl['memory'])
             ctx['actions'].append({
                 'type': 'STATICCALL',
-                'callee': web3.Web3.toChecksumAddress('0x' + dest[-40:]),
+                'gasStart': sl['gas'],
+                'callee': web3.Web3.toChecksumAddress(dest),
                 'args': b,
                 'actions': []
             })
             ctx_stack.append(ctx)
             ctx = ctx['actions'][-1]
         if sl['op'] == 'DELEGATECALL':
-            dest = sl['stack'][-2]
+            dest = '0x' + sl['stack'][-2].replace('0x', '').lstrip('0').rjust(40, '0')
             arg_offset = int(sl['stack'][-4], base=16)
             arg_len = int(sl['stack'][-5], base=16)
             b = read_mem(arg_offset, arg_len, sl['memory'])
             ctx['actions'].append({
                 'type': 'DELEGATECALL',
-                'callee': web3.Web3.toChecksumAddress('0x' + dest[-40:]),
+                'gasStart': sl['gas'],
+                'callee': web3.Web3.toChecksumAddress(dest),
                 'args': b,
                 'actions': []
             })
             ctx_stack.append(ctx)
             ctx = ctx['actions'][-1]
         if sl['op'] == 'CALL':
-            dest = sl['stack'][-2]
+            dest = '0x' + sl['stack'][-2].replace('0x', '').lstrip('0').rjust(40, '0')
             arg_offset = int(sl['stack'][-4], base=16)
             arg_len = int(sl['stack'][-5], base=16)
             b = read_mem(arg_offset, arg_len, sl['memory'])
             ctx['actions'].append({
                 'type': 'CALL',
-                'callee': web3.Web3.toChecksumAddress('0x' + dest[-40:]),
+                'gasStart': sl['gas'],
+                'callee': web3.Web3.toChecksumAddress(dest),
                 'args': b,
                 'actions': []
             })
@@ -169,6 +175,7 @@ def decode_trace_calls(trace):
     return ctx
 
 @pytest.mark.ganache_block_num(14_180_071 - 1)
+@pytest.mark.ganache_mine_mode('TIMED')
 def test_shoot_two_exchanges_basic(
         mainnet_chain: web3.Web3,
         ganache_chain: web3.Web3,
@@ -184,23 +191,25 @@ def test_shoot_two_exchanges_basic(
     print('latest block.......', w3.eth.get_block('latest')['number'])
     replay_to_txn(mainnet_chain, ganache_chain, '0x4bbd3ead05d44408bff9ce948501d7e6179f8d7da5a85ad9c9b05274653d2343')
 
-    coinbase_xfer_amt = w3.toWei('0.01', 'ether')
+    coinbase_xfer_amt = 0 # w3.toWei('0.01', 'ether')
+    target_block = w3.eth.get_block('latest')['number'] + 1
     enc = shooter.encoder.encode_basic(
-        deadline=w3.eth.get_block('latest')['number'] + 2,
+        target_block=target_block,
+        amount_in=0xcceead6811c5d300e0,
         coinbase_xfer=coinbase_xfer_amt,
         exchanges=[
             shooter.encoder.UniswapV3Record(
                 address='0xFd76bE67FFF3BAC84E3D5444167bbC018f5968b6',
-                amount_out=0xcceead6811c5d300e0, # 3171900643996530984,
+                amount_out=0, # unused
                 zero_for_one=False,
-                auto_funded=True,
+                recipient=shooter.encoder.FundsRecipient.SHOOTER
             ),
             shooter.encoder.UniswapV2Record(
                 address='0x18Cd890F4e23422DC4aa8C2D6E0Bd3F3bD8873d8',
                 zero_for_one=True,
                 amount_in_explicit=3154113260025438813,
                 amount_out=3780334308014288994528,
-                recipient='0xFd76bE67FFF3BAC84E3D5444167bbC018f5968b6',
+                recipient=shooter.encoder.FundsRecipient.MSG_SENDER,
             )
         ]
     )
@@ -210,31 +219,13 @@ def test_shoot_two_exchanges_basic(
     print()
 
     assert isinstance(enc, bytes)
-    print('balance', w3.fromWei((w3.eth.get_balance(funded_deployer.address)), 'ether'))
-
-    txn0 = web3.types.TxParams = {
-        'chainId': w3.eth.chain_id,
-        'nonce': w3.eth.get_transaction_count(funded_deployer.address),
-        'from': funded_deployer.address,
-        'to': deployed_shooter,
-        'value': coinbase_xfer_amt * 2,
-        'gas': 400_000,
-        'maxPriorityFeePerGas': 2,
-        'maxFeePerGas': 300 * (10 ** 9),
-    }
-    signed_txn = w3.eth.account.sign_transaction(txn0, funded_deployer.key)
-    tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-    print(receipt)
-    print('balance', w3.fromWei((w3.eth.get_balance(funded_deployer.address)), 'ether'))
-    assert receipt['status'] == 1
 
     print('balance shooter', w3.fromWei((w3.eth.get_balance(deployed_shooter)), 'ether'))
     txn: web3.types.TxParams = {
         'chainId': w3.eth.chain_id,
         'from': funded_deployer.address,
         'to': deployed_shooter,
-        'value': 0,
+        'value': coinbase_xfer_amt,
         'nonce': w3.eth.get_transaction_count(funded_deployer.address),
         'data': enc,
         'gas': 400_000,
@@ -244,13 +235,32 @@ def test_shoot_two_exchanges_basic(
     signed_txn = w3.eth.account.sign_transaction(txn, funded_deployer.key)
     tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    print(receipt)
+    print('target block', target_block)
 
     trace = w3.provider.make_request('debug_traceTransaction', [tx_hash.hex()])
     with open('/mnt/goldphish/trace.txt', mode='w') as fout:
         for l in trace['result']['structLogs']:
             fout.write(str(l) + '\n')
+
+    print('------------------ self trace --------------------------')
+
     parsed = decode_trace_calls(trace['result']['structLogs'])
     pretty_print_trace(parsed)
+
+    print('--------------------------------------------------------')
+
+    print('------------------ old trace --------------------------')
+
+    traceOld = mainnet_chain.provider.make_request('debug_traceTransaction', [
+        '0x4bbd3ead05d44408bff9ce948501d7e6179f8d7da5a85ad9c9b05274653d2343',
+        {'enableMemory': True}
+    ])
+    parsedOld = decode_trace_calls(traceOld['result']['structLogs'])
+    pretty_print_trace(parsedOld)
+
+    print('--------------------------------------------------------')
+
 
     # first call should be to uniswap v3, decode it and ensure the args are as expected
     uv3_call = parsed['actions'][0]

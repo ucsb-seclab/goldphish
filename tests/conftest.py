@@ -19,7 +19,10 @@ import shooter.deploy
 
 def pytest_configure(config):
     config.addinivalue_line(
-        "markers", "ganache_block_num"
+        "markers", "ganache_block_num",
+    )
+    config.addinivalue_line(
+        "markers", "ganache_mine_mode",
     )
 
 @pytest.fixture(scope='function')
@@ -45,11 +48,25 @@ def ganache_chain(request, mainnet_chain: web3.Web3, funded_deployer: LocalAccou
     global _next_ganache_port
     block_num = request.node.get_closest_marker('ganache_block_num').args[0]
 
+    mine_mode = request.node.get_closest_marker('ganache_mine_mode')
+
+    if mine_mode is None:
+        mine_mode = 'INSTANT'
+    else:
+        mine_mode = mine_mode.args[0]
+    assert mine_mode in ['INSTANT', 'TIMED']
+
     old_block = mainnet_chain.eth.get_block(block_num)
     old_ts = old_block['timestamp']
 
     assert isinstance(block_num, int)
     assert block_num > 0
+
+    extra_args = []
+    if mine_mode == 'TIMED':
+        extra_args += [
+            '--miner.blockTime', '5',
+        ]
 
     p = subprocess.Popen(
         [
@@ -62,8 +79,8 @@ def ganache_chain(request, mainnet_chain: web3.Web3, funded_deployer: LocalAccou
             '--wallet.accounts', f'{funded_deployer.key.hex()},{web3.Web3.toWei(100, "ether")}',
             '--chain.chainId', '1',
             '--chain.time', str(old_ts),
-            '--miner.blockTime', '5',
             '--miner.coinbase', web3.Web3.toChecksumAddress(b'\xa0' * 20) + ' ',
+            *extra_args
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL

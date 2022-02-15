@@ -35,17 +35,49 @@ contract Shooter is
         require(success && (data.length == 0 || abi.decode(data, (bool))), 'ST');
     }
 
-    function maybeDecodeUniswapV2ExtraData(uint256 data) view internal returns (address recipient, uint256 requiredIn) {
-        requiredIn = (data >> 160);
-        uint160 irecipient = uint160(data);
-        if (irecipient == 0x0)
+    function doUniswapV3Swap(
+            address exchange,
+            uint256 amountOut,
+            bool zeroForOne,
+            uint8 recipientCode,
+            uint256 cdata_idx,
+            bytes calldata data
+        ) internal {
+        // uniswap v3
+        // we need to copy the remaining exchange info into memory
+        address recipient;
+        if (recipientCode == 0x0)
         {
+            // send to self
             recipient = address(this);
+        }
+        else if (recipientCode == 0x1)
+        {
+            // send to msg.sender
+            recipient = msg.sender;
         }
         else
         {
-            recipient = address(irecipient);
+            // send to next exchange address
+            recipient = address(uint160(bytes20(data[cdata_idx+(32+12):cdata_idx+(32+12+20)])));
         }
+
+        (bool success,) = exchange.call(
+            abi.encodeWithSelector(
+                IUniswapV3PoolActions.swap.selector,
+                recipient,
+                zeroForOne,
+                -int256(amountOut),
+                (
+                    zeroForOne
+                        ? MIN_SQRT_RATIO + 1
+                        : MAX_SQRT_RATIO - 1
+                ),
+                data[cdata_idx+32:]
+            )
+        );
+
+        require(success);
     }
 
     function uniswapV3SwapCallback(
@@ -53,113 +85,104 @@ contract Shooter is
         int256 amount1Delta,
         bytes calldata data
     ) external {
-        address token0;
-        address token1;
+        address repaymentToken;
+        address lastTokenSentToSelf;
         {
+            address token0;
+            address token1;
             IUniswapV3Pool pool = IUniswapV3Pool(msg.sender);
             token0 = pool.token0();
             token1 = pool.token1();
-            uint24  fee    = pool.fee();
+            uint24 fee = pool.fee();
             CallbackValidation.verifyCallback(
                 UNISWAP_V3_FACTORY,
                 token0,
                 token1,
                 fee
             );
+            (lastTokenSentToSelf, repaymentToken) = amount0Delta < 0
+                ? (token0, token1)
+                : (token1, token0);
         }
 
-        address lastExchange = msg.sender;
-        bool lastZeroForOne = amount0Delta > 0;
-
+        uint8 recipientCode = 0;
         uint256 cdata_idx = 0;
         while (cdata_idx < data.length)
         {
             uint256 cdataNext = uint256(bytes32(data[cdata_idx:cdata_idx+32]));
-            bool zeroForOne = (cdataNext & (0x1 << 249)) != 0;
+
+            // decode flags
+            recipientCode = uint8(cdataNext >> 254);
+            bool zeroForOne = (cdataNext & (0x1 << 253)) != 0;
             address exchange = address(uint160(cdataNext));
             uint256 amountOut = (cdataNext >> 160) & 0xfffffffffffffffffffffff;
 
-            if ((cdata_idx & (0x1 << 248)) != 0)
+            if (cdataNext & (0x1 << 252) != 0)
             {
-                // uniswap v3
-                // we need to copy the remaining exchange info into memory
-                bytes memory cdata = data[cdata_idx+32:];
-
-                // forward the uniswap v3 funding method info into callback
-                cdata[0] = cdata[0] | bytes1(uint8((cdataNext >> 254) & 0x1) << 7);
-
-                (bool success, bytes memory totallyunused) = exchange.call(
-                    abi.encodeWithSelector(
-                        IUniswapV3PoolActions.swap.selector,
-                        address(this),
-                        zeroForOne,
-                        -int256(amountOut),
-                        (
-                            zeroForOne
-                                ? MIN_SQRT_RATIO + 1
-                                : MAX_SQRT_RATIO - 1
-                        ),
-                        cdata
-                    )
-                );
-
-                require(success && totallyunused.length == 64);
+                // broken out to avoid 'stack too deep' error (I guess)
+                doUniswapV3Swap(exchange, amountOut, zeroForOne, recipientCode, cdata_idx, data);
                 // assume remainder was handled recursively
                 break;
             }
             else
             {
-                // address recipient = address(this);
+                address recipient;
 
-                // uniswap v2
-                address recipient = address(this);
-                if (cdataNext & (0x1 << 254) != 0)
                 {
-                    // extradata follows
-                    uint256 requiredInput;
-                    (recipient, requiredInput) = maybeDecodeUniswapV2ExtraData(uint256(bytes32(data[cdata_idx + 32 : cdata_idx + 2 * 32])));
-                    if (requiredInput > 0)
+                    uint256 maybeExtraData = uint256(bytes32(data[cdata_idx + 32 : cdata_idx + 64]));
+                    if (maybeExtraData & uint160(0x00ffffffffffffffffffffffffffffffffffffffff /* leading zero is deliberate */) == 0)
                     {
-                        address lastOutputToken;
-                        // figure out what token we need to send
-                        if (lastExchange == msg.sender)
-                        {
-                            lastOutputToken = lastZeroForOne ? token1 : token0;
-                        }
-                        else
-                        {
-                            // last exchange must necessarily have been v2, since we recurse to do more v3s
-                            lastOutputToken = lastZeroForOne ? IUniswapV2Pair(lastExchange).token1() : IUniswapV2Pair(lastExchange).token0();
-                        }
-                        safeTransfer(lastOutputToken, exchange, requiredInput);
+                        // using extradata mark
+                        uint256 requiredInput = maybeExtraData >> 160;
+                        safeTransfer(lastTokenSentToSelf, exchange, requiredInput);
+                        
+                        cdata_idx += 64;
                     }
-
-                    cdata_idx += 32;
+                    else
+                    {
+                        cdata_idx += 32;
+                    }
                 }
-                cdata_idx += 32;
+
+                if (recipientCode == 0x0)
+                {
+                    // send to self
+                    recipient = address(this);
+                }
+                else if (recipientCode == 0x1)
+                {
+                    // send to msg.sender
+                    recipient = msg.sender;
+                    // only update if we need this info for forwarding payment to another uniswap v2 address
+                    if (cdata_idx < data.length)
+                    {
+                        lastTokenSentToSelf = zeroForOne ? IUniswapV2Pair(exchange).token1() : IUniswapV2Pair(exchange).token0();
+                    }
+                }
+                else
+                {
+                    // send to next exchange address directly
+                    recipient = address(uint160(bytes20(data[cdata_idx+12:cdata_idx+32])));
+                }
+
                 (bool success, ) = exchange.call(
                     abi.encodeWithSelector(
                         IUniswapV2Pair.swap.selector,
-                        zeroForOne ? amountOut : 0,
                         zeroForOne ? 0 : amountOut,
+                        zeroForOne ? amountOut : 0,
                         recipient,
                         new bytes(0)
                     )
                 );
                 require(success);
-
-
-                lastExchange = exchange;
-                lastZeroForOne = zeroForOne;
+                cdata_idx += 32;
             }
         }
 
-        if (uint8(data[0]) & (0x1 << 7) == 0) {
-            // manually funded
-            address neededToken = amount0Delta > 0 ? token0 : token1;
+        if (recipientCode == 0x0) {
+            // must manually forward payment to msg.sender
             int256 neededValue = int256(amount0Delta > 0 ? amount0Delta : amount1Delta);
-            require(neededValue > 0);
-            safeTransfer(neededToken, msg.sender, uint256(neededValue));
+            safeTransfer(repaymentToken, msg.sender, uint256(neededValue));
         }
     }
 
@@ -183,33 +206,49 @@ contract Shooter is
         uint256 input0 = uint256(bytes32(input[4:36]));
         
         {
-            uint deadline = input0 >> 228;
-            if (block.number > deadline)
+            uint blockTarget = input0 >> 240;
+            if ((block.number) & 0xffff != blockTarget)
             {
                 revert();
             }
         }
 
-        uint256 coinbase_xfer = 0xffffffffffffffff & (input0 >> 160);
-
-        // unpack parameters
+        // unpack flags
         address exchange1 = address(uint160(input0));
-        bool zeroForOne  = (input0 & (0x1 << 160)) != 0;
-        int256 amount_in = int256(uint256(bytes32(input[36:68])));
-        require(amount_in > 0);
+        bool zeroForOne  = (input0 & (0x1 << 239)) != 0;
+        int256 amountIn = int256((input0 >> 160) & 0x3fffffffffffffffffff);
+        uint256 coinbase_xfer = 0;
+        address recipient;
+        bytes memory cdata;
+        if (amountIn == 0)
+        {
+            uint256 input1 = uint256(bytes32(input[36:68]));
+            // use extradata for amountIn (and, potentially, coinbase xfer)
+            coinbase_xfer = input1 & 0xffffffffffffffff;
+            amountIn = int256(input1 >> 64);
+            cdata = input[68:];
+            recipient = 
+                (input0 & (0x1 << 238)) == 0
+                ? address(this)
+                : address(uint160(bytes20(input[80:100])));
+        }
+        else
+        {
+            cdata = input[36:];
+            recipient = 
+                (input0 & (0x1 << 238)) == 0
+                ? address(this)
+                : address(uint160(bytes20(input[48:68])));
+        }
+        require(amountIn > 0);
 
-        // we need to copy the remaining exchange info into memory
-        bytes memory cdata = input[68:];
-
-        // forward the uniswap v3 payment method info into callback
-        cdata[0] = cdata[0] | bytes1(uint8((input0 >> (160 + 64 + 1)) & 0x1) << 7);
 
         (bool success, bytes memory data) = exchange1.call(
             abi.encodeWithSelector(
                 IUniswapV3PoolActions.swap.selector,
                 address(this),
                 zeroForOne,
-                amount_in,
+                amountIn,
                 (
                     zeroForOne
                         ? MIN_SQRT_RATIO + 1
@@ -225,8 +264,6 @@ contract Shooter is
         {
             block.coinbase.transfer(coinbase_xfer);
         }
-        
-        return new bytes(0);
     }
 
     /** fallback to accept payments of Ether */
@@ -241,5 +278,10 @@ contract Shooter is
         require(msg.sender == deployer);
         safeTransfer(token, msg.sender, amount);
     }
+
+    // function sellAndWithdrawToken(address token, uint256 amount, address uniswapV3Exchange, )
+    // {
+
+    // }
 
 }

@@ -9,23 +9,29 @@ import web3
 import web3.types
 import enum
 
-from .constants import MAX_AMOUNT_IN_UNISWAP_V2, MAX_AMOUNT_OUT, MAX_COINBASE_XFER, MAX_DEADLINE
+from .constants import MAX_AMOUNT_IN_BRIEF, MAX_AMOUNT_IN_UNISWAP_V2, MAX_AMOUNT_OUT, MAX_COINBASE_XFER, MAX_TARGET_BLOCK, MAX_AMOUNT_IN_SWAP
+
+class FundsRecipient(enum.Enum):
+    SHOOTER = 0x0
+    MSG_SENDER = 0x1
+    NEXT_EXCHANGE = 0x2
 
 class UniswapV2Record(typing.NamedTuple):
     address: str
     amount_out: int
     amount_in_explicit: int
-    recipient: typing.Optional[str]
+    recipient: FundsRecipient
     zero_for_one: bool
 
 class UniswapV3Record(typing.NamedTuple):
     address: str
     amount_out: int
     zero_for_one: bool
-    auto_funded: bool
+    recipient: FundsRecipient
 
 def encode_basic(
-        deadline: int,
+        target_block: int,
+        amount_in: int,
         coinbase_xfer: int,
         exchanges: typing.List[typing.Union[UniswapV2Record, UniswapV3Record]],
     ) -> bytes:
@@ -34,9 +40,11 @@ def encode_basic(
 
     NOTE: `mode` is fixed at 0 for now
     """
-    assert isinstance(deadline, int)
-    assert 0 < deadline
-    assert deadline <= MAX_DEADLINE
+    assert isinstance(amount_in, int)
+    assert 0 <= amount_in
+    assert amount_in <= MAX_AMOUNT_IN_SWAP
+    assert isinstance(target_block, int)
+    assert 0 <= target_block
 
     assert isinstance(coinbase_xfer, int)
     assert 0 <= coinbase_xfer
@@ -44,22 +52,30 @@ def encode_basic(
 
     assert len(exchanges) >= 2
     assert isinstance(exchanges[0], UniswapV3Record)
+    assert exchanges[0].recipient in [FundsRecipient.NEXT_EXCHANGE, FundsRecipient.SHOOTER]
 
     ret =  b''
     # method selector is always zero
     ret += b'\x00' * 4
 
-    deadline_and_flags = deadline << 4
+    first_line = 0
+    first_line |= (target_block & MAX_TARGET_BLOCK) << 240
     if exchanges[0].zero_for_one:
-        deadline_and_flags |= 0x1
-    if exchanges[0].auto_funded:
-        deadline_and_flags |= (0x1 << 1)
-    ret += int.to_bytes(deadline_and_flags, length=4, byteorder='big', signed = False)
-    ret += int.to_bytes(coinbase_xfer, length=8, byteorder='big', signed=False)
-    ret += bytes.fromhex(exchanges[0].address[2:])
-    
-    assert len(ret) == 4 + 32
-    ret += int.to_bytes(exchanges[0].amount_out, length=32, byteorder='big', signed=False)
+        first_line |= (0x1 << 239)
+    if exchanges[0].recipient == FundsRecipient.NEXT_EXCHANGE:
+        first_line |= (0x1 << 238)
+    first_line |= int(exchanges[0].address[2:], base=16)
+
+    # do we need extradata?
+    need_extradata = coinbase_xfer > 0 or amount_in > MAX_AMOUNT_IN_BRIEF
+    if not need_extradata:
+        first_line |= (amount_in << 160)
+        ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
+    else:
+        second_line = coinbase_xfer
+        second_line |= amount_in << 64
+        ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
+        ret += int.to_bytes(second_line, length=32, byteorder='big', signed=False)
 
     for ex in exchanges[1:]:
         assert ex.amount_out > 0
@@ -68,30 +84,30 @@ def encode_basic(
         assert web3.Web3.isChecksumAddress(ex.address)
         assert isinstance(ex.zero_for_one, bool)
 
-        flags = 0
-        if isinstance(ex, UniswapV3Record):
-            assert isinstance(ex.auto_funded, bool)
-            flags |= (0x1 << 4)
-            if not ex.auto_funded:
-                flags |= (0x1 << 6)
-        if ex.zero_for_one:
-            flags |= (0x1 << 5)
- 
-        addr_int = int.from_bytes(bytes.fromhex(ex.address[2:]), byteorder='big', signed=False)
+        first_line = 0
 
-        action = (flags << (256 - 8)) | (ex.amount_out << 160) | addr_int
-        if isinstance(ex, UniswapV2Record):
-            extra_details = 0x0
-            if ex.recipient is not None:
-                assert web3.Web3.isChecksumAddress(ex.recipient)
-                extra_details |= int.from_bytes(bytes.fromhex(ex.recipient[2:]), byteorder='big', signed=False)
-            if ex.amount_in_explicit > 0:
-                assert isinstance(ex.amount_in_explicit, int)
-                assert ex.amount_in_explicit <= MAX_AMOUNT_IN_UNISWAP_V2
-                extra_details |= (ex.amount_in_explicit << 160)
-            if extra_details != 0x0:
-                action |= (0x1 << 6) << (256 - 8)
-                ret += int.to_bytes(action, length=32, byteorder='big', signed=False)
-                ret += int.to_bytes(extra_details, length=32, byteorder='big', signed=False)
+        # handle flags
+        if isinstance(ex, UniswapV3Record):
+            first_line |= 0x1 << 252
+        if ex.zero_for_one:
+            first_line |= 0x1 << 253
+        first_line |= int(ex.recipient.value) << 254
+ 
+        # add address
+        first_line |= int(ex.address[2:], base=16)
+
+        # add amount out
+        first_line |= ex.amount_out << 160
+
+        ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
+
+        if isinstance(ex, UniswapV2Record) and ex.amount_in_explicit > 0:
+            assert ex.amount_in_explicit < MAX_AMOUNT_IN_UNISWAP_V2
+            ret += int.to_bytes(
+                ex.amount_in_explicit << 160,
+                length=32,
+                byteorder='big',
+                signed=False
+            )
 
     return ret
