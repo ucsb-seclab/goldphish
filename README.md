@@ -6,7 +6,7 @@ It is planned to support Uniswap v3, v2, and SushiSwap (which is uniswap v2 abi-
 
 ## Planning
 
-### Invocation ABI
+### Invocation ABI                                                 
 
 ```
 Offset: 0
@@ -14,33 +14,35 @@ function selector, kept at zero for obfuscation purposes
 > 00000000
 
 # First 32 bytes:
-fffffff # block deadline
-       f # FLAGS
-        ffffffffffffffff # coinbase transfer
+ffff # block target
+    / # FLAGS
+    /fffffffffffffffffff # amount in (brief)
                         ffffffffffffffffffffffffffffffffffffffff # flash swap addr
 
 FLAGS:
-_ _ _ _ _ _ _ _
-< RESRVED > | +------- flash swap: zeroForOne
-            +--------- 1 = auto-funded, 0 = manually-funded
+_ _ x x
+| | +-+--- belongs to amount in (brief)
+| +------- 0 = send to self, 1 = send to next exchange addr
++--------- flash swap: zeroForOne
 
-# Next 32 bytes:
-<int256 amountOut, flash swap>
+IF amount in == 0, use extradata below
+
+Extradata, if included (following 32 bytes)
+ffffffffffffffffffffffffffffffffffffffffffffffff # amount in, (extended) flash swap
+                                                ffffffffffffffff # coinbase xfer (wei)
 
 # Following: series of Action records
 
 f # FLAGS
- fffffffffffffffffffffff # amountOut
+ fffffffffffffffffffffff # amountOut or, when amountOut can be inferred in uniswap v2, amountIn
                         ffffffffffffffffffffffffffffffffffffffff # exchange address
 FLAGS:
 _ _ _ _ x x x x
-| | | +--- uniswap v2/v3 (0 = v2)
-| | +----- zeroForOne
-| +------- when uniswap v3, 1 = auto-funded, 0 = manually funded; when uniswap v2, 1 = extra data follows
-+--------- (reserved for internal use; indicates auto-funding status of previous univ3 call)
++-+ | +--- uniswap v2/v3 (0 = v2)
+ |  +----- zeroForOne
+ +------- recipient (0 = self, 1 = msg.sender, 2 = next exchange)
 
-When Uniswap v2, followed by 32 bytes
-ffffffffffffffffffffffff # amountIn (NOTE: high bit must be zero if specifying this, otherwise default of 0, address(this) is used)
-                        ffffffffffffffffffffffffffffffffffffffff # address (recipient)
-
+When Uniswap v2, check if next exchange address is zero; if so, this is the amount to forward from self
+ffffffffffffffffffffffff # amountInFromSelf
+                        0000000000000000000000000000000000000000 # must = 0
 ```

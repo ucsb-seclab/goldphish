@@ -4,6 +4,7 @@ encoder.py
 Packs parameters for the shooter.
 """
 
+import itertools
 import typing
 import web3
 import web3.types
@@ -77,7 +78,7 @@ def encode_basic(
         ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
         ret += int.to_bytes(second_line, length=32, byteorder='big', signed=False)
 
-    for ex in exchanges[1:]:
+    for i, ex in zip(itertools.count(1), exchanges[1:]):
         assert ex.amount_out > 0
         assert ex.amount_out <= MAX_AMOUNT_OUT
         assert len(ex.address) == 42
@@ -96,12 +97,17 @@ def encode_basic(
         # add address
         first_line |= int(ex.address[2:], base=16)
 
-        # add amount out
-        first_line |= ex.amount_out << 160
+        can_infer_amount_out = isinstance(ex, UniswapV2Record) and i == len(exchanges) - 1 and ex.recipient == FundsRecipient.MSG_SENDER
+        if can_infer_amount_out:
+            assert ex.amount_in_explicit < MAX_AMOUNT_IN_UNISWAP_V2
+            first_line |= ex.amount_in_explicit << 160
+        else:
+            # add amount out
+            first_line |= ex.amount_out << 160
 
         ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
 
-        if isinstance(ex, UniswapV2Record) and ex.amount_in_explicit > 0:
+        if not can_infer_amount_out and isinstance(ex, UniswapV2Record) and ex.amount_in_explicit > 0:
             assert ex.amount_in_explicit < MAX_AMOUNT_IN_UNISWAP_V2
             ret += int.to_bytes(
                 ex.amount_in_explicit << 160,

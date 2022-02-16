@@ -13,8 +13,8 @@ contract Shooter is
     uint160 internal constant MIN_SQRT_RATIO = 4295128739;
     uint160 internal constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
     address internal constant UNISWAP_V3_FACTORY = 0x1F98431c8aD98523631AE4a59f267346ea31F984;
-    // below deployer is for example purposes; private key = 0x02f690498604807a0970b2c39634e3fe71e13920187c6a4c23b7a3a0b3fb4638
-    address internal constant deployer = 0xb8af261A6E3cB246215F252e82B9D2F3b1b5ccCc;
+    // below deployer is for example purposes; private key = 0xab1179084d3336336d60b2ed654d99a21c2644cadd89fd3034ee592e931e4a77
+    address internal constant deployer = 0x23E7D87AFF47ba3D65D7Ab2F8cbc9F1BB3DDD32d;
 
     constructor() {
         require(msg.sender == deployer);
@@ -128,6 +128,7 @@ contract Shooter is
             {
                 address recipient;
 
+                if (cdata_idx + 64 <= data.length)
                 {
                     uint256 maybeExtraData = uint256(bytes32(data[cdata_idx + 32 : cdata_idx + 64]));
                     if (maybeExtraData & uint160(0x00ffffffffffffffffffffffffffffffffffffffff /* leading zero is deliberate */) == 0)
@@ -143,21 +144,27 @@ contract Shooter is
                         cdata_idx += 32;
                     }
                 }
+                else
+                {
+                    // this is the last exchange; we can infer the amountOut so actually we need to swap some stuff
+                    safeTransfer(lastTokenSentToSelf, exchange, amountOut);
+                    amountOut = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
+                }
 
                 if (recipientCode == 0x0)
                 {
                     // send to self
                     recipient = address(this);
-                }
-                else if (recipientCode == 0x1)
-                {
-                    // send to msg.sender
-                    recipient = msg.sender;
                     // only update if we need this info for forwarding payment to another uniswap v2 address
                     if (cdata_idx < data.length)
                     {
                         lastTokenSentToSelf = zeroForOne ? IUniswapV2Pair(exchange).token1() : IUniswapV2Pair(exchange).token0();
                     }
+                }
+                else if (recipientCode == 0x1)
+                {
+                    // send to msg.sender
+                    recipient = msg.sender;
                 }
                 else
                 {

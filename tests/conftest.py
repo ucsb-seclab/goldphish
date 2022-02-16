@@ -27,7 +27,7 @@ def pytest_configure(config):
 
 @pytest.fixture(scope='function')
 def funded_deployer():
-    ret: LocalAccount = Account.from_key(bytes.fromhex('0x02f690498604807a0970b2c39634e3fe71e13920187c6a4c23b7a3a0b3fb4638'[2:]))
+    ret: LocalAccount = Account.from_key(bytes.fromhex('0xab1179084d3336336d60b2ed654d99a21c2644cadd89fd3034ee592e931e4a77'[2:]))
     return ret
 
 @pytest.fixture(scope='module')
