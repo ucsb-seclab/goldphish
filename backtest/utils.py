@@ -66,7 +66,7 @@ def get_ganache_fork(w3: web3.Web3, target_block: int) -> typing.Iterator[web3.W
             '--fork.blockNumber', str(target_block),
             '--wallet.accounts', f'{funded_deployer().key.hex()},{web3.Web3.toWei(100, "ether")}',
             '--chain.chainId', '1',
-            '--chain.time', str(old_ts),
+            '--chain.time', str(old_ts * 1_000), # unit conversion needed for some reason -- blame javascript
             '--miner.coinbase', web3.Web3.toChecksumAddress(b'\xa0' * 20) + ' ',
             '--miner.blockTime', '1',
         ],

@@ -189,8 +189,6 @@ def get_arbitrages_from_sample(w3: web3.Web3) -> typing.Generator[web3.types.TxR
                 progress_reporter.observe(1)
 
 def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.TextIOWrapper):
-    # if receipt['transactionHash'].hex() != '0x69e1c1004ef3d7dc227c9bf7c677132828fd772b3fd3b2b722a91fdcec27d6ab':
-    #     return
     l.debug(f'Re-shooting {receipt["transactionHash"].hex()}')
     # attempt to re-run this arbitrage using our own shooter, and record the results
 
@@ -308,6 +306,11 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
         new_receipt = w3_fork.eth.wait_for_transaction_receipt(tx_hash)
         
         if new_receipt['status'] != 1:
+            old_block_ts = w3.eth.get_block(receipt['blockHash'])['timestamp']
+            new_block_ts = w3_fork.eth.get_block(new_receipt['blockHash'])['timestamp']
+            print(f'old block timestamp {old_block_ts:,}')
+            print(f'new block timestamp {new_block_ts:,}')
+
             print(new_receipt)
 
             trace = w3_fork.provider.make_request('debug_traceTransaction', [new_receipt['transactionHash'].hex()])
@@ -341,6 +344,7 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
         old_gasprice = receipt['effectiveGasPrice']
         profit_amount = old_profits[took_profit_in][SAMPLE_ADDR]
         fout.write(f'{receipt["blockNumber"]},{receipt["transactionHash"].hex()},{old_gas},{new_gas},{old_gasprice},{profit_amount}\n')
+        fout.flush()
 
     l.debug('done processing transaction')
 

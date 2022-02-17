@@ -146,9 +146,12 @@ contract Shooter is
                 }
                 else
                 {
-                    // this is the last exchange; we can infer the amountOut so actually we need to swap some stuff
-                    safeTransfer(lastTokenSentToSelf, exchange, amountOut);
-                    amountOut = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
+                    // this is the last exchange; if we can infer the amountOut so actually we need to swap some stuff
+                    if (recipientCode != 0x0)
+                    {
+                        safeTransfer(lastTokenSentToSelf, exchange, amountOut);
+                        amountOut = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
+                    }
                 }
 
                 if (recipientCode == 0x0)
@@ -168,6 +171,7 @@ contract Shooter is
                 }
                 else
                 {
+                    // gets here
                     // send to next exchange address directly
                     recipient = address(uint160(bytes20(data[cdata_idx+12:cdata_idx+32])));
                 }
@@ -247,13 +251,12 @@ contract Shooter is
                 ? address(this)
                 : address(uint160(bytes20(input[48:68])));
         }
-        require(amountIn > 0);
 
 
         (bool success, bytes memory data) = exchange1.call(
             abi.encodeWithSelector(
                 IUniswapV3PoolActions.swap.selector,
-                address(this),
+                recipient,
                 zeroForOne,
                 amountIn,
                 (

@@ -80,9 +80,6 @@ def decode_trace_calls(trace):
             payload = read_mem(mem_offset, mem_len, sl['memory'])
             reason_offset = int.from_bytes(payload[4:36], byteorder='big', signed=False)
             reason_len = int.from_bytes(payload[36:68], byteorder='big', signed=False)
-            print(payload)
-            print('reason offset', reason_offset)
-            print('reason len', reason_len)
             message = payload[reason_offset + 4 + 32 : reason_offset + 4 + 32 + reason_len]
             ctx['actions'].append({
                 'type': 'REVERT',

@@ -84,6 +84,8 @@ def encode_basic(
         assert len(ex.address) == 42
         assert web3.Web3.isChecksumAddress(ex.address)
         assert isinstance(ex.zero_for_one, bool)
+        if i == len(exchanges) - 1:
+            assert ex.recipient != FundsRecipient.NEXT_EXCHANGE, 'no more exchanges after this one'
 
         first_line = 0
 
