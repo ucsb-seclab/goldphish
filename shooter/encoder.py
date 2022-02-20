@@ -80,10 +80,13 @@ def encode_basic(
 
     for i, ex in zip(itertools.count(1), exchanges[1:]):
         assert ex.amount_out > 0
-        assert ex.amount_out <= MAX_AMOUNT_OUT
         assert len(ex.address) == 42
         assert web3.Web3.isChecksumAddress(ex.address)
         assert isinstance(ex.zero_for_one, bool)
+        # if uniswap v2, must be last exchange to use MSG_SENDER recipient
+        if isinstance(ex, UniswapV2Record):
+            if ex.recipient == FundsRecipient.MSG_SENDER:
+                assert i + 1 == len(exchanges)
         if i == len(exchanges) - 1:
             assert ex.recipient != FundsRecipient.NEXT_EXCHANGE, 'no more exchanges after this one'
 
@@ -99,13 +102,18 @@ def encode_basic(
         # add address
         first_line |= int(ex.address[2:], base=16)
 
+        if isinstance(ex, UniswapV2Record) and ex.amount_in_explicit > 0:
+            assert ex.amount_in_explicit <= MAX_AMOUNT_IN_UNISWAP_V2
+
         can_infer_amount_out = isinstance(ex, UniswapV2Record) and i == len(exchanges) - 1 and ex.recipient == FundsRecipient.MSG_SENDER
         if can_infer_amount_out:
-            assert ex.amount_in_explicit < MAX_AMOUNT_IN_UNISWAP_V2
             first_line |= ex.amount_in_explicit << 160
         else:
-            # add amount out
-            first_line |= ex.amount_out << 160
+            can_infer_all_amounts = isinstance(exchanges[i-1], UniswapV3Record) and isinstance(ex, UniswapV3Record) and ex.recipient == FundsRecipient.MSG_SENDER
+            if not can_infer_all_amounts:
+                # add amount out
+                assert ex.amount_out <= MAX_AMOUNT_OUT
+                first_line |= ex.amount_out << 160
 
         ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
 

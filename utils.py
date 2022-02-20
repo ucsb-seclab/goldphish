@@ -88,6 +88,8 @@ def decode_trace_calls(trace):
         if sl['op'] == 'RETURN' or sl['op'] == 'STOP' or sl['op'] == 'REVERT':
             if i + 1 < len(trace):
                 ctx['gasEnd'] = trace[i+1]['gas']
+            else:
+                ctx['gasEnd'] = sl['gas'] - sl['gasCost']
             ctx['traceEnd'] = i
             ctx = ctx_stack.pop()
         if sl['op'] == 'STATICCALL':

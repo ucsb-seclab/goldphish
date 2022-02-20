@@ -15,6 +15,7 @@ contract Shooter is
     address internal constant UNISWAP_V3_FACTORY = 0x1F98431c8aD98523631AE4a59f267346ea31F984;
     // below deployer is for example purposes; private key = 0xab1179084d3336336d60b2ed654d99a21c2644cadd89fd3034ee592e931e4a77
     address internal constant deployer = 0x23E7D87AFF47ba3D65D7Ab2F8cbc9F1BB3DDD32d;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
     constructor() {
         require(msg.sender == deployer);
@@ -33,6 +34,24 @@ contract Shooter is
     ) internal {
         (bool success, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, value));
         require(success && (data.length == 0 || abi.decode(data, (bool))), 'ST');
+    }
+
+    function getNextUniswapV2(
+        uint256 idx,
+        bytes calldata data
+    ) pure internal returns (address recipient) {
+        while (true)
+        {
+            require(idx < data.length);
+            uint256 rec = uint256(bytes32(data[idx:idx+32]));
+            if (rec & (0x1 << 252) == 0)
+            {
+                // this is a uniswap v2
+                recipient = address(uint160(rec));
+                break;
+            }
+            idx += 32;
+        }
     }
 
     function doUniswapV3Swap(
@@ -58,8 +77,8 @@ contract Shooter is
         }
         else
         {
-            // send to next exchange address
-            recipient = address(uint160(bytes20(data[cdata_idx+(32+12):cdata_idx+(32+12+20)])));
+            // send to next uniswap v3 exchange address -- need to scan for it
+            recipient = getNextUniswapV2(cdata_idx + 32, data);
         }
 
         (bool success,) = exchange.call(
@@ -86,7 +105,7 @@ contract Shooter is
         bytes calldata data
     ) external {
         address repaymentToken;
-        address lastTokenSentToSelf;
+        address outputToken;
         {
             address token0;
             address token1;
@@ -100,7 +119,7 @@ contract Shooter is
                 token1,
                 fee
             );
-            (lastTokenSentToSelf, repaymentToken) = amount0Delta < 0
+            (outputToken, repaymentToken) = amount0Delta < 0
                 ? (token0, token1)
                 : (token1, token0);
         }
@@ -120,6 +139,12 @@ contract Shooter is
             if (cdataNext & (0x1 << 252) != 0)
             {
                 // broken out to avoid 'stack too deep' error (I guess)
+                if (recipientCode == 0x1)
+                {
+                    // we're paying for the prior uniswap v3 exchange, as gas savings we already had set amountOut to 0
+                    // so infer it here
+                    amountOut = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
+                }
                 doUniswapV3Swap(exchange, amountOut, zeroForOne, recipientCode, cdata_idx, data);
                 // assume remainder was handled recursively
                 break;
@@ -127,6 +152,7 @@ contract Shooter is
             else
             {
                 address recipient;
+                uint256 requiredInput = 0;
 
                 if (cdata_idx + 64 <= data.length)
                 {
@@ -134,23 +160,35 @@ contract Shooter is
                     if (maybeExtraData & uint160(0x00ffffffffffffffffffffffffffffffffffffffff /* leading zero is deliberate */) == 0)
                     {
                         // using extradata mark
-                        uint256 requiredInput = maybeExtraData >> 160;
-                        safeTransfer(lastTokenSentToSelf, exchange, requiredInput);
-                        
-                        cdata_idx += 64;
-                    }
-                    else
-                    {
+                        requiredInput = maybeExtraData >> 160;                        
                         cdata_idx += 32;
                     }
                 }
                 else
                 {
-                    // this is the last exchange; if we can infer the amountOut so actually we need to swap some stuff
+                    // This is the last exchange and we are sending the whole amount to msg.sender; so we can infer the amountOut.
+                    // In this case, interpret amountOut field as amountIn
                     if (recipientCode != 0x0)
                     {
-                        safeTransfer(lastTokenSentToSelf, exchange, amountOut);
+                        requiredInput = amountOut;
                         amountOut = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
+                    }
+                }
+                cdata_idx += 32;
+
+                if (requiredInput > 0)
+                {
+                    if (cdata_idx == 0)
+                    {
+                        // We are forwarding output from the prior uniswap v3, we already know the token address
+                        safeTransfer(WETH, exchange, requiredInput);                        
+                    }
+                    else
+                    {
+                        // address neededToken = zeroForOne ? IUniswapV2Pair(exchange).token0() : IUniswapV2Pair(exchange).token1();
+                        safeTransfer(
+                            WETH, exchange, requiredInput
+                        );
                     }
                 }
 
@@ -158,11 +196,6 @@ contract Shooter is
                 {
                     // send to self
                     recipient = address(this);
-                    // only update if we need this info for forwarding payment to another uniswap v2 address
-                    if (cdata_idx < data.length)
-                    {
-                        lastTokenSentToSelf = zeroForOne ? IUniswapV2Pair(exchange).token1() : IUniswapV2Pair(exchange).token0();
-                    }
                 }
                 else if (recipientCode == 0x1)
                 {
@@ -171,7 +204,6 @@ contract Shooter is
                 }
                 else
                 {
-                    // gets here
                     // send to next exchange address directly
                     recipient = address(uint160(bytes20(data[cdata_idx+12:cdata_idx+32])));
                 }
@@ -186,7 +218,6 @@ contract Shooter is
                     )
                 );
                 require(success);
-                cdata_idx += 32;
             }
         }
 
@@ -241,7 +272,7 @@ contract Shooter is
             recipient = 
                 (input0 & (0x1 << 238)) == 0
                 ? address(this)
-                : address(uint160(bytes20(input[80:100])));
+                : recipient = getNextUniswapV2(68, input); // address(uint160(bytes20(input[80:100])));
         }
         else
         {
@@ -249,7 +280,7 @@ contract Shooter is
             recipient = 
                 (input0 & (0x1 << 238)) == 0
                 ? address(this)
-                : address(uint160(bytes20(input[48:68])));
+                : recipient = getNextUniswapV2(36, input); // address(uint160(bytes20(input[48:68])));
         }
 
 

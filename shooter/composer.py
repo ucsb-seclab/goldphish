@@ -20,6 +20,9 @@ class ExchangeRecord(typing.NamedTuple):
     token_in: str
     token_out: str
 
+    @property
+    def zero_for_one(self) -> bool:
+        return bytes.fromhex(self.token_in[2:]) < bytes.fromhex(self.token_out[2:])
 
 def construct(
         exchanges: typing.List[ExchangeRecord],
@@ -76,100 +79,291 @@ def construct(
 
     excs = []
 
-    # handle first exchange, which is univ3
-    # figure out where to send funds
-    if len(univ2_chain) == 0:
-        send_funds = shooter.encoder.FundsRecipient.SHOOTER
-    else:
-        # if we need to take profit before giving to v2, send to self
-        if univ3_chain[0].amount_out > univ2_chain[0].amount_in:
-            send_funds = shooter.encoder.FundsRecipient.SHOOTER
-        else:
-            if len(univ3_chain) == 1:
-                send_funds = shooter.encoder.FundsRecipient.NEXT_EXCHANGE
-            else:
-                raise NotImplementedError('Not sure how to handle this yet, ideally sends funds directly to the v2 exchange')
-    excs.append(shooter.encoder.UniswapV3Record(
-        univ3_chain[0].address,
-        univ3_chain[0].amount_out,
-        bytes.fromhex(univ3_chain[0].token_in[2:]) < bytes.fromhex(univ3_chain[0].token_out[2:]),
-        send_funds
-    ))
+    # Handle each situation separately, I suppose. This makes the logic perhaps a bit more readable (but repeated).
 
-    for i, exchange in list(enumerate(univ3_chain))[1:]:
-        assert exchange.token_out == univ3_chain[i-1].token_in
-        if exchange.amount_out > univ3_chain[i-1].amount_in:
-            # we're taking profit, must send to self
-            recipient = shooter.encoder.FundsRecipient.SHOOTER
-        else:
-            # we're not taking profit, pay previous exchange directly
-            recipient = shooter.encoder.FundsRecipient.MSG_SENDER
-        excs.append(shooter.encoder.UniswapV3Record(
-            exchange.address,
-            exchange.amount_out,
-            bytes.fromhex(exchange.token_in[2:]) < bytes.fromhex(exchange.token_out[2:]),
-            recipient
-        ))
-    
-    if len(univ2_chain) > 0:
-        # handle first uniswap v2 separately
+    if len(univ3_chain) == 1 and len(univ2_chain) == 1:
         if univ3_chain[0].amount_out > univ2_chain[0].amount_in:
-            # must forward payment from self manually
-            excs.append(shooter.encoder.UniswapV2Record(
-                univ2_chain[0].address,
-                univ2_chain[0].amount_out,
-                amount_in_explicit=univ2_chain[0].amount_in,
-                recipient=shooter.encoder.FundsRecipient.MSG_SENDER if len(univ2_chain) == 1 else shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
-                zero_for_one=bytes.fromhex(univ2_chain[0].token_in[2:]) < bytes.fromhex(univ2_chain[0].token_out[2:]),
-            ))
+            # SITUATION
+            #   (uv3) -- profit --> (uv2) --> (uv3)
+            #
+            #   uv3 -> self
+            #     self -> uv2
+            #     uv2 -> uv3
+            l.debug('Cycle situation 1')
+            excs = [
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[0].address,
+                    amount_out = univ3_chain[0].amount_out,
+                    zero_for_one = univ3_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.SHOOTER,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[0].address,
+                    amount_in_explicit = univ2_chain[0].amount_in,
+                    amount_out = univ2_chain[0].amount_out,
+                    zero_for_one = univ2_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
+                )
+            ]
         else:
-            # assume exchange is already paid; if so, find out whether we're taking profit _after_ this exchange
-            if len(univ2_chain) == 1:
-                next_in = univ3_chain[-1].amount_in
-                if univ2_chain[0].amount_out > next_in:
-                    recipient = shooter.encoder.FundsRecipient.SHOOTER
-                else:
-                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER
-            else:
-                next_in = univ2_chain[1].amount_in
-                if univ2_chain[0].amount_out > next_in:
-                    recipient = shooter.encoder.FundsRecipient.SHOOTER
-                else:
-                    recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE
-            excs.append(shooter.encoder.UniswapV2Record(
-                univ2_chain[0].address,
-                univ2_chain[0].amount_out,
-                amount_in_explicit=0,
-                recipient=recipient,
-                zero_for_one=bytes.fromhex(univ2_chain[0].token_in[2:]) < bytes.fromhex(univ2_chain[0].token_out[2:]),
-            ))
+            l.debug('Cycle situation 2')
+            # SITUATION
+            #   (uv3) --> (uv2) -- profit --> (uv3)
+            #
+            #   uv3 -> self
+            #     self -> uv2
+            #     uv2 -> uv3
+            assert univ2_chain[0].amount_out > univ3_chain[0].amount_in
+            excs = [
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[0].address,
+                    amount_out = univ3_chain[0].amount_out,
+                    zero_for_one = univ3_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[0].address,
+                    amount_in_explicit = 0,
+                    amount_out = univ2_chain[0].amount_out,
+                    zero_for_one = univ2_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.SHOOTER,
+                )
+            ]
+    elif len(univ3_chain) == 1 and len(univ2_chain) == 2:
+        if univ3_chain[0].amount_out > univ2_chain[0].amount_in:
+            l.debug('Cycle situation 3')
+            # SITUATION
+            #   (uv3) -- profit --> (uv2a) --> (uv2b) --> (uv3)
+            #
+            #   uv3 -> self
+            #     self -> uv2a
+            #     uv2a -> uv2b
+            #     uv2b -> uv3
+            excs = [
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[0].address,
+                    amount_out = univ3_chain[0].amount_out,
+                    zero_for_one = univ3_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.SHOOTER,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[0].address,
+                    amount_in_explicit = univ2_chain[0].amount_in,
+                    amount_out = univ2_chain[0].amount_out,
+                    zero_for_one = univ2_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[1].address,
+                    amount_in_explicit = 0,
+                    amount_out = univ2_chain[1].amount_out,
+                    zero_for_one = univ2_chain[1].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
+                )
+            ]
+        elif univ2_chain[0].amount_out > univ2_chain[1].amount_in:
+            l.debug('Cycle situation 4')
+            # SITUATION
+            #   (uv3) --> (uv2a) -- profit --> (uv2b) --> (uv3)
+            #
+            #   uv3 -> uv2a
+            #     uv2a -> self
+            #     self -> uv2b
+            #     uv2b -> uv3
+            excs = [
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[0].address,
+                    amount_out = univ3_chain[0].amount_out,
+                    zero_for_one = univ3_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[0].address,
+                    amount_in_explicit = 0,
+                    amount_out = univ2_chain[0].amount_out,
+                    zero_for_one = univ2_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.SHOOTER,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[1].address,
+                    amount_in_explicit = univ2_chain[1].amount_in,
+                    amount_out = univ2_chain[1].amount_out,
+                    zero_for_one = univ2_chain[1].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
+                )
+            ]
+        else:
+            assert univ2_chain[1].amount_out > univ3_chain[0].amount_in
+            l.debug('Cycle situation 4')
+            # SITUATION
+            #   (uv3) --> (uv2a) --> (uv2b) -- profit --> (uv3)
+            #
+            #   uv3 -> uv2a
+            #     uv2a -> uv2b
+            #     uv2b -> self
+            #     self -> uv3
+            excs = [
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[0].address,
+                    amount_out = univ3_chain[0].amount_out,
+                    zero_for_one = univ3_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[0].address,
+                    amount_in_explicit = 0,
+                    amount_out = univ2_chain[0].amount_out,
+                    zero_for_one = univ2_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.SHOOTER,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[1].address,
+                    amount_in_explicit = univ2_chain[1].amount_in,
+                    amount_out = univ2_chain[1].amount_out,
+                    zero_for_one = univ2_chain[1].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
+                ),
+            ]
+    elif len(univ3_chain) == 2 and len(univ2_chain) == 1:
+        if univ3_chain[0].amount_in < univ3_chain[1].amount_out:
+            l.debug('Cycle situation 5')
+            # SITUATION
+            #   (uv3_1) -- profit --> (uv3_0) --> (uv2) --> (uv3_1)
+            #
+            #   uv3_0 -> uv2
+            #     uv3_1 -> self
+            #       uv2 -> uv3_1
+            #     self -> uv3_0
+            excs = [
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[0].address,
+                    amount_out = univ3_chain[0].amount_out,
+                    zero_for_one = univ3_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE, # here, means 'next uniswap v2 exchange'
+                ),
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[1].address,
+                    amount_out = univ3_chain[1].amount_out,
+                    zero_for_one = univ3_chain[1].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.SHOOTER,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[0].address,
+                    amount_in_explicit = 0,
+                    amount_out = univ2_chain[0].amount_out,
+                    zero_for_one = univ2_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
+                ),
+            ]
+        elif univ3_chain[0].amount_out > univ2_chain[0].amount_in:
+            l.debug('Cycle situation 6')
+            # SITUATION
+            #   (uv3_1) --> (uv3_0) -- profit --> (uv2) --> (uv3_1)
+            #
+            #   uv3_0 -> self
+            #     uv3_1 -> uv3_0
+            #       self -> uv2
+            #       uv2 -> uv3_1
+            excs = [
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[0].address,
+                    amount_out = univ3_chain[0].amount_out,
+                    zero_for_one = univ3_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.SHOOTER,
+                ),
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[1].address,
+                    amount_out = univ3_chain[1].amount_out,
+                    zero_for_one = univ3_chain[1].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[0].address,
+                    amount_in_explicit = univ2_chain[0].amount_in,
+                    amount_out = univ2_chain[0].amount_out,
+                    zero_for_one = univ2_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
+                ),
+            ]
+        else:
+            assert univ2_chain[0].amount_out > univ3_chain[1].amount_in
+            l.debug('Cycle situation 7')
+            # SITUATION
+            #   (uv3_1) --> (uv3_0) --> (uv2) -- profit --> (uv3_1)
+            #
+            #   uv3_0 -> uv2
+            #     uv3_1 -> uv3_0
+            #       uv2 -> self
+            #       self -> uv3_1
+            excs = [
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[0].address,
+                    amount_out = univ3_chain[0].amount_out,
+                    zero_for_one = univ3_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
+                ),
+                shooter.encoder.UniswapV3Record(
+                    address = univ3_chain[1].address,
+                    amount_out = univ3_chain[1].amount_out,
+                    zero_for_one = univ3_chain[1].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
+                ),
+                shooter.encoder.UniswapV2Record(
+                    address = univ2_chain[0].address,
+                    amount_in_explicit = 0,
+                    amount_out = univ2_chain[0].amount_out,
+                    zero_for_one = univ2_chain[0].zero_for_one,
+                    recipient = shooter.encoder.FundsRecipient.SHOOTER,
+                ),
+            ]
+    else:
+        assert len(univ3_chain) == 3
+        assert len(univ2_chain) == 0
+        l.debug(f'Cycle situation 8')
+        # fortunately this is the easy one
+        # SITUATION
+        # (uv3_2) --> (uv3_1) --> (uv3_0) --> (uv3_2) // implicit profit possible along any of these
         
-        # handle second (and last) uniswap v2
-        if len(univ2_chain) > 1:
-            # if we just took profit, send payment manually
-            if univ2_chain[0].amount_out > univ2_chain[1].amount_in:
-                amount_in_explicit = univ2_chain[1].amount_in
-                recipient = shooter.encoder.FundsRecipient.MSG_SENDER
+        # rotate so that profit is at the beginning
+        while not (univ3_chain[0].amount_out > univ3_chain[-1].amount_in):
+            univ3_chain = univ3_chain[1:] + univ3_chain[:1]
+
+        # ensure invariant(s) hold
+        for ex1, ex2 in zip(univ3_chain, (univ3_chain[1:] + univ3_chain[:1])):
+            assert ex1.token_in == ex2.token_out
+        assert univ3_chain[0].amount_out > univ3_chain[-1].amount_in
+
+        # NORMALIZED SITUATION
+        # (uv3_2) --> (uv3_1) --> (uv3_0) -- profit --> (uv3_2)
+        #
+        #   uv3_0 -> self
+        #     uv3_1 -> uv3_0
+        #       uv3_2 -> uv3_1
+        #         self -> uv3_2
+
+        for i, exchange in list(enumerate(univ3_chain)):
+            assert exchange.token_out == univ3_chain[i-1].token_in
+            if exchange.amount_out > univ3_chain[i-1].amount_in:
+                # we're taking profit, must send to self
+                recipient = shooter.encoder.FundsRecipient.SHOOTER
             else:
-                amount_in_explicit = 0
-                # if we take profit after this, then send to self; otherwise send to msg_sender
-                if univ2_chain[1].amount_out > univ3_chain[-1].amount_in:
-                    recipient = shooter.encoder.FundsRecipient.SHOOTER
-                else:
-                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER
-            excs.append(shooter.encoder.UniswapV2Record(
-                univ2_chain[0].address,
-                univ2_chain[0].amount_out,
-                amount_in_explicit=amount_in_explicit,
-                recipient=recipient,
-                zero_for_one=bytes.fromhex(univ2_chain[1].token_in[2:]) < bytes.fromhex(univ2_chain[1].token_out[2:]),
+                # we're not taking profit, pay previous exchange directly
+                recipient = shooter.encoder.FundsRecipient.MSG_SENDER
+            excs.append(shooter.encoder.UniswapV3Record(
+                exchange.address,
+                exchange.amount_out,
+                exchange.zero_for_one,
+                recipient
             ))
+
+    uv3_flash_loaner = next(filter(lambda x: x.address == excs[0].address, univ3_chain))
 
     print(excs)
+    print('in_amount', )
 
     encoded = shooter.encoder.encode_basic(
         target_block,
-        univ3_chain[0].amount_in,
+        uv3_flash_loaner.amount_in,
         coinbase_xfer,
         excs,
     )

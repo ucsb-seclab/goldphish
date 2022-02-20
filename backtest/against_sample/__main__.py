@@ -189,6 +189,8 @@ def get_arbitrages_from_sample(w3: web3.Web3) -> typing.Generator[web3.types.TxR
                 progress_reporter.observe(1)
 
 def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.TextIOWrapper):
+    # if receipt['transactionHash'].hex() != '0x799e3604d946ee543be460adbf9cdac11ec3cb0dbde3d2915b11f98b4a0133ed': # '0xb67e9bf3ac2e6b4f0ca1cb11f7994eaefb3840188532e858cc6d8885bf196b8b':
+    #     return
     l.debug(f'Re-shooting {receipt["transactionHash"].hex()}')
     # attempt to re-run this arbitrage using our own shooter, and record the results
 
@@ -308,10 +310,10 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
         if new_receipt['status'] != 1:
             old_block_ts = w3.eth.get_block(receipt['blockHash'])['timestamp']
             new_block_ts = w3_fork.eth.get_block(new_receipt['blockHash'])['timestamp']
-            print(f'old block timestamp {old_block_ts:,}')
-            print(f'new block timestamp {new_block_ts:,}')
+            l.debug(f'old block timestamp {old_block_ts:,}')
+            l.debug(f'new block timestamp {new_block_ts:,}')
 
-            print(new_receipt)
+            l.debug(new_receipt)
 
             trace = w3_fork.provider.make_request('debug_traceTransaction', [new_receipt['transactionHash'].hex()])
             with open('/mnt/goldphish/trace.txt', mode='w') as fout:
