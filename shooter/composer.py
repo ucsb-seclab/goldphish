@@ -358,8 +358,8 @@ def construct(
 
     uv3_flash_loaner = next(filter(lambda x: x.address == excs[0].address, univ3_chain))
 
-    print(excs)
-    print('in_amount', )
+    l.debug(str(excs))
+    l.debug(f'in_amount {uv3_flash_loaner.amount_in}')
 
     encoded = shooter.encoder.encode_basic(
         target_block,

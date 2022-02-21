@@ -229,81 +229,123 @@ contract Shooter is
     }
 
     fallback(bytes calldata input) external payable returns (bytes memory) {
-        {
-            bytes4 method_sel = bytes4(input[:4]);
-
-            if (method_sel != 0x00000000)
+        assembly {
             {
-                revert();
+                // ensure method sel is 0
+                let method_sel := calldataload(0)
+                method_sel := shr(244, method_sel)
+                if iszero(iszero(method_sel)) { revert(0,0) }
             }
-        }
 
-        {
-            if (msg.sender != deployer)
             {
-                revert();
+                // ensure only authorized caller
+                let msg_sender := caller()
+                if iszero(eq(msg_sender, deployer)) { revert(0,0) }
             }
-        }
 
-        uint256 input0 = uint256(bytes32(input[4:36]));
-        
-        {
-            uint blockTarget = input0 >> 240;
-            if ((block.number) & 0xffff != blockTarget)
             {
-                revert();
+                // load first line
+                let input0 := calldataload(0x4)
+    
+                {
+                    // check block target
+                    let block_target := shr(240, input0)
+                    if iszero(eq(and(number(), 0xffff), block_target)) { revert(0,0) }
+                }
+
+                let exchange1 := and(input0, 0xffffffffffffffffffffffffffffffffffffffff)
+
+                // NOTE: memory from 0x80 and on is free for our use, store our call info there
+                mstore(0x80, shl(224, 0x128acb08)) // method selector for uniswap v3 swap()
+
+                // compute zeroForOne (easy)
+                let zeroForOne := iszero(iszero(and(input0, shl(239, 0x1))))
+                mstore(0xa4, zeroForOne)
+                
+                // store max price (computed from zeroForOne)
+                switch zeroForOne
+                case 0 {
+                    mstore(0xe4, sub(MAX_SQRT_RATIO, 1))
+                }
+                default {
+                    mstore(0xe4, add(MIN_SQRT_RATIO, 1))
+                }
+
+                // compute amountIn (may require loading extradata)
+                let amountInOriginal := and(shr(160, input0), 0x3fffffffffffffffffff)
+                switch amountInOriginal 
+                case 0 {
+                    // amountIn is actually in extradata
+                    let extradata := calldataload(0x24)
+                    mstore(0xc4, shr(64, extradata))
+                }
+                default {
+                    // set amountIn
+                    mstore(0xc4, amountInOriginal)
+                }
+
+                // compute the recipient address, store it in memory too
+                switch and(input0, shl(238, 0x1))
+                case 0 {
+                    // recipient is shooter
+                    mstore(0x84, address())
+                }
+                default {
+                    // recipient is next uniswap v2 exchange -- unfortunately, we need to scan calldata for it
+                    let cdsize := calldatasize()
+                    let i := add(0x24, mul(iszero(amountInOriginal), 0x20)) // account for extradata, if present
+                    for { } lt(i, cdsize) { i := add(i, 0x20) } {
+                        let line := calldataload(i)
+                        if iszero(and(line, shl(252, 0x1))) {
+                            // this is the uniswap v2 address we're looking for
+                            line := and(line, 0xffffffffffffffffffffffffffffffffffffffff)
+                            mstore(0x84, line)
+                            break
+                        }
+                    }
+                    if iszero(lt(i, cdsize)) { revert(0,0) }
+                }
+
+                // store the bytes calldata data (For callback)
+                mstore(0x104, 0xa0)
+                // copy the remaining calldata
+                {
+                    let cdsize := calldatasize()
+                    let additionalCdStart := add(0x24, mul(iszero(amountInOriginal), 0x20))
+                    let additionalCdLen := sub(cdsize, additionalCdStart)
+                    // store the size of data
+                    mstore(0x124, additionalCdLen)
+                    // copy the extra calldata itself
+                    calldatacopy(0x144, additionalCdStart, additionalCdLen)
+
+                    let status := call(
+                        gas(), // gas amount
+                        exchange1, // recipient
+                        0, // value (wei)
+                        0x80, // calldata start
+                        add(0xc4, additionalCdLen), // calldata len
+                        0x80,
+                        0x40
+                    )
+                    if iszero(status) { revert(0,0) }
+                }
+
+                if iszero(amountInOriginal) {
+                    // see if we do a coinbase xfer
+                    let coinbaseXfer := and(calldataload(0x24), 0xffffffffffffffff)
+
+                    let status := call(
+                        gas(), // gas amount
+                        coinbase(), // recipient
+                        coinbaseXfer, // value (wei)
+                        0x0, // calldata start
+                        0x0, // calldata len
+                        0x0, // return start
+                        0x0 // return len
+                    )
+                    if iszero(status) { revert(0,0) }
+                }
             }
-        }
-
-        // unpack flags
-        address exchange1 = address(uint160(input0));
-        bool zeroForOne  = (input0 & (0x1 << 239)) != 0;
-        int256 amountIn = int256((input0 >> 160) & 0x3fffffffffffffffffff);
-        uint256 coinbase_xfer = 0;
-        address recipient;
-        bytes memory cdata;
-        if (amountIn == 0)
-        {
-            uint256 input1 = uint256(bytes32(input[36:68]));
-            // use extradata for amountIn (and, potentially, coinbase xfer)
-            coinbase_xfer = input1 & 0xffffffffffffffff;
-            amountIn = int256(input1 >> 64);
-            cdata = input[68:];
-            recipient = 
-                (input0 & (0x1 << 238)) == 0
-                ? address(this)
-                : recipient = getNextUniswapV2(68, input); // address(uint160(bytes20(input[80:100])));
-        }
-        else
-        {
-            cdata = input[36:];
-            recipient = 
-                (input0 & (0x1 << 238)) == 0
-                ? address(this)
-                : recipient = getNextUniswapV2(36, input); // address(uint160(bytes20(input[48:68])));
-        }
-
-
-        (bool success, bytes memory data) = exchange1.call(
-            abi.encodeWithSelector(
-                IUniswapV3PoolActions.swap.selector,
-                recipient,
-                zeroForOne,
-                amountIn,
-                (
-                    zeroForOne
-                        ? MIN_SQRT_RATIO + 1
-                        : MAX_SQRT_RATIO - 1
-                ),
-                cdata
-            )
-        );
-
-        require(success && data.length == 64);
-
-        if (coinbase_xfer > 0)
-        {
-            block.coinbase.transfer(coinbase_xfer);
         }
     }
 
@@ -319,10 +361,5 @@ contract Shooter is
         require(msg.sender == deployer);
         safeTransfer(token, msg.sender, amount);
     }
-
-    // function sellAndWithdrawToken(address token, uint256 amount, address uniswapV3Exchange, )
-    // {
-
-    // }
 
 }
