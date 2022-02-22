@@ -36,68 +36,50 @@ contract Shooter is
         require(success && (data.length == 0 || abi.decode(data, (bool))), 'ST');
     }
 
-    function getNextUniswapV2(
-        uint256 idx,
-        bytes calldata data
-    ) pure internal returns (address recipient) {
-        while (true)
-        {
-            require(idx < data.length);
-            uint256 rec = uint256(bytes32(data[idx:idx+32]));
-            if (rec & (0x1 << 252) == 0)
-            {
-                // this is a uniswap v2
-                recipient = address(uint160(rec));
-                break;
-            }
-            idx += 32;
-        }
-    }
+    // function doUniswapV3Swap(
+    //         address exchange,
+    //         uint256 amountOut,
+    //         bool zeroForOne,
+    //         uint8 recipientCode,
+    //         uint256 cdata_idx,
+    //         bytes calldata data
+    //     ) internal {
+    //     // uniswap v3
+    //     // we need to copy the remaining exchange info into memory
+    //     address recipient;
+    //     if (recipientCode == 0x0)
+    //     {
+    //         // send to self
+    //         recipient = address(this);
+    //     }
+    //     else if (recipientCode == 0x1)
+    //     {
+    //         // send to msg.sender
+    //         recipient = msg.sender;
+    //     }
+    //     else
+    //     {
+    //         // send to next uniswap v3 exchange address -- need to scan for it
+    //         recipient = getNextUniswapV2(cdata_idx + 32, data);
+    //     }
 
-    function doUniswapV3Swap(
-            address exchange,
-            uint256 amountOut,
-            bool zeroForOne,
-            uint8 recipientCode,
-            uint256 cdata_idx,
-            bytes calldata data
-        ) internal {
-        // uniswap v3
-        // we need to copy the remaining exchange info into memory
-        address recipient;
-        if (recipientCode == 0x0)
-        {
-            // send to self
-            recipient = address(this);
-        }
-        else if (recipientCode == 0x1)
-        {
-            // send to msg.sender
-            recipient = msg.sender;
-        }
-        else
-        {
-            // send to next uniswap v3 exchange address -- need to scan for it
-            recipient = getNextUniswapV2(cdata_idx + 32, data);
-        }
+    //     (bool success,) = exchange.call(
+    //         abi.encodeWithSelector(
+    //             IUniswapV3PoolActions.swap.selector,
+    //             recipient,
+    //             zeroForOne,
+    //             -int256(amountOut),
+    //             (
+    //                 zeroForOne
+    //                     ? MIN_SQRT_RATIO + 1
+    //                     : MAX_SQRT_RATIO - 1
+    //             ),
+    //             data[cdata_idx+32:]
+    //         )
+    //     );
 
-        (bool success,) = exchange.call(
-            abi.encodeWithSelector(
-                IUniswapV3PoolActions.swap.selector,
-                recipient,
-                zeroForOne,
-                -int256(amountOut),
-                (
-                    zeroForOne
-                        ? MIN_SQRT_RATIO + 1
-                        : MAX_SQRT_RATIO - 1
-                ),
-                data[cdata_idx+32:]
-            )
-        );
-
-        require(success);
-    }
+    //     require(success);
+    // }
 
     function uniswapV3SwapCallback(
         int256 amount0Delta,
@@ -155,11 +137,90 @@ contract Shooter is
             for { } lt(calldata_idx, calldata_end) { } {
                 last_line := calldataload(calldata_idx)
                 let exchange_addr := and(last_line, 0x00ffffffffffffffffffffffffffffffffffffffff)
-
                 if and(last_line, shl(252, 0x1)) {
                     // this is uniswap v3
-                    revert( 0, 0)
-                    // break
+
+                    let amountOutNeg
+
+                    mstore(0x80, shl(224, 0x128acb08)) // method selector for uniswap v3 swap()
+
+                    switch shr(254, last_line)
+                    case 0 {
+                        // shooter (self)
+                        mstore(0x84, address())
+                        amountOutNeg := getAmountOut(last_line)
+                    }
+                    case 1 {
+                        // msg_sender
+                        mstore(0x84, caller())
+                        // as a gas savings, in this instance we get amountOut from known args
+                        switch sgt(amount0Delta, 0)
+                        case 0 {
+                            amountOutNeg := amount1Delta
+                        }
+                        default {
+                            amountOutNeg := amount0Delta
+                        }
+                    }
+                    default {
+                        // recipient is next uniswap v2 exchange -- unfortunately, we need to scan calldata for it
+                        let cdsize := calldatasize()
+                        let i := add(calldata_idx, 0x20) // account for extradata, if present
+                        for { } lt(i, cdsize) { i := add(i, 0x20) } {
+                            let line := calldataload(i)
+                            if iszero(and(line, shl(252, 0x1))) {
+                                // this is the uniswap v2 address we're looking for
+                                line := and(line, 0xffffffffffffffffffffffffffffffffffffffff)
+                                mstore(0x84, line)
+                                break
+                            }
+                        }
+                        if iszero(lt(i, cdsize)) { revert(0,0) }
+                        amountOutNeg := getAmountOut(last_line)
+                    }
+
+
+                    // compute zeroForOne (easy)
+                    let zeroForOne := getZeroForOne(last_line)
+                    mstore(0xa4, zeroForOne)
+                    
+                    // store max price (computed from zeroForOne)
+                    switch zeroForOne
+                    case 0 {
+                        mstore(0xe4, sub(MAX_SQRT_RATIO, 1))
+                    }
+                    default {
+                        mstore(0xe4, add(MIN_SQRT_RATIO, 1))
+                    }
+
+                    // set amountOut (must negate to indicate amount out)
+                    mstore(0xc4, sub(0, amountOutNeg))
+
+                    // store the bytes calldata data (For callback)
+                    mstore(0x104, 0xa0)
+                    // copy the remaining calldata
+                    {
+                        let cdsize := calldatasize()
+                        let additionalCdStart := add(calldata_idx, 0x20)
+                        let additionalCdLen := sub(cdsize, additionalCdStart)
+                        // store the size of data
+                        mstore(0x124, additionalCdLen)
+                        // copy the extra calldata itself
+                        calldatacopy(0x144, additionalCdStart, additionalCdLen)
+
+                        let status := call(
+                            gas(), // gas amount
+                            exchange_addr, // recipient
+                            0, // value (wei)
+                            0x80, // calldata start
+                            add(0xc4, additionalCdLen), // calldata len
+                            0x0,
+                            0x0
+                        )
+                        if iszero(status) { revert(0,0) }
+                    }
+
+                    break
                 }
 
                 // this is uniswap v2
@@ -227,7 +288,7 @@ contract Shooter is
                 }
                 default {
                     // next exchange
-                    calldatacopy(0xc4, add(calldata_idx, 12), 20)
+                    calldatacopy(add(0xc4, 12), add(calldata_idx, 12), 20)
                 }
 
                 mstore(0xe4, 0x80)

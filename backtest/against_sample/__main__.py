@@ -190,8 +190,8 @@ def get_arbitrages_from_sample(w3: web3.Web3) -> typing.Generator[web3.types.TxR
 
 def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.TextIOWrapper):
     # 0xc3b0273c28fe7fb0ec71a8e27e67383f62919cc555db4119af6a40b63d991918
-    if receipt['transactionHash'].hex() != '0x9f27a2203a3362b7c8714612d3c0a12723100744c131197071b300508d42a458': # '0xb67e9bf3ac2e6b4f0ca1cb11f7994eaefb3840188532e858cc6d8885bf196b8b':
-        return
+    # if receipt['transactionHash'].hex() != '0x08871b83a92dc9b656033e3167d8eb39610c9c110c6dff4f018f4b0495bfee85': # '0xb67e9bf3ac2e6b4f0ca1cb11f7994eaefb3840188532e858cc6d8885bf196b8b':
+    #     return
     l.debug(f'Re-shooting {receipt["transactionHash"].hex()}')
     # attempt to re-run this arbitrage using our own shooter, and record the results
 
