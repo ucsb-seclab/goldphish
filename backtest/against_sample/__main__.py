@@ -189,8 +189,9 @@ def get_arbitrages_from_sample(w3: web3.Web3) -> typing.Generator[web3.types.TxR
                 progress_reporter.observe(1)
 
 def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.TextIOWrapper):
-    # if receipt['transactionHash'].hex() != '0x799e3604d946ee543be460adbf9cdac11ec3cb0dbde3d2915b11f98b4a0133ed': # '0xb67e9bf3ac2e6b4f0ca1cb11f7994eaefb3840188532e858cc6d8885bf196b8b':
-    #     return
+    # 0xc3b0273c28fe7fb0ec71a8e27e67383f62919cc555db4119af6a40b63d991918
+    if receipt['transactionHash'].hex() != '0x9f27a2203a3362b7c8714612d3c0a12723100744c131197071b300508d42a458': # '0xb67e9bf3ac2e6b4f0ca1cb11f7994eaefb3840188532e858cc6d8885bf196b8b':
+        return
     l.debug(f'Re-shooting {receipt["transactionHash"].hex()}')
     # attempt to re-run this arbitrage using our own shooter, and record the results
 
@@ -254,11 +255,6 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
     
     # poor man's context manager
     for w3_fork in backtest.utils.get_ganache_fork(w3, receipt['blockNumber'] - 1):
-        backtest.utils.replay_to_txn(
-            w3,
-            w3_fork,
-            receipt,
-        )
         # deploy shooter
         deployer = backtest.utils.funded_deployer()
         shooter_addr = shooter.deploy.deploy_shooter(
@@ -280,7 +276,7 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
         assert wrap_receipt['status'] == 1
 
         # transfer to shooter
-        xfer = weth.functions.transfer(deployer.address, 100).buildTransaction({'from': deployer.address})
+        xfer = weth.functions.transfer(shooter_addr, 100).buildTransaction({'from': deployer.address})
         xfer_hash = w3_fork.eth.send_transaction(xfer)
         xfer_receipt = w3_fork.eth.wait_for_transaction_receipt(xfer_hash)
         assert xfer_receipt['status'] == 1
@@ -304,8 +300,16 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
             'maxFeePerGas': 500 * (10 ** 9),
         }
         signed_txn = w3_fork.eth.account.sign_transaction(txn, deployer.key)
-        tx_hash = w3_fork.eth.send_raw_transaction(signed_txn.rawTransaction)
-        new_receipt = w3_fork.eth.wait_for_transaction_receipt(tx_hash)
+        # tx_hash = w3_fork.eth.send_raw_transaction(signed_txn.rawTransaction)
+        got = backtest.utils.replay_to_txn(
+            w3,
+            w3_fork,
+            receipt,
+            extras=[signed_txn.rawTransaction,],
+        )
+        tx_hash = got[0]
+
+        new_receipt = w3_fork.eth.get_transaction_receipt(tx_hash)
         
         if new_receipt['status'] != 1:
             old_block_ts = w3.eth.get_block(receipt['blockHash'])['timestamp']
@@ -320,8 +324,50 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
                 for log in trace['result']['structLogs']:
                     fout.write(str(log) + '\n')
 
-            decoded = decode_trace_calls(trace['result']['structLogs'])
-            pretty_print_trace(decoded)
+            print('------------------our trace---------------------------')
+            decoded = decode_trace_calls(trace['result']['structLogs'], txn, new_receipt)
+            pretty_print_trace(decoded, txn, new_receipt)
+            print('------------------------------------------------------')
+
+            print('------------------their trace-------------------------')
+            their_txn = w3.eth.get_transaction(receipt['transactionHash'])
+            trace_theirs = w3.provider.make_request('debug_traceTransaction', [receipt['transactionHash'].hex(), {'enableMemory': True}])
+            decoded = decode_trace_calls(trace_theirs['result']['structLogs'], their_txn, receipt)
+            pretty_print_trace(decoded, their_txn, receipt)
+            print('------------------------------------------------------')
+
+            # # attempt repro their shot
+            # for w3_fork2 in backtest.utils.get_ganache_fork(w3, receipt['blockNumber'] - 1, unlock = [their_txn['from']]):
+            #     backtest.utils.replay_to_txn(
+            #         w3,
+            #         w3_fork2,
+            #         receipt,
+            #     )
+            #     new_block_tip = w3_fork2.eth.get_block('latest')['number']
+            #     old_block_target_bin = int.to_bytes(receipt['blockNumber'], length=5, byteorder='big', signed=False)
+            #     new_block_target_bin = int.to_bytes(new_block_tip + 1, length=5, byteorder='big', signed=False)
+            #     print('old block target', old_block_target_bin.hex())
+            #     print('new block target', old_block_target_bin.hex())
+            #     old_input = their_txn['input']
+            #     print('old input', old_input)
+            #     assert old_block_target_bin.hex() in old_input
+            #     new_input = old_input.replace(old_block_target_bin.hex(), new_block_target_bin.hex())
+            #     new_txn: web3.types.TxParams = {
+            #         'gas': their_txn['gas'],
+            #         'chainId': their_txn['chainId'],
+            #         'maxFeePerGas': their_txn['maxFeePerGas'],
+            #         'maxPriorityFeePerGas': their_txn['maxPriorityFeePerGas'],
+            #         'from': their_txn['from'],
+            #         'to': their_txn['to'],
+            #         'nonce': their_txn['nonce'],
+            #         'input': new_input
+            #     }
+            #     print(new_txn)
+            #     txn_hash = w3_fork2.eth.send_transaction(new_txn)
+            #     new_reshoot_receipt = w3_fork2.eth.wait_for_transaction_receipt(txn_hash)
+            #     print(new_reshoot_receipt)
+
+
             raise Exception('status should be success')
 
 

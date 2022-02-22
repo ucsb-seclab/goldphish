@@ -7,6 +7,7 @@ import scipy.stats
 import logging
 import random
 import web3
+import web3.types
 import web3.contract
 
 l = logging.getLogger(__name__)
@@ -26,9 +27,13 @@ def read_mem(start, read_len, mem):
     return b
 
 
-def pretty_print_trace(parsed):
+def pretty_print_trace(parsed, txn: web3.types.TxData, receipt: web3.types.TxReceipt):
     print()
     print('-----------------------')
+    # compute gas used just to start the call
+    invocation_gas = txn['gas'] - parsed['gasStart']
+    print(f'Gas usage from invocation: {invocation_gas:,}')
+
     stack = [(0, x) for x in reversed(parsed['actions'])]
     while len(stack) > 0:
         depth, item = stack.pop()
@@ -65,11 +70,19 @@ def pretty_print_trace(parsed):
     print('-----------------------')
 
 
-def decode_trace_calls(trace):
+def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxReceipt):
+    # sum the gas and see if things square up
+    gas_from_call = txn['gas'] - trace[0]['gas']
+    print(f'Gas from call: {gas_from_call:,}')
+    all_gas_usage = sum(sl['gasCost'] for sl in trace)
+    print(f'Trace all_gas_usage {all_gas_usage:,}')
+    print(f'Trace sum gas usage {gas_from_call + all_gas_usage:,}')
+    print(f'Reported gas usage {receipt["gasUsed"]:,}')
+
     ctx = {
         'type': 'root',
         'traceStart': 0,
-        'gasStart': 0,
+        'gasStart': trace[0]['gas'],
         'actions': [],
     }
     ctx_stack = [ctx]

@@ -32,22 +32,26 @@ def funded_deployer() -> LocalAccount:
     ret: LocalAccount = Account.from_key(bytes.fromhex('0xab1179084d3336336d60b2ed654d99a21c2644cadd89fd3034ee592e931e4a77'[2:]))
     return ret
 
-def replay_to_txn(w3: web3.Web3, ganache: web3.Web3, receipt: web3.types.TxReceipt):
+def replay_to_txn(w3: web3.Web3, ganache: web3.Web3, receipt: web3.types.TxReceipt, extras: typing.List = []):
     """
-    Replay transactions from the top of the block `txn` appears in.
+    Replay transactions from the top of the block `receipt` appears in.
     """
     l.debug('replaying...')
     hashes = []
     for i in range(receipt['transactionIndex']):
         to_replay = w3.eth.get_raw_transaction_by_block(receipt['blockHash'], i)
         hashes.append(ganache.eth.send_raw_transaction(to_replay))
-    for h in hashes:
+    ret = []
+    for t in extras:
+        ret.append(ganache.eth.send_raw_transaction(t))
+    for h in hashes + ret:
         r = ganache.eth.wait_for_transaction_receipt(h)
     l.debug('done replay')
+    return ret
 
 
 _next_ganache_port = 4444
-def get_ganache_fork(w3: web3.Web3, target_block: int) -> typing.Iterator[web3.Web3]:
+def get_ganache_fork(w3: web3.Web3, target_block: int, unlock: typing.Optional[typing.List[str]] = None) -> typing.Iterator[web3.Web3]:
     global _next_ganache_port
 
     old_block = w3.eth.get_block(target_block)
@@ -55,6 +59,10 @@ def get_ganache_fork(w3: web3.Web3, target_block: int) -> typing.Iterator[web3.W
 
     assert isinstance(target_block, int)
     assert target_block > 0
+    
+    extra_args = []
+    if unlock is not None:
+        extra_args = ['--wallet.unlockedAccounts', ','.join(unlock)]
 
     p = subprocess.Popen(
         [
@@ -69,6 +77,7 @@ def get_ganache_fork(w3: web3.Web3, target_block: int) -> typing.Iterator[web3.W
             '--chain.time', str(old_ts * 1_000), # unit conversion needed for some reason -- blame javascript
             '--miner.coinbase', web3.Web3.toChecksumAddress(b'\xa0' * 20) + ' ',
             '--miner.blockTime', '1',
+            *extra_args
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
@@ -93,6 +102,7 @@ def get_ganache_fork(w3: web3.Web3, target_block: int) -> typing.Iterator[web3.W
         time.sleep(0.1)
 
     assert w3.isConnected()
+    tip = w3.eth.get_block('latest')
 
     yield w3
 
