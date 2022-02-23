@@ -4,6 +4,8 @@ shooter/constants.py
 Constants for the shooter contract
 """
 
+WETH_ADDRESS = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+
 
 # target block is identified (non-uniquely) by lower 2 bytes
 MAX_TARGET_BLOCK = 0xffff

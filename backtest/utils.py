@@ -28,25 +28,9 @@ def parse_logs_for_net_profit(logs: typing.List[web3.types.LogReceipt]) -> typin
             ret[log['address']][xfer['args']['to']] += xfer['args']['value']
     return {k: dict(v) for k, v in ret.items()}
 
+
 def funded_deployer() -> LocalAccount:
     ret: LocalAccount = Account.from_key(bytes.fromhex('0xab1179084d3336336d60b2ed654d99a21c2644cadd89fd3034ee592e931e4a77'[2:]))
-    return ret
-
-def replay_to_txn(w3: web3.Web3, ganache: web3.Web3, receipt: web3.types.TxReceipt, extras: typing.List = []):
-    """
-    Replay transactions from the top of the block `receipt` appears in.
-    """
-    l.debug('replaying...')
-    hashes = []
-    for i in range(receipt['transactionIndex']):
-        to_replay = w3.eth.get_raw_transaction_by_block(receipt['blockHash'], i)
-        hashes.append(ganache.eth.send_raw_transaction(to_replay))
-    ret = []
-    for t in extras:
-        ret.append(ganache.eth.send_raw_transaction(t))
-    for h in hashes + ret:
-        r = ganache.eth.wait_for_transaction_receipt(h)
-    l.debug('done replay')
     return ret
 
 

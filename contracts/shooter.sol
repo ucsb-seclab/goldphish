@@ -36,51 +36,6 @@ contract Shooter is
         require(success && (data.length == 0 || abi.decode(data, (bool))), 'ST');
     }
 
-    // function doUniswapV3Swap(
-    //         address exchange,
-    //         uint256 amountOut,
-    //         bool zeroForOne,
-    //         uint8 recipientCode,
-    //         uint256 cdata_idx,
-    //         bytes calldata data
-    //     ) internal {
-    //     // uniswap v3
-    //     // we need to copy the remaining exchange info into memory
-    //     address recipient;
-    //     if (recipientCode == 0x0)
-    //     {
-    //         // send to self
-    //         recipient = address(this);
-    //     }
-    //     else if (recipientCode == 0x1)
-    //     {
-    //         // send to msg.sender
-    //         recipient = msg.sender;
-    //     }
-    //     else
-    //     {
-    //         // send to next uniswap v3 exchange address -- need to scan for it
-    //         recipient = getNextUniswapV2(cdata_idx + 32, data);
-    //     }
-
-    //     (bool success,) = exchange.call(
-    //         abi.encodeWithSelector(
-    //             IUniswapV3PoolActions.swap.selector,
-    //             recipient,
-    //             zeroForOne,
-    //             -int256(amountOut),
-    //             (
-    //                 zeroForOne
-    //                     ? MIN_SQRT_RATIO + 1
-    //                     : MAX_SQRT_RATIO - 1
-    //             ),
-    //             data[cdata_idx+32:]
-    //         )
-    //     );
-
-    //     require(success);
-    // }
-
     function uniswapV3SwapCallback(
         int256 amount0Delta,
         int256 amount1Delta,
@@ -228,7 +183,7 @@ contract Shooter is
 
                 let requiredInput
                 let amountOut
-                switch lt(add(calldata_idx, 0x40), calldata_end)
+                switch lt(add(calldata_idx, 0x39), calldata_end)
                 case 0 {
                     // this is the last exchange record, and we're forwarding the whole output to msg.sender, so we can infer
                     // amountOut, so requiredInput is encoded where amountOut usually is
@@ -319,111 +274,6 @@ contract Shooter is
                 }
             }
         }
-
-        // revert('himom');
-
-        // uint8 recipientCode = 0;
-        // uint256 cdata_idx = 0;
-        // while (cdata_idx < data.length)
-        // {
-        //     uint256 cdataNext = uint256(bytes32(data[cdata_idx:cdata_idx+32]));
-
-        //     // decode flags
-        //     recipientCode = uint8(cdataNext >> 254);
-        //     bool zeroForOne = (cdataNext & (0x1 << 253)) != 0;
-        //     address exchange = address(uint160(cdataNext));
-        //     uint256 amountOut = (cdataNext >> 160) & 0xfffffffffffffffffffffff;
-
-        //     if (cdataNext & (0x1 << 252) != 0)
-        //     {
-        //         // broken out to avoid 'stack too deep' error (I guess)
-        //         if (recipientCode == 0x1)
-        //         {
-        //             // we're paying for the prior uniswap v3 exchange, as gas savings we already had set amountOut to 0
-        //             // so infer it here
-        //             amountOut = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
-        //         }
-        //         doUniswapV3Swap(exchange, amountOut, zeroForOne, recipientCode, cdata_idx, data);
-        //         // assume remainder was handled recursively
-        //         break;
-        //     }
-        //     else
-        //     {
-        //         address recipient;
-        //         uint256 requiredInput = 0;
-
-        //         if (cdata_idx + 64 <= data.length)
-        //         {
-        //             uint256 maybeExtraData = uint256(bytes32(data[cdata_idx + 32 : cdata_idx + 64]));
-        //             if (maybeExtraData & uint160(0x00ffffffffffffffffffffffffffffffffffffffff /* leading zero is deliberate */) == 0)
-        //             {
-        //                 // using extradata mark
-        //                 requiredInput = maybeExtraData >> 160;                        
-        //                 cdata_idx += 32;
-        //             }
-        //         }
-        //         else
-        //         {
-        //             // This is the last exchange and we are sending the whole amount to msg.sender; so we can infer the amountOut.
-        //             // In this case, interpret amountOut field as amountIn
-        //             if (recipientCode != 0x0)
-        //             {
-        //                 requiredInput = amountOut;
-        //                 amountOut = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
-        //             }
-        //         }
-        //         cdata_idx += 32;
-
-        //         if (requiredInput > 0)
-        //         {
-        //             if (cdata_idx == 0)
-        //             {
-        //                 // We are forwarding output from the prior uniswap v3, we already know the token address
-        //                 safeTransfer(WETH, exchange, requiredInput);                        
-        //             }
-        //             else
-        //             {
-        //                 // address neededToken = zeroForOne ? IUniswapV2Pair(exchange).token0() : IUniswapV2Pair(exchange).token1();
-        //                 safeTransfer(
-        //                     WETH, exchange, requiredInput
-        //                 );
-        //             }
-        //         }
-
-        //         if (recipientCode == 0x0)
-        //         {
-        //             // send to self
-        //             recipient = address(this);
-        //         }
-        //         else if (recipientCode == 0x1)
-        //         {
-        //             // send to msg.sender
-        //             recipient = msg.sender;
-        //         }
-        //         else
-        //         {
-        //             // send to next exchange address directly
-        //             recipient = address(uint160(bytes20(data[cdata_idx+12:cdata_idx+32])));
-        //         }
-
-        //         (bool success, ) = exchange.call(
-        //             abi.encodeWithSelector(
-        //                 IUniswapV2Pair.swap.selector,
-        //                 zeroForOne ? 0 : amountOut,
-        //                 zeroForOne ? amountOut : 0,
-        //                 recipient,
-        //                 new bytes(0)
-        //             )
-        //         );
-        //         require(success);
-        //     }
-        // }
-
-        // if (recipientCode == 0x0) {
-        //     // must manually forward payment to msg.sender
-        //     int256 neededValue = int256(amount0Delta > 0 ? amount0Delta : amount1Delta);
-        //     safeTransfer(repaymentToken, msg.sender, uint256(neededValue));
-        // }
     }
 
     fallback(bytes calldata input) external payable returns (bytes memory) {

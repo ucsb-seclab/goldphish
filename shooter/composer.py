@@ -8,7 +8,7 @@ import logging
 
 import shooter.encoder
 
-from .constants import MAX_COINBASE_XFER
+from .constants import MAX_COINBASE_XFER, WETH_ADDRESS
 
 l = logging.getLogger(__name__)
 
@@ -194,7 +194,7 @@ def construct(
             ]
         else:
             assert univ2_chain[1].amount_out > univ3_chain[0].amount_in
-            l.debug('Cycle situation 4')
+            l.debug('Cycle situation 5')
             # SITUATION
             #   (uv3) --> (uv2a) --> (uv2b) -- profit --> (uv3)
             #
@@ -214,19 +214,19 @@ def construct(
                     amount_in_explicit = 0,
                     amount_out = univ2_chain[0].amount_out,
                     zero_for_one = univ2_chain[0].zero_for_one,
-                    recipient = shooter.encoder.FundsRecipient.SHOOTER,
+                    recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
                 ),
                 shooter.encoder.UniswapV2Record(
                     address = univ2_chain[1].address,
-                    amount_in_explicit = univ2_chain[1].amount_in,
+                    amount_in_explicit = 0,
                     amount_out = univ2_chain[1].amount_out,
                     zero_for_one = univ2_chain[1].zero_for_one,
-                    recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
+                    recipient = shooter.encoder.FundsRecipient.SHOOTER,
                 ),
             ]
     elif len(univ3_chain) == 2 and len(univ2_chain) == 1:
         if univ3_chain[0].amount_in < univ3_chain[1].amount_out:
-            l.debug('Cycle situation 5')
+            l.debug('Cycle situation 6')
             # SITUATION
             #   (uv3_1) -- profit --> (uv3_0) --> (uv2) --> (uv3_1)
             #
@@ -256,7 +256,7 @@ def construct(
                 ),
             ]
         elif univ3_chain[0].amount_out > univ2_chain[0].amount_in:
-            l.debug('Cycle situation 6')
+            l.debug('Cycle situation 7')
             # SITUATION
             #   (uv3_1) --> (uv3_0) -- profit --> (uv2) --> (uv3_1)
             #
@@ -287,7 +287,7 @@ def construct(
             ]
         else:
             assert univ2_chain[0].amount_out > univ3_chain[1].amount_in
-            l.debug('Cycle situation 7')
+            l.debug('Cycle situation 8')
             # SITUATION
             #   (uv3_1) --> (uv3_0) --> (uv2) -- profit --> (uv3_1)
             #
@@ -319,7 +319,7 @@ def construct(
     else:
         assert len(univ3_chain) == 3
         assert len(univ2_chain) == 0
-        l.debug(f'Cycle situation 8')
+        l.debug(f'Cycle situation 9')
         # fortunately this is the easy one
         # SITUATION
         # (uv3_2) --> (uv3_1) --> (uv3_0) --> (uv3_2) // implicit profit possible along any of these

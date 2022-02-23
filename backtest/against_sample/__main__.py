@@ -44,6 +44,62 @@ univ3: web3.contract.Contract = web3.Web3().eth.contract(
 )
 UNIV3_SWAP_TOPIC = event_abi_to_log_topic(univ3.events.Swap().abi)
 
+class IncompleteReplayException(Exception):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+def try_replay(w3: web3.Web3, ganache: web3.Web3, receipt: web3.types.TxReceipt, extras: typing.List = []):
+    """
+    Replay transactions from the top of the block `receipt` appears in.
+
+    Also include the 'extras' in the same block after replaying.
+
+    Throws IncompleteRelayException if the transaction(s) with relevant uniswap modifications
+    failed to replay.
+    """
+    l.debug('replaying...')
+    block = w3.eth.get_block(receipt['blockHash'])
+    hashes = []
+    failed_resubmit = []
+    for i in range(receipt['transactionIndex']):
+        to_replay = w3.eth.get_raw_transaction_by_block(receipt['blockHash'], i)
+        try:
+            hashes.append(ganache.eth.send_raw_transaction(to_replay))
+        except Exception as e:
+            if 'insufficient funds for gas' not in str(e):
+                raise e
+            failed_resubmit.append(block['transactions'][i])
+    ret = []
+    for t in extras:
+        ret.append(ganache.eth.send_raw_transaction(t))
+
+    important_exchanges = set()
+    for log in receipt['logs']:
+        if len(log['topics']) > 0 and log['topics'][0] in [UNIV2_SWAP_TOPIC, UNIV3_SWAP_TOPIC]:
+            important_exchanges.add(log['address'])
+    assert len(important_exchanges) >= 2
+
+    for h in hashes:
+        r = ganache.eth.wait_for_transaction_receipt(h)
+        if r['status'] != 1:
+            failed_resubmit.append(r['transactionHash'])
+
+    for failed in failed_resubmit:
+        # status failed ... figure out if we really need to care
+        old_receipt = w3.eth.get_transaction_receipt(failed)
+        if old_receipt['status'] == 1:
+            # see if any actions in the logs are important
+            for log in old_receipt['logs']:
+                if log['address'] in important_exchanges:
+                    raise IncompleteReplayException(f'failed to replay {h.hex()}')
+        l.debug(f'Transaction {failed.hex()} failed, but that seems to be fine...')
+    for h in ret:
+        ganache.eth.wait_for_transaction_receipt(h)
+    # see which 
+    l.debug('done replay')
+    return ret
+
 
 def get_txns_to_address(w3: web3.Web3) -> typing.List[typing.Tuple[int, bytes]]:
     l.debug(f'getting all transactions to sample shooter')
@@ -135,63 +191,69 @@ def recover_token_pairs(logs: typing.List[web3.types.LogReceipt]) -> typing.Dict
     return ret
 
 
-def get_arbitrages_from_sample(w3: web3.Web3) -> typing.Generator[web3.types.TxReceipt, None, None]:
+def get_arbitrages_from_sample(w3: web3.Web3, fout: io.TextIOWrapper) -> typing.Generator[web3.types.TxReceipt, None, None]:
     all_txns = get_txns_to_address(w3)
     l.debug(f'Have {len(all_txns)} transactions to go through')
 
-    with open('/mnt/goldphish/tmp/rejected_hashes.csv', mode='w') as fout:
-        fout.write('# transaction hash, rejection reason\n')
-        progress_reporter = ProgressReporter(l, len(all_txns), 0)
-        for _, txn_hash in all_txns:
-            try:
-                receipt = w3.eth.get_transaction_receipt(txn_hash)
+    fout.write('# transaction hash, rejection reason\n')
+    progress_reporter = ProgressReporter(l, len(all_txns), 0)
+    seen_point = False
+    for _, txn_hash in all_txns:
+        if txn_hash != bytes.fromhex('5e0c7d2c2ab89bfab3d5341d31a3aa0b91f6472461609351e75c7fc50a98ffdc'):
+            if not seen_point:
+                continue
+        else:
+            seen_point = True
+        try:
+            receipt = w3.eth.get_transaction_receipt(txn_hash)
 
-                # ensure the transaction didn't revert
-                if receipt['status'] == 0:
-                    fout.write(f'{txn_hash.hex()},reverted\n')
-                    continue
-                
-                # ensure there are at least TWO exchange actions (and at least one uniswap v3)
-                univ2_exchanges, univ3_exchanges = recover_exchanges(receipt)
-                if len(univ3_exchanges) + len(univ2_exchanges) < 2:
-                    fout.write(f'{txn_hash.hex()},not enough exchange actions\n')
-                    continue
-                if len(univ3_exchanges) < 1:
-                    fout.write(f'{txn_hash.hex()},no uniswap v3 action\n')
-                    continue
-                
-                # This arbitrage may have used an exchange to take profits. As a crude metric, ensure
-                # all exchanged tokens are both bought once and sold exactly once
-                addr_to_tokens_in = collections.defaultdict(lambda: set())
-                addr_to_tokens_out = collections.defaultdict(lambda: set())
-                for log in receipt['logs']:
-                    if len(log['topics']) > 0 and log['topics'][0] == ERC20_TRANSFER_TOPIC:
-                        xfer = erc20.events.Transfer().processLog(log)
-                        addr_to_tokens_in[xfer['args']['to']].add(log['address'])
-                        addr_to_tokens_out[xfer['args']['from']].add(log['address'])
+            # ensure the transaction didn't revert
+            if receipt['status'] == 0:
+                fout.write(f'{txn_hash.hex()},reverted\n')
+                fout.flush()
+                continue
+            
+            # ensure there are at least TWO exchange actions (and at least one uniswap v3)
+            univ2_exchanges, univ3_exchanges = recover_exchanges(receipt)
+            if len(univ3_exchanges) + len(univ2_exchanges) < 2:
+                fout.write(f'{txn_hash.hex()},not enough exchange actions\n')
+                continue
+            if len(univ3_exchanges) < 1:
+                fout.write(f'{txn_hash.hex()},no uniswap v3 action\n')
+                fout.flush()
+                continue
+            
+            # This arbitrage may have used an exchange to take profits. As a crude metric, ensure
+            # all exchanged tokens are both bought once and sold exactly once
+            addr_to_tokens_in = collections.defaultdict(lambda: set())
+            addr_to_tokens_out = collections.defaultdict(lambda: set())
+            for log in receipt['logs']:
+                if len(log['topics']) > 0 and log['topics'][0] == ERC20_TRANSFER_TOPIC:
+                    xfer = erc20.events.Transfer().processLog(log)
+                    addr_to_tokens_in[xfer['args']['to']].add(log['address'])
+                    addr_to_tokens_out[xfer['args']['from']].add(log['address'])
 
-                sold_tokens = collections.defaultdict(lambda: 0)
-                bought_tokens = collections.defaultdict(lambda: 0)
-                for exchange in univ2_exchanges.union(univ3_exchanges):
-                    assert len(addr_to_tokens_out[exchange]) == 1
-                    assert len(addr_to_tokens_in[exchange]) == 1
-                    sold_token = next(addr_to_tokens_in[exchange].__iter__())
-                    bought_token = next(addr_to_tokens_out[exchange].__iter__())
-                    sold_tokens[sold_token] += 1
-                    bought_tokens[bought_token] += 1
-                for exchanged_token in set(sold_tokens.keys()).union(bought_tokens.keys()):
-                    if sold_tokens[exchanged_token] != 1 or bought_tokens[exchanged_token] != 1:
-                        fout.write(f'{txn_hash.hex()},at least one token was bought or sold more than once\n')
-                        continue
-                
-                yield receipt
-            finally:
-                progress_reporter.observe(1)
+            sold_tokens = collections.defaultdict(lambda: 0)
+            bought_tokens = collections.defaultdict(lambda: 0)
+            for exchange in univ2_exchanges.union(univ3_exchanges):
+                assert len(addr_to_tokens_out[exchange]) == 1
+                assert len(addr_to_tokens_in[exchange]) == 1
+                sold_token = next(addr_to_tokens_in[exchange].__iter__())
+                bought_token = next(addr_to_tokens_out[exchange].__iter__())
+                sold_tokens[sold_token] += 1
+                bought_tokens[bought_token] += 1
+            for exchanged_token in set(sold_tokens.keys()).union(bought_tokens.keys()):
+                if sold_tokens[exchanged_token] != 1 or bought_tokens[exchanged_token] != 1:
+                    fout.write(f'{txn_hash.hex()},at least one token was bought or sold more than once\n')
+                    fout.flush()
+                    continue
+            
+            yield receipt
+        finally:
+            progress_reporter.observe(1)
 
-def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.TextIOWrapper):
+def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.TextIOWrapper, fout_rejects: io.TextIOWrapper):
     # 0xc3b0273c28fe7fb0ec71a8e27e67383f62919cc555db4119af6a40b63d991918
-    # if receipt['transactionHash'].hex() != '0x08871b83a92dc9b656033e3167d8eb39610c9c110c6dff4f018f4b0495bfee85': # '0xb67e9bf3ac2e6b4f0ca1cb11f7994eaefb3840188532e858cc6d8885bf196b8b':
-    #     return
     l.debug(f'Re-shooting {receipt["transactionHash"].hex()}')
     # attempt to re-run this arbitrage using our own shooter, and record the results
 
@@ -301,13 +363,18 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
         }
         signed_txn = w3_fork.eth.account.sign_transaction(txn, deployer.key)
         # tx_hash = w3_fork.eth.send_raw_transaction(signed_txn.rawTransaction)
-        got = backtest.utils.replay_to_txn(
-            w3,
-            w3_fork,
-            receipt,
-            extras=[signed_txn.rawTransaction,],
-        )
-        tx_hash = got[0]
+        try:
+            got = try_replay(
+                w3,
+                w3_fork,
+                receipt,
+                extras=[signed_txn.rawTransaction,],
+            )
+            tx_hash = got[0]
+        except IncompleteReplayException as e:
+            fout_rejects.write(f'{receipt["transactionHash"].hex()},could not replay: {str(e)}\n')
+            l.exception('Relay was incomplete')
+            continue
 
         new_receipt = w3_fork.eth.get_transaction_receipt(tx_hash)
         
@@ -380,10 +447,14 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
         for token_addr in new_profits.keys():
             new_shooter_mvmt = new_profits[token_addr].get(shooter_addr, None)
             old_shooter_mvmt = old_profits[token_addr].get(SAMPLE_ADDR, None)
-            assert new_shooter_mvmt == old_shooter_mvmt
             if new_shooter_mvmt is not None:
+                assert new_shooter_mvmt >= old_shooter_mvmt, 'we didnt make enough profit'
+                if new_shooter_mvmt > old_shooter_mvmt:
+                    l.warning(f'Unexpected increase in profits after reshoot: {receipt["transactionHash"].hex()}')
                 assert new_shooter_mvmt > 0
                 took_profit_in = token_addr
+            else:
+                assert old_shooter_mvmt is None
         assert took_profit_in == '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
 
         # log to output
@@ -438,9 +509,9 @@ def main():
     l.debug(f'Connected to web3, chainId={w3.eth.chain_id}')
 
     try:
-        with open('/mnt/goldphish/tmp/reshoot_log.txt', mode='w') as fout:
-            for a in get_arbitrages_from_sample(w3):
-                reshoot_arbitrage(w3, a, fout)
+        with open('/mnt/goldphish/tmp/reshoot_log.txt', mode='w') as fout, open('/mnt/goldphish/tmp/rejected_hashes.csv', mode='w') as fout_rejects:
+            for a in get_arbitrages_from_sample(w3, fout_rejects):
+                reshoot_arbitrage(w3, a, fout, fout_rejects)
     except Exception as e:
         l.exception('top-level exception')
         raise e
