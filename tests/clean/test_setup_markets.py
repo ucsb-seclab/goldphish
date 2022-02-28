@@ -9,6 +9,10 @@ import web3
 import web3.contract
 import web3.types
 from eth_account.signers.local import LocalAccount
+import pricers
+import find_circuit.find
+from pricers.uniswap_v2 import UniswapV2Pricer
+from pricers.uniswap_v3 import UniswapV3Pricer
 
 from utils import decode_trace_calls, get_abi, pretty_print_trace
 
@@ -333,7 +337,17 @@ def test_basic_arbitrage(
     # create a v2 weth-token_a pool
     univ2_pool = deploy_v2_pool(w3, funded_account, deployed_uniswap_v2_factory, weth, token_a)
 
-    # mint liquidity
-    mint_uniswap_v2(w3, funded_account, univ2_pool, weth, token_a, w3.toWei(49, 'ether'), w3.toWei(50, 'ether'))
+    # mint liquidity, v2
+    mint_uniswap_v2(w3, funded_account, univ2_pool, weth, token_a, w3.toWei(48, 'ether'), w3.toWei(50, 'ether'))
 
-    
+    token0, token1 = sorted([weth, token_a], key=lambda x: bytes.fromhex(x[2:]))
+
+    # attempt to find arbitrage
+    exchanges = [
+        UniswapV3Pricer(w3, univ3_pool, token0, token1, 3_000),
+        UniswapV2Pricer(w3, univ2_pool, token0, token1)
+    ]
+    got = find_circuit.find.detect_arbitrages(exchanges, block_identifier=w3.eth.get_block('latest')['number'])
+    assert len(got) > 0
+    print(got)
+
