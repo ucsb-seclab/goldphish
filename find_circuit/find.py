@@ -88,7 +88,7 @@ class PricingCircuit:
         Rotate the cycle once, to use a new pivot token
         """
         self._circuit = self._circuit[1:] + [self._circuit[0]]
-        self._directions = self._directions
+        self._directions = self._directions[1:] + [self._directions[0]]
 
     def flip(self):
         """
@@ -116,10 +116,13 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
     pc = PricingCircuit(exchanges)
 
     # for each rotation
-    for _ in range(len(exchanges) - 1):
+    for _ in range(len(exchanges)):
         run_exc = lambda i: pc.sample(math.ceil(i), block_identifier)
         # try each direction
         for _ in range(2):
+            print('testing', pc.circuit)
+            print('directions', pc._directions)
+            print('pivot', pc.pivot_token)
             result = scipy.optimize.minimize_scalar(
                 fun = lambda x: - (run_exc(x) - x),
                 bounds = (
@@ -139,4 +142,5 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
                     )
                 )
             pc.flip()
+        pc.rotate()
     return ret

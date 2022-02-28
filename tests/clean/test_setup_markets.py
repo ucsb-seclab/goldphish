@@ -3,6 +3,7 @@ mainly test-the-tests stuff;  to make sure we're setting up exchanges correctly
 """
 
 import json
+import math
 import time
 import pytest
 import web3
@@ -15,6 +16,7 @@ from pricers.uniswap_v2 import UniswapV2Pricer
 from pricers.uniswap_v3 import UniswapV3Pricer
 
 from utils import decode_trace_calls, get_abi, pretty_print_trace
+
 
 def deploy_v3_pool(
         w3: web3.Web3,
@@ -44,6 +46,63 @@ def deploy_v3_pool(
     (event,) = factory.events.PoolCreated().processReceipt(receipt)
 
     return event['args']['pool']
+
+
+def swap_uniswap_v3(
+        w3: web3.Web3,
+        funded_account: LocalAccount,
+        router: str,
+        token_in: str,
+        token_out: str,
+        amount_in: str
+    ):
+    
+    with open('./contracts/artifacts/V3SwapRouter.json') as fin:
+        artifact = json.load(fin)
+    
+    router: web3.contract.Contract = w3.eth.contract(
+        address = router,
+        abi = artifact['abi'],
+    )
+
+    if bytes.fromhex(token_in[2:]) < bytes.fromhex(token_out[2:]):
+        # zeroForOne
+        sqrt_price_limit = UniswapV3Pricer.MIN_SQRT_RATIO + 1
+    else:
+        sqrt_price_limit = UniswapV3Pricer.MAX_SQRT_RATIO - 1
+
+    txn = router.functions.exactInputSingle(
+        (
+            token_in,
+            token_out,
+            3_000,
+            funded_account.address,
+            int(time.time()) + 100,
+            amount_in,
+            1,
+            sqrt_price_limit,
+        )
+    ).buildTransaction({
+        'from': funded_account.address,
+        'maxFeePerGas': 80 * (10 ** 9),
+        'maxPriorityFeePerGas': 3 * (10 ** 9),
+        'gas': 6_000_000,
+    })
+    tx_hash = w3.eth.send_transaction(txn)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+    if receipt['status'] != 1:
+        trace = w3.provider.make_request('debug_traceTransaction', [receipt['transactionHash'].hex()])
+        with open('/mnt/goldphish/trace.txt', mode='w') as fout:
+            for log in trace['result']['structLogs']:
+                fout.write(str(log) + '\n')
+
+        print('------------------our trace---------------------------')
+        decoded = decode_trace_calls(trace['result']['structLogs'], txn, receipt)
+        pretty_print_trace(decoded, txn, receipt)
+        print('------------------------------------------------------')
+        raise Exception('broken')
+
 
 
 def deploy_v2_pool(
@@ -76,15 +135,14 @@ def deploy_v2_pool(
     return event['args']['pair']
 
 
-
-def authorize_nfp(w3: web3.Web3, funded_account: LocalAccount, nf_position_manager: str, token: str):
+def authorize(w3: web3.Web3, funded_account: LocalAccount, authorizee: str, token: str):
 
     contract = w3.eth.contract(
         address = token,
         abi = get_abi('erc20.abi.json'),
     )
 
-    txn = contract.functions.approve(nf_position_manager, (0x1 << 256) - 1).buildTransaction({
+    txn = contract.functions.approve(authorizee, (0x1 << 256) - 1).buildTransaction({
         'from': funded_account.address,
         'maxFeePerGas': 80 * (10 ** 9),
         'maxPriorityFeePerGas': 3 * (10 ** 9),
@@ -214,6 +272,7 @@ def mint_uniswap_v3(
         decoded = decode_trace_calls(trace['result']['structLogs'], txn, receipt)
         pretty_print_trace(decoded, txn, receipt)
         print('------------------------------------------------------')
+        raise Exception()
 
 
 def mint_uniswap_v2(w3: web3.Web3, funded_account: LocalAccount, pair, token0, token1, amount0, amount1):
@@ -267,7 +326,17 @@ def mint_uniswap_v2(w3: web3.Web3, funded_account: LocalAccount, pair, token0, t
     })
     tx_hash = w3.eth.send_transaction(txn)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-    assert receipt['status'] == 1
+    if receipt['status'] != 1:
+        trace = w3.provider.make_request('debug_traceTransaction', [receipt['transactionHash'].hex()])
+        with open('/mnt/goldphish/trace.txt', mode='w') as fout:
+            for log in trace['result']['structLogs']:
+                fout.write(str(log) + '\n')
+
+        print('------------------our trace---------------------------')
+        decoded = decode_trace_calls(trace['result']['structLogs'], txn, receipt)
+        pretty_print_trace(decoded, txn, receipt)
+        print('------------------------------------------------------')
+        raise Exception()
 
 
 def test_setup_univ2(ganache_chain, funded_account, deployed_uniswap_v2_factory):
@@ -296,6 +365,7 @@ def test_basic_arbitrage(
         deployed_uniswap_v3_factory: str,
         deployed_uniswap_v2_factory: str,
         nf_position_manager: str,
+        v3_swap_router: str,
         weth: str,
         token_a: str,
     ):
@@ -310,13 +380,14 @@ def test_basic_arbitrage(
     # mint some 25:75 WETH liquidity in the pool
 
     # wrap some weth
-    wrap_weth(w3, funded_account, w3.toWei(100, 'ether'))
+    wrap_weth(w3, funded_account, w3.toWei(200, 'ether'))
 
-    mint_token(w3, funded_account, 100 * (10 ** 18), token_a, funded_account.address)
+    mint_token(w3, funded_account, 500 * (10 ** 18), token_a, funded_account.address)
 
-    print('nf_position_manager:', nf_position_manager)
-    authorize_nfp(w3, funded_account, nf_position_manager, weth)
-    authorize_nfp(w3, funded_account, nf_position_manager, token_a)
+    authorize(w3, funded_account, nf_position_manager, weth)
+    authorize(w3, funded_account, nf_position_manager, token_a)
+    authorize(w3, funded_account, v3_swap_router, weth)
+    authorize(w3, funded_account, v3_swap_router, token_a)
 
     # mint it into uniswap v3
     init_uniswap_v3(w3, univ3_pool, funded_account, 1 * (1 << 96))
@@ -334,11 +405,14 @@ def test_basic_arbitrage(
         amount1_min = w3.toWei(50, 'ether')
     )
 
+    # whale txn
+    swap_uniswap_v3(w3, funded_account, v3_swap_router, weth, token_a, w3.toWei(10, 'ether'))
+
     # create a v2 weth-token_a pool
     univ2_pool = deploy_v2_pool(w3, funded_account, deployed_uniswap_v2_factory, weth, token_a)
 
     # mint liquidity, v2
-    mint_uniswap_v2(w3, funded_account, univ2_pool, weth, token_a, w3.toWei(48, 'ether'), w3.toWei(50, 'ether'))
+    mint_uniswap_v2(w3, funded_account, univ2_pool, weth, token_a, w3.toWei(50, 'ether'), w3.toWei(50, 'ether'))
 
     token0, token1 = sorted([weth, token_a], key=lambda x: bytes.fromhex(x[2:]))
 
@@ -347,6 +421,7 @@ def test_basic_arbitrage(
         UniswapV3Pricer(w3, univ3_pool, token0, token1, 3_000),
         UniswapV2Pricer(w3, univ2_pool, token0, token1)
     ]
+
     got = find_circuit.find.detect_arbitrages(exchanges, block_identifier=w3.eth.get_block('latest')['number'])
     assert len(got) > 0
     print(got)

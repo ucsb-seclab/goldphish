@@ -33,7 +33,7 @@ def ganache_chain(funded_account: LocalAccount):
             'ganache-cli',
             '--server.ws',
             '--server.port', str(_next_ganache_port),
-            '--wallet.accounts', f'{funded_account.key.hex()},{web3.Web3.toWei(1_000, "ether")}',
+            '--wallet.accounts', f'{funded_account.key.hex()},{web3.Web3.toWei(2_000, "ether")}',
             '--wallet.unlockedAccounts', f'{UNISWAP_V2_DEPLOYER}',
             '--wallet.unlockedAccounts', f'{UNISWAP_V3_DEPLOYER}',
             '--wallet.unlockedAccounts', f'{WETH_DEPLOYER}',
@@ -262,6 +262,34 @@ def nf_position_manager(ganache_chain, funded_account: LocalAccount, deployed_un
         bytecode=artifact['bytecode'],
     )
     txn = contract.constructor(deployed_uniswap_v3_factory, weth, w3.toChecksumAddress(b'\xa1' * 20)).buildTransaction({
+        'from': funded_account.address,
+        'maxFeePerGas': 80 * (10 ** 9),
+        'maxPriorityFeePerGas': 3 * (10 ** 9),
+        'gas': 6_000_000,
+    })
+
+    tx_hash = w3.eth.send_transaction(txn)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    assert receipt['status'] == 1
+
+    return receipt['contractAddress']
+
+
+@pytest.fixture()
+def v3_swap_router(ganache_chain, funded_account: LocalAccount, deployed_uniswap_v3_factory, weth):
+    """
+    Deploys the position manager helper contract
+    """
+    w3: web3.Web3 = ganache_chain
+
+    with open('./contracts/artifacts/V3SwapRouter.json') as fin:
+        artifact = json.load(fin)
+    
+    contract: web3.contract.Contract = w3.eth.contract(
+        abi=artifact['abi'],
+        bytecode=artifact['bytecode'],
+    )
+    txn = contract.constructor(deployed_uniswap_v3_factory, weth).buildTransaction({
         'from': funded_account.address,
         'maxFeePerGas': 80 * (10 ** 9),
         'maxPriorityFeePerGas': 3 * (10 ** 9),
