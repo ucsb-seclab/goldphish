@@ -11,11 +11,12 @@ import web3.contract
 import web3.types
 from eth_account.signers.local import LocalAccount
 import pricers
+import shooter
 import find_circuit.find
 from pricers.uniswap_v2 import UniswapV2Pricer
 from pricers.uniswap_v3 import UniswapV3Pricer
 
-from utils import decode_trace_calls, get_abi, pretty_print_trace
+from utils import decode_trace_calls, get_abi, pretty_print_trace, get_block_logs
 
 
 def deploy_v3_pool(
@@ -417,12 +418,110 @@ def test_basic_arbitrage(
     token0, token1 = sorted([weth, token_a], key=lambda x: bytes.fromhex(x[2:]))
 
     # attempt to find arbitrage
+    univ3_pricer = UniswapV3Pricer(w3, univ3_pool, token0, token1, 3_000)
+    univ2_pricer = UniswapV2Pricer(w3, univ2_pool, token0, token1)
+
     exchanges = [
-        UniswapV3Pricer(w3, univ3_pool, token0, token1, 3_000),
-        UniswapV2Pricer(w3, univ2_pool, token0, token1)
+        univ3_pricer,
+        univ2_pricer,
     ]
 
     got = find_circuit.find.detect_arbitrages(exchanges, block_identifier=w3.eth.get_block('latest')['number'])
     assert len(got) > 0
-    print(got)
+
+    arbitrage = max(got, key=lambda x: x.profit)
+
+    # deploy shooter
+    shooter_addr = shooter.deploy.deploy_shooter(
+        w3,
+        funded_account,
+        max_priority = 3 * (10 ** 9),
+        max_fee_total = w3.toWei(1, 'ether'),
+    )
+
+    # synthesize arbitrage
+    shot = shooter.composer.construct_from_found_arbitrage(arbitrage, 0, w3.eth.get_block('latest')['number'] + 1)
+
+    # fire shot
+    txn: web3.types.TxParams = {
+        'chainId': w3.eth.chain_id,
+        'from': funded_account.address,
+        'to': shooter_addr,
+        'value': 0,
+        'nonce': w3.eth.get_transaction_count(funded_account.address),
+        'data': shot,
+        'gas': 400_000,
+        'maxPriorityFeePerGas': 2,
+        'maxFeePerGas': 500 * (10 ** 9),
+    }
+    signed_txn = w3.eth.account.sign_transaction(txn, funded_account.key)
+    tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+    # update pricers
+    block_logs = get_block_logs(w3, 'latest')
+    univ3_pricer.observe_block(block_logs)
+    univ2_pricer.observe_block(block_logs)
+
+    assert receipt['status'] == 1
+    print(receipt)
+
+    #
+    # Second test of exchange
+    #
+
+    # another whale txn
+    swap_uniswap_v3(w3, funded_account, v3_swap_router, weth, token_a, w3.toWei(10, 'ether'))
+
+    # update pricers
+    block_logs = get_block_logs(w3, 'latest')
+    univ3_pricer.observe_block(block_logs)
+    univ2_pricer.observe_block(block_logs)
+
+    got = find_circuit.find.detect_arbitrages(exchanges, block_identifier=w3.eth.get_block('latest')['number'])
+    print('len(got)', len(got))
+    print('got', got)
+    arbitrage = max(got, key=lambda x: x.profit)
+    assert arbitrage is not None
+
+    # synthesize arbitrage
+    shot = shooter.composer.construct_from_found_arbitrage(arbitrage, w3.toWei(1.5, 'ether'), w3.eth.get_block('latest')['number'] + 1)
+    bal_before = w3.eth.get_balance(
+        funded_account.address
+    )
+
+    # fire shot
+    txn: web3.types.TxParams = {
+        'chainId': w3.eth.chain_id,
+        'from': funded_account.address,
+        'to': shooter_addr,
+        'value': w3.toWei(1.5, 'ether'),
+        'nonce': w3.eth.get_transaction_count(funded_account.address),
+        'data': shot,
+        'gas': 400_000,
+        'maxPriorityFeePerGas': 2,
+        'maxFeePerGas': 500 * (10 ** 9),
+    }
+    signed_txn = w3.eth.account.sign_transaction(txn, funded_account.key)
+    tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+    if receipt['status'] != 1:
+        trace = w3.provider.make_request('debug_traceTransaction', [receipt['transactionHash'].hex()])
+        with open('/mnt/goldphish/trace.txt', mode='w') as fout:
+            for log in trace['result']['structLogs']:
+                fout.write(str(log) + '\n')
+
+        print('------------------our trace---------------------------')
+        decoded = decode_trace_calls(trace['result']['structLogs'], txn, receipt)
+        pretty_print_trace(decoded, txn, receipt)
+        print('------------------------------------------------------')
+        raise Exception('broken')
+
+    print(receipt)
+
+    bal_after = w3.eth.get_balance(funded_account.address)
+
+    total_fee = receipt['gasUsed'] * receipt['effectiveGasPrice']
+    assert bal_before - (total_fee + w3.toWei(1.5, 'ether')) == bal_after
 

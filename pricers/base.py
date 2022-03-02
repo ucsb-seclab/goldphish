@@ -9,6 +9,7 @@ class BaseExchangePricer:
     w3: web3.Web3
     token0: str
     token1: str
+    address: str
 
     def __init__(self, w3: web3.Web3) -> None:
         self.w3 = w3

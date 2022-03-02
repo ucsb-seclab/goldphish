@@ -6,13 +6,17 @@ Finds a profitable arbitrage circuit
 import math
 import typing
 
+import logging
 import scipy.optimize
 
 import pricers.base
 
+l = logging.getLogger(__name__)
+
 class FoundArbitrage(typing.NamedTuple):
     amount_in: int
-    circuit: typing.List[typing.Tuple[pricers.base.BaseExchangePricer]]
+    circuit: typing.List[pricers.base.BaseExchangePricer]
+    directions: typing.List[bool]
     pivot_token: str
     profit: int
 
@@ -52,7 +56,6 @@ class PricingCircuit:
         self._directions = _directions
         assert len(self._circuit) == len(self._directions)
 
-
     @property
     def pivot_token(self) -> str:
         if self._directions[0] == True:
@@ -65,6 +68,10 @@ class PricingCircuit:
     def circuit(self) -> typing.List[pricers.base.BaseExchangePricer]:
         return list(self._circuit)
 
+    @property
+    def directions(self) -> typing.List[bool]:
+        return list(self._directions)
+
     def sample(self, amount_in: int, block_identifier: int) -> int:
         """
         Run the circuit with the given amount_in, returning the amount_out
@@ -75,12 +82,14 @@ class PricingCircuit:
             if dxn == True:
                 # zeroForOne
                 assert last_token == p.token0
-                curr_amt = p.exact_token0_to_token1(amount_in, block_identifier)
+                curr_amt = p.exact_token0_to_token1(curr_amt, block_identifier)
                 last_token = p.token1
             else:
+                assert dxn == False
                 assert last_token == p.token1
-                curr_amt = p.exact_token1_to_token0(amount_in, block_identifier)
+                curr_amt = p.exact_token1_to_token0(curr_amt, block_identifier)
                 last_token = p.token0
+        assert last_token == self.pivot_token
         return curr_amt
 
     def rotate(self):
@@ -123,24 +132,35 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
             print('testing', pc.circuit)
             print('directions', pc._directions)
             print('pivot', pc.pivot_token)
-            result = scipy.optimize.minimize_scalar(
-                fun = lambda x: - (run_exc(x) - x),
-                bounds = (
-                    100, # only a little
-                    (1_000 * (10 ** 18)) # a shit-ton
-                ),
-                method='bounded'
-            )
-            if result.fun < 0:
-                # profit reported
-                ret.append(
-                    FoundArbitrage(
-                        amount_in   = math.ceil(result.x),
-                        circuit     = pc.circuit,
-                        pivot_token = pc.pivot_token,
-                        profit      = -result.fun,
-                    )
+
+            # quickly try pushing 100 tokens -- if unprofitable, fail
+            quick_test_amount_in = 100
+            quick_test_amount_out = pc.sample(100, block_identifier)
+
+            if quick_test_amount_out > quick_test_amount_in:
+                # this may be profitable
+                result = scipy.optimize.minimize_scalar(
+                    fun = lambda x: - (run_exc(x) - x),
+                    bounds = (
+                        100, # only a little
+                        (1_000 * (10 ** 18)) # a shit-ton
+                    ),
+                    method='bounded'
                 )
+                if result.fun < 0:
+                    amount_in = math.ceil(result.x)
+                    expected_profit = pc.sample(amount_in, block_identifier) - amount_in
+                    if expected_profit < 0:
+                        l.warning('fun indicated profit but expected profit did not!')
+                    else:
+                        to_add = FoundArbitrage(
+                            amount_in   = amount_in,
+                            directions  = pc.directions,
+                            circuit     = pc.circuit,
+                            pivot_token = pc.pivot_token,
+                            profit      = expected_profit,
+                        )
+                        ret.append(to_add)
             pc.flip()
         pc.rotate()
     return ret

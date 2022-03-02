@@ -59,10 +59,10 @@ class UniswapV2Pricer(BaseExchangePricer):
         return (self.known_token0_bal, self.known_token1_bal)
 
     def quote_token0_to_token1(self, token0_amount, block_identifier=int) -> int:
-        return self.token1_out_for_exact_token0_in(token0_amount, block_identifier)
+        return self.exact_token0_to_token1(token0_amount, block_identifier)
 
     def quote_token1_to_token0(self, token1_amount, block_identifier=int) -> int:
-        return self.token0_out_for_exact_token1_in(token1_amount, block_identifier)
+        return self.exact_token1_to_token0(token1_amount, block_identifier)
 
     def exact_token0_to_token1(self, token0_amount, block_identifier=int) -> int:
         # based off https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol#L43
@@ -96,6 +96,7 @@ class UniswapV2Pricer(BaseExchangePricer):
                 bal0 = sync['args']['reserve0']
                 assert bal0 >= 0
                 bal1 = sync['args']['reserve1']
-                assert bal1 >= 1
-                self.balance_cache[block_num] = (bal0, bal1)
+                assert bal1 >= 0
+                self.known_token0_bal = bal0
+                self.known_token1_bal = bal1
                 return # this is all we care about -- the last Sync done

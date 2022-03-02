@@ -19,7 +19,7 @@ WETH                = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
 
 @pytest.fixture(scope='module')
 def funded_account():
-    return Account.from_key(b'\x30' * 32)
+    return Account.from_key(bytes.fromhex('ab1179084d3336336d60b2ed654d99a21c2644cadd89fd3034ee592e931e4a77'))
 
 
 _next_ganache_port = 6555

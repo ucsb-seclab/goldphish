@@ -7,6 +7,8 @@ import typing
 import logging
 
 import shooter.encoder
+import pricers
+import find_circuit.find
 
 from .constants import MAX_COINBASE_XFER, WETH_ADDRESS
 
@@ -23,6 +25,40 @@ class ExchangeRecord(typing.NamedTuple):
     @property
     def zero_for_one(self) -> bool:
         return bytes.fromhex(self.token_in[2:]) < bytes.fromhex(self.token_out[2:])
+
+def construct_from_found_arbitrage(fa: find_circuit.find.FoundArbitrage, coinbase_xfer: int, target_block: int):
+    """
+    Simple wrapper over construct() which transforms the input into expected named tuple.
+    """
+    assert len(fa.circuit) == len(fa.directions)
+
+    exchanges: typing.List[ExchangeRecord] = []
+
+    last_out = fa.amount_in
+    for dxn, p in zip(fa.directions, fa.circuit):
+        if dxn == True:
+            # zeroForOne
+            amt_out = p.exact_token0_to_token1(last_out, target_block - 1)
+            token_in = p.token0
+            token_out = p.token1
+        else:
+            assert dxn == False
+            amt_out = p.exact_token1_to_token0(last_out, target_block - 1)
+            token_in = p.token1
+            token_out = p.token0
+        exchanges.append(ExchangeRecord(
+            is_uniswap_v2 = isinstance(p, pricers.uniswap_v2.UniswapV2Pricer),
+            address = p.address,
+            amount_in = last_out,
+            amount_out = amt_out,
+            token_in = token_in,
+            token_out = token_out,
+        ))
+        last_out = amt_out
+    assert last_out > fa.amount_in
+
+    return construct(exchanges, coinbase_xfer, target_block)    
+
 
 def construct(
         exchanges: typing.List[ExchangeRecord],

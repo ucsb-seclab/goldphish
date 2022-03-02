@@ -192,6 +192,16 @@ def get_abi(abiname) -> typing.Any:
     return abi
 
 
+def get_block_logs(w3: web3.Web3, block_identifier: int) -> typing.List[web3.types.LogReceipt]:
+    block = w3.eth.get_block(block_identifier)
+    
+    logs = []
+    for txn in block['transactions']:
+        receipt = w3.eth.get_transaction_receipt(txn)
+        logs = logs + receipt['logs']
+    return logs
+
+
 # taken from https://gist.github.com/thatalextaylor/7408395 on Jan 12th 2022
 def pretty_time_delta(seconds):
     sign_string = '-' if seconds < 0 else ''
