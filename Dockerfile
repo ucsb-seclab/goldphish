@@ -8,7 +8,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_17.x | bash -
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y python3 python3-pip nodejs yarn psmisc
 
-RUN pip install web3 numpy scipy tabulate pytest
+RUN pip install web3 numpy scipy tabulate pytest networkx
 
 WORKDIR /opt/goldphish
 
@@ -20,5 +20,11 @@ RUN yarn install
 COPY hardhat.config.js .
 COPY contracts contracts
 RUN yarn hardhat compile
+
+# COPY vend vend
+
+# # build ganache
+# RUN cd vend/ganache && npm install
+# RUN cd vend/ganache && npm ci
 
 COPY . ./

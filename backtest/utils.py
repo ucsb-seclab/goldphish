@@ -33,6 +33,16 @@ def funded_deployer() -> LocalAccount:
     ret: LocalAccount = Account.from_key(bytes.fromhex('0xab1179084d3336336d60b2ed654d99a21c2644cadd89fd3034ee592e931e4a77'[2:]))
     return ret
 
+def mine_block(w3: web3.Web3):
+    block = w3.eth.get_block('latest')
+    block_num_before = block['number']
+
+    resp = w3.provider.make_request('evm_mine', [block['timestamp'] + 12])
+
+    bn_result = w3.provider.make_request('eth_blockNumber', [])
+    block_num_after = int(bn_result['result'][2:], base=16)
+
+    assert block_num_before + 1 == block_num_after, f'expected {block_num_before} + 1 == {block_num_after}'
 
 _next_ganache_port = 4444
 def get_ganache_fork(w3: web3.Web3, target_block: int, unlock: typing.Optional[typing.List[str]] = None) -> typing.Iterator[web3.Web3]:
@@ -60,7 +70,8 @@ def get_ganache_fork(w3: web3.Web3, target_block: int, unlock: typing.Optional[t
             '--chain.chainId', '1',
             '--chain.time', str(old_ts * 1_000), # unit conversion needed for some reason -- blame javascript
             '--miner.coinbase', web3.Web3.toChecksumAddress(b'\xa0' * 20) + ' ',
-            '--miner.blockTime', '1',
+            '--miner.blockTime', '100',
+            '--miner.blockGasLimit', str(60_000_000),
             *extra_args
         ],
         stdout=subprocess.DEVNULL,
@@ -87,6 +98,16 @@ def get_ganache_fork(w3: web3.Web3, target_block: int, unlock: typing.Optional[t
 
     assert w3.isConnected()
     tip = w3.eth.get_block('latest')
+    l.debug(f'tip after fork {tip["number"]:,}')
+
+    w3.provider.make_request('miner_stop', [])
+
+    # patch wait to make a mine block request
+    old_wait = w3.eth.wait_for_transaction_receipt
+    def new_wait(*args, **kwargs):
+        mine_block(w3)
+        return old_wait(*args, **kwargs)
+    w3.eth.wait_for_transaction_receipt = new_wait
 
     yield w3
 

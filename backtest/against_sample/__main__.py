@@ -1,18 +1,19 @@
 import collections
+import time
 import typing
 import io
 import sys
 import web3
 import os
 import web3.types
+import web3.exceptions
 import web3.contract
 import web3._utils.events
 import web3._utils.filters
 import logging
 import logging.handlers
 from eth_utils import event_abi_to_log_topic
-from tests.conftest import funded_deployer
-
+from ..utils import mine_block
 from utils import ProgressReporter, get_abi, decode_trace_calls, pretty_print_trace
 
 import shooter.deploy
@@ -73,6 +74,7 @@ def try_replay(w3: web3.Web3, ganache: web3.Web3, receipt: web3.types.TxReceipt,
     ret = []
     for t in extras:
         ret.append(ganache.eth.send_raw_transaction(t))
+        l.debug('submitted ' + ret[-1].hex())
 
     important_exchanges = set()
     for log in receipt['logs']:
@@ -80,10 +82,27 @@ def try_replay(w3: web3.Web3, ganache: web3.Web3, receipt: web3.types.TxReceipt,
             important_exchanges.add(log['address'])
     assert len(important_exchanges) >= 2
 
+    l.debug(f'Important exchanges: {", ".join(sorted(important_exchanges))}')
+    mine_block(ganache)
+    mine_block(ganache)
+
     for h in hashes:
-        r = ganache.eth.wait_for_transaction_receipt(h)
+        r = ganache.eth.get_transaction_receipt(h)
+        assert isinstance(r['blockNumber'], int)
         if r['status'] != 1:
             failed_resubmit.append(r['transactionHash'])
+        else:
+            l.debug(f'examining replay of {h.hex()}')
+            # if the transaction receipt touches one of our exchanges, ensure that the log is the same
+            old_receipt = w3.eth.get_transaction_receipt(h)
+            for log in r['logs']:
+                if log['address'] in important_exchanges:
+                    # ensure that this exists exactly in old_receipt
+                    for old_log in old_receipt['logs']:
+                        if log['topics'] == old_log['topics'] and log['data'] == old_log['data']:
+                            break
+                    else:
+                        raise IncompleteReplayException(f'failed to replay {h.hex()}')
 
     for failed in failed_resubmit:
         # status failed ... figure out if we really need to care
@@ -94,8 +113,7 @@ def try_replay(w3: web3.Web3, ganache: web3.Web3, receipt: web3.types.TxReceipt,
                 if log['address'] in important_exchanges:
                     raise IncompleteReplayException(f'failed to replay {h.hex()}')
         l.debug(f'Transaction {failed.hex()} failed, but that seems to be fine...')
-    for h in ret:
-        ganache.eth.wait_for_transaction_receipt(h)
+    
     # see which 
     l.debug('done replay')
     return ret
@@ -199,11 +217,11 @@ def get_arbitrages_from_sample(w3: web3.Web3, fout: io.TextIOWrapper) -> typing.
     progress_reporter = ProgressReporter(l, len(all_txns), 0)
     seen_point = False
     for _, txn_hash in all_txns:
-        if txn_hash != bytes.fromhex('5e0c7d2c2ab89bfab3d5341d31a3aa0b91f6472461609351e75c7fc50a98ffdc'):
-            if not seen_point:
-                continue
-        else:
-            seen_point = True
+        # if txn_hash != bytes.fromhex('af712bc65956d6c34a737e06a5a530e30139bbd67307d002f766d5aecb437160'):
+        #     if not seen_point:
+        #         continue
+        # else:
+        #     seen_point = True
         try:
             receipt = w3.eth.get_transaction_receipt(txn_hash)
 
@@ -316,154 +334,162 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
     assert len(arbitrage_chain) <= 3
     
     # poor man's context manager
-    for w3_fork in backtest.utils.get_ganache_fork(w3, receipt['blockNumber'] - 1):
-        # deploy shooter
-        deployer = backtest.utils.funded_deployer()
-        shooter_addr = shooter.deploy.deploy_shooter(
-            w3_fork,
-            deployer,
-            max_priority=3,
-            max_fee_total=w3.toWei('1', 'ether'),
-        )
-        l.debug('deployed shooter on new chain')
-
-        # wrap some ether
-        weth: web3.contract.Contract = w3_fork.eth.contract(
-            address='0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-            abi=get_abi('weth9/WETH9.json')['abi'],
-        )
-        wrap = weth.functions.deposit().buildTransaction({'value': 100, 'from': deployer.address})
-        wrap_hash = w3_fork.eth.send_transaction(wrap)
-        wrap_receipt = w3_fork.eth.wait_for_transaction_receipt(wrap_hash)
-        assert wrap_receipt['status'] == 1
-
-        # transfer to shooter
-        xfer = weth.functions.transfer(shooter_addr, 100).buildTransaction({'from': deployer.address})
-        xfer_hash = w3_fork.eth.send_transaction(xfer)
-        xfer_receipt = w3_fork.eth.wait_for_transaction_receipt(xfer_hash)
-        assert xfer_receipt['status'] == 1
-
-        shot = shooter.composer.construct(
-            arbitrage_chain,
-            coinbase_xfer=0,
-            target_block=w3_fork.eth.get_block('latest')['number'] + 1,
-        )
-        l.debug(f'About to shoot {shot.hex()}')
-
-        txn: web3.types.TxParams = {
-            'chainId': w3_fork.eth.chain_id,
-            'from': deployer.address,
-            'to': shooter_addr,
-            'value': 0,
-            'nonce': w3_fork.eth.get_transaction_count(deployer.address),
-            'data': shot,
-            'gas': 400_000,
-            'maxPriorityFeePerGas': 2,
-            'maxFeePerGas': 500 * (10 ** 9),
-        }
-        signed_txn = w3_fork.eth.account.sign_transaction(txn, deployer.key)
-        # tx_hash = w3_fork.eth.send_raw_transaction(signed_txn.rawTransaction)
+    while True:
         try:
-            got = try_replay(
-                w3,
-                w3_fork,
-                receipt,
-                extras=[signed_txn.rawTransaction,],
-            )
-            tx_hash = got[0]
-        except IncompleteReplayException as e:
-            fout_rejects.write(f'{receipt["transactionHash"].hex()},could not replay: {str(e)}\n')
-            l.exception('Relay was incomplete')
+            for w3_fork in backtest.utils.get_ganache_fork(w3, receipt['blockNumber'] - 1):
+                # deploy shooter
+                deployer = backtest.utils.funded_deployer()
+                shooter_addr = shooter.deploy.deploy_shooter(
+                    w3_fork,
+                    deployer,
+                    max_priority=3,
+                    max_fee_total=w3.toWei('1', 'ether'),
+                )
+                l.debug('deployed shooter on new chain')
+
+                # wrap some ether
+                weth: web3.contract.Contract = w3_fork.eth.contract(
+                    address='0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+                    abi=get_abi('weth9/WETH9.json')['abi'],
+                )
+                wrap = weth.functions.deposit().buildTransaction({'value': 100, 'from': deployer.address})
+                wrap_hash = w3_fork.eth.send_transaction(wrap)
+                wrap_receipt = w3_fork.eth.wait_for_transaction_receipt(wrap_hash)
+                assert wrap_receipt['status'] == 1
+
+                # transfer to shooter
+                xfer = weth.functions.transfer(shooter_addr, 100).buildTransaction({'from': deployer.address})
+                xfer_hash = w3_fork.eth.send_transaction(xfer)
+                xfer_receipt = w3_fork.eth.wait_for_transaction_receipt(xfer_hash)
+                assert xfer_receipt['status'] == 1
+
+                shot = shooter.composer.construct(
+                    arbitrage_chain,
+                    coinbase_xfer=0,
+                    target_block=w3_fork.eth.get_block('latest')['number'] + 1,
+                )
+                l.debug(f'About to shoot {shot.hex()}')
+
+                txn: web3.types.TxParams = {
+                    'chainId': w3_fork.eth.chain_id,
+                    'from': deployer.address,
+                    'to': shooter_addr,
+                    'value': 0,
+                    'nonce': w3_fork.eth.get_transaction_count(deployer.address),
+                    'data': shot,
+                    'gas': 400_000,
+                    'maxPriorityFeePerGas': 2,
+                    'maxFeePerGas': 1000 * (10 ** 9),
+                }
+                signed_txn = w3_fork.eth.account.sign_transaction(txn, deployer.key)
+                try:
+                    got = try_replay(
+                        w3,
+                        w3_fork,
+                        receipt,
+                        extras=[signed_txn.rawTransaction,],
+                    )
+                    tx_hash = got[0]
+                except IncompleteReplayException as e:
+                    fout_rejects.write(f'{receipt["transactionHash"].hex()},could not replay: {str(e)}\n')
+                    l.exception('Relay was incomplete')
+                    continue
+
+                new_receipt = w3_fork.eth.get_transaction_receipt(tx_hash)
+                
+                if new_receipt['status'] != 1:
+                    old_block_ts = w3.eth.get_block(receipt['blockHash'])['timestamp']
+                    new_block_ts = w3_fork.eth.get_block(new_receipt['blockHash'])['timestamp']
+                    l.debug(f'old block timestamp {old_block_ts:,}')
+                    l.debug(f'new block timestamp {new_block_ts:,}')
+
+                    l.debug(new_receipt)
+
+                    trace = w3_fork.provider.make_request('debug_traceTransaction', [new_receipt['transactionHash'].hex()])
+                    with open('/mnt/goldphish/trace.txt', mode='w') as fout:
+                        for log in trace['result']['structLogs']:
+                            fout.write(str(log) + '\n')
+
+                    print('------------------our trace---------------------------')
+                    decoded = decode_trace_calls(trace['result']['structLogs'], txn, new_receipt)
+                    pretty_print_trace(decoded, txn, new_receipt)
+                    print('------------------------------------------------------')
+
+                    print('------------------their trace-------------------------')
+                    their_txn = w3.eth.get_transaction(receipt['transactionHash'])
+                    trace_theirs = w3.provider.make_request('debug_traceTransaction', [receipt['transactionHash'].hex(), {'enableMemory': True}])
+                    decoded = decode_trace_calls(trace_theirs['result']['structLogs'], their_txn, receipt)
+                    pretty_print_trace(decoded, their_txn, receipt)
+                    print('------------------------------------------------------')
+
+                    # # attempt repro their shot
+                    # for w3_fork2 in backtest.utils.get_ganache_fork(w3, receipt['blockNumber'] - 1, unlock = [their_txn['from']]):
+                    #     backtest.utils.replay_to_txn(
+                    #         w3,
+                    #         w3_fork2,
+                    #         receipt,
+                    #     )
+                    #     new_block_tip = w3_fork2.eth.get_block('latest')['number']
+                    #     old_block_target_bin = int.to_bytes(receipt['blockNumber'], length=5, byteorder='big', signed=False)
+                    #     new_block_target_bin = int.to_bytes(new_block_tip + 1, length=5, byteorder='big', signed=False)
+                    #     print('old block target', old_block_target_bin.hex())
+                    #     print('new block target', old_block_target_bin.hex())
+                    #     old_input = their_txn['input']
+                    #     print('old input', old_input)
+                    #     assert old_block_target_bin.hex() in old_input
+                    #     new_input = old_input.replace(old_block_target_bin.hex(), new_block_target_bin.hex())
+                    #     new_txn: web3.types.TxParams = {
+                    #         'gas': their_txn['gas'],
+                    #         'chainId': their_txn['chainId'],
+                    #         'maxFeePerGas': their_txn['maxFeePerGas'],
+                    #         'maxPriorityFeePerGas': their_txn['maxPriorityFeePerGas'],
+                    #         'from': their_txn['from'],
+                    #         'to': their_txn['to'],
+                    #         'nonce': their_txn['nonce'],
+                    #         'input': new_input
+                    #     }
+                    #     print(new_txn)
+                    #     txn_hash = w3_fork2.eth.send_transaction(new_txn)
+                    #     new_reshoot_receipt = w3_fork2.eth.wait_for_transaction_receipt(txn_hash)
+                    #     print(new_reshoot_receipt)
+
+
+                    raise Exception('status should be success')
+
+
+
+                # ensure our exchanges align with the old one
+                new_profits = backtest.utils.parse_logs_for_net_profit(new_receipt['logs'])
+                old_profits = backtest.utils.parse_logs_for_net_profit(receipt['logs'])
+                assert set(new_profits.keys()) == set(old_profits.keys())
+                took_profit_in = None
+                for token_addr in new_profits.keys():
+                    new_shooter_mvmt = new_profits[token_addr].get(shooter_addr, None)
+                    old_shooter_mvmt = old_profits[token_addr].get(SAMPLE_ADDR, None)
+                    if new_shooter_mvmt is not None:
+                        assert new_shooter_mvmt >= old_shooter_mvmt, 'we didnt make enough profit'
+                        if new_shooter_mvmt > old_shooter_mvmt:
+                            l.warning(f'Unexpected increase in profits after reshoot: {receipt["transactionHash"].hex()}')
+                        assert new_shooter_mvmt > 0
+                        took_profit_in = token_addr
+                    else:
+                        assert old_shooter_mvmt is None
+                assert took_profit_in == '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+
+                # log to output
+                old_gas = receipt['gasUsed']
+                new_gas = new_receipt['gasUsed']
+                old_gasprice = receipt['effectiveGasPrice']
+                profit_amount = old_profits[took_profit_in][SAMPLE_ADDR]
+                fout.write(f'{receipt["blockNumber"]},{receipt["transactionHash"].hex()},{old_gas},{new_gas},{old_gasprice},{profit_amount}\n')
+                fout.flush()
+        except web3.exceptions.TimeExhausted:
+            wait_time = 60
+            l.exception(f'retrying in {wait_time} seconds due to time exhausted')
+            time.sleep(wait_time)
             continue
-
-        new_receipt = w3_fork.eth.get_transaction_receipt(tx_hash)
-        
-        if new_receipt['status'] != 1:
-            old_block_ts = w3.eth.get_block(receipt['blockHash'])['timestamp']
-            new_block_ts = w3_fork.eth.get_block(new_receipt['blockHash'])['timestamp']
-            l.debug(f'old block timestamp {old_block_ts:,}')
-            l.debug(f'new block timestamp {new_block_ts:,}')
-
-            l.debug(new_receipt)
-
-            trace = w3_fork.provider.make_request('debug_traceTransaction', [new_receipt['transactionHash'].hex()])
-            with open('/mnt/goldphish/trace.txt', mode='w') as fout:
-                for log in trace['result']['structLogs']:
-                    fout.write(str(log) + '\n')
-
-            print('------------------our trace---------------------------')
-            decoded = decode_trace_calls(trace['result']['structLogs'], txn, new_receipt)
-            pretty_print_trace(decoded, txn, new_receipt)
-            print('------------------------------------------------------')
-
-            print('------------------their trace-------------------------')
-            their_txn = w3.eth.get_transaction(receipt['transactionHash'])
-            trace_theirs = w3.provider.make_request('debug_traceTransaction', [receipt['transactionHash'].hex(), {'enableMemory': True}])
-            decoded = decode_trace_calls(trace_theirs['result']['structLogs'], their_txn, receipt)
-            pretty_print_trace(decoded, their_txn, receipt)
-            print('------------------------------------------------------')
-
-            # # attempt repro their shot
-            # for w3_fork2 in backtest.utils.get_ganache_fork(w3, receipt['blockNumber'] - 1, unlock = [their_txn['from']]):
-            #     backtest.utils.replay_to_txn(
-            #         w3,
-            #         w3_fork2,
-            #         receipt,
-            #     )
-            #     new_block_tip = w3_fork2.eth.get_block('latest')['number']
-            #     old_block_target_bin = int.to_bytes(receipt['blockNumber'], length=5, byteorder='big', signed=False)
-            #     new_block_target_bin = int.to_bytes(new_block_tip + 1, length=5, byteorder='big', signed=False)
-            #     print('old block target', old_block_target_bin.hex())
-            #     print('new block target', old_block_target_bin.hex())
-            #     old_input = their_txn['input']
-            #     print('old input', old_input)
-            #     assert old_block_target_bin.hex() in old_input
-            #     new_input = old_input.replace(old_block_target_bin.hex(), new_block_target_bin.hex())
-            #     new_txn: web3.types.TxParams = {
-            #         'gas': their_txn['gas'],
-            #         'chainId': their_txn['chainId'],
-            #         'maxFeePerGas': their_txn['maxFeePerGas'],
-            #         'maxPriorityFeePerGas': their_txn['maxPriorityFeePerGas'],
-            #         'from': their_txn['from'],
-            #         'to': their_txn['to'],
-            #         'nonce': their_txn['nonce'],
-            #         'input': new_input
-            #     }
-            #     print(new_txn)
-            #     txn_hash = w3_fork2.eth.send_transaction(new_txn)
-            #     new_reshoot_receipt = w3_fork2.eth.wait_for_transaction_receipt(txn_hash)
-            #     print(new_reshoot_receipt)
-
-
-            raise Exception('status should be success')
-
-
-
-        # ensure our exchanges align with the old one
-        new_profits = backtest.utils.parse_logs_for_net_profit(new_receipt['logs'])
-        old_profits = backtest.utils.parse_logs_for_net_profit(receipt['logs'])
-        assert set(new_profits.keys()) == set(old_profits.keys())
-        took_profit_in = None
-        for token_addr in new_profits.keys():
-            new_shooter_mvmt = new_profits[token_addr].get(shooter_addr, None)
-            old_shooter_mvmt = old_profits[token_addr].get(SAMPLE_ADDR, None)
-            if new_shooter_mvmt is not None:
-                assert new_shooter_mvmt >= old_shooter_mvmt, 'we didnt make enough profit'
-                if new_shooter_mvmt > old_shooter_mvmt:
-                    l.warning(f'Unexpected increase in profits after reshoot: {receipt["transactionHash"].hex()}')
-                assert new_shooter_mvmt > 0
-                took_profit_in = token_addr
-            else:
-                assert old_shooter_mvmt is None
-        assert took_profit_in == '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
-
-        # log to output
-        old_gas = receipt['gasUsed']
-        new_gas = new_receipt['gasUsed']
-        old_gasprice = receipt['effectiveGasPrice']
-        profit_amount = old_profits[took_profit_in][SAMPLE_ADDR]
-        fout.write(f'{receipt["blockNumber"]},{receipt["transactionHash"].hex()},{old_gas},{new_gas},{old_gasprice},{profit_amount}\n')
-        fout.flush()
+        # no exception, no need to retry
+        break
 
     l.debug('done processing transaction')
 
