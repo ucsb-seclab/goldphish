@@ -50,6 +50,13 @@ class IncompleteReplayException(Exception):
     def __init__(self, *args: object) -> None:
         super().__init__(*args)
 
+def get_relevant_exchanges(receipt: web3.types.TxReceipt) -> typing.Set[str]:
+    important_exchanges = set()
+    for log in receipt['logs']:
+        if len(log['topics']) > 0 and log['topics'][0] in [UNIV2_SWAP_TOPIC, UNIV3_SWAP_TOPIC]:
+            important_exchanges.add(log['address'])
+    return important_exchanges
+
 def try_replay(w3: web3.Web3, ganache: web3.Web3, receipt: web3.types.TxReceipt, extras: typing.List = []):
     """
     Replay transactions from the top of the block `receipt` appears in.
@@ -76,10 +83,7 @@ def try_replay(w3: web3.Web3, ganache: web3.Web3, receipt: web3.types.TxReceipt,
         ret.append(ganache.eth.send_raw_transaction(t))
         l.debug('submitted ' + ret[-1].hex())
 
-    important_exchanges = set()
-    for log in receipt['logs']:
-        if len(log['topics']) > 0 and log['topics'][0] in [UNIV2_SWAP_TOPIC, UNIV3_SWAP_TOPIC]:
-            important_exchanges.add(log['address'])
+    important_exchanges = get_relevant_exchanges(receipt)
     assert len(important_exchanges) >= 2
 
     l.debug(f'Important exchanges: {", ".join(sorted(important_exchanges))}')
@@ -93,13 +97,20 @@ def try_replay(w3: web3.Web3, ganache: web3.Web3, receipt: web3.types.TxReceipt,
             failed_resubmit.append(r['transactionHash'])
         else:
             l.debug(f'examining replay of {h.hex()}')
-            # if the transaction receipt touches one of our exchanges, ensure that the log is the same
             old_receipt = w3.eth.get_transaction_receipt(h)
             for log in r['logs']:
                 if log['address'] in important_exchanges:
                     # ensure that this exists exactly in old_receipt
                     for old_log in old_receipt['logs']:
-                        if log['topics'] == old_log['topics'] and log['data'] == old_log['data']:
+                        if log['topics'] == old_log['topics'] and log['data'] == old_log['data'] and log['removed'] == old_log['removed']:
+                            break
+                    else:
+                        raise IncompleteReplayException(f'failed to replay {h.hex()}')
+            for old_log in old_receipt['logs']:
+                if old_log['address'] in important_exchanges:
+                    # ensure that this exists exactly in new receipt 'r'
+                    for log in r['logs']:
+                        if log['topics'] == old_log['topics'] and log['data'] == old_log['data'] and log['removed'] == old_log['removed']:
                             break
                     else:
                         raise IncompleteReplayException(f'failed to replay {h.hex()}')
@@ -217,11 +228,11 @@ def get_arbitrages_from_sample(w3: web3.Web3, fout: io.TextIOWrapper) -> typing.
     progress_reporter = ProgressReporter(l, len(all_txns), 0)
     seen_point = False
     for _, txn_hash in all_txns:
-        # if txn_hash != bytes.fromhex('af712bc65956d6c34a737e06a5a530e30139bbd67307d002f766d5aecb437160'):
-        #     if not seen_point:
-        #         continue
-        # else:
-        #     seen_point = True
+        if txn_hash != bytes.fromhex('37716d597b1879304b0279008aab51424f552f05f1491cef5b068531aa2fcee6'):
+            if not seen_point:
+                continue
+        else:
+            seen_point = True
         try:
             receipt = w3.eth.get_transaction_receipt(txn_hash)
 
@@ -404,6 +415,36 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
                     l.debug(f'new block timestamp {new_block_ts:,}')
 
                     l.debug(new_receipt)
+
+                    # check to see if this is caused by the ganache REVERT bug
+                    bugged = False
+                    b = w3.eth.get_block(receipt['blockHash'])
+                    relevant_exchanges = get_relevant_exchanges(receipt)
+                    for h in b['transactions']:
+                        if h == receipt['transactionHash']:
+                            break
+                        r = w3.eth.get_transaction_receipt(h)
+                        if r['status'] == 1:
+                            for log in r['logs']:
+                                if log['address'] in relevant_exchanges:
+                                    # this guy is relevant! see if it had a revert() in the trace -- if so,
+                                    # this reshoot failure is because of the ganache REVERT bug, where it fails
+                                    # to commit state
+                                    trace = w3.provider.make_request('debug_traceTransaction', [r['transactionHash'].hex()])
+                                    for sl in trace['result']['structLogs']:
+                                        if sl['op'] == 'REVERT':
+                                            fout_rejects.write(f'{receipt["transactionHash"].hex()},could not replay: due to ganache REVERT bug\n')
+                                            l.error(f'presumed ganache REVERT bug in txn {r["transactionHash"].hex()} prevented reshoot of {receipt["transactionHash"].hex()}')
+                                            bugged = True
+                                            break
+                                if bugged:
+                                    break
+                        if bugged:
+                            break
+                    else:
+                        raise Exception('Should have seen transactionHash in this block')
+                    if bugged:
+                        continue
 
                     trace = w3_fork.provider.make_request('debug_traceTransaction', [new_receipt['transactionHash'].hex()])
                     with open('/mnt/goldphish/trace.txt', mode='w') as fout:
