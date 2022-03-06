@@ -26,6 +26,10 @@ class ExchangeRecord(typing.NamedTuple):
     def zero_for_one(self) -> bool:
         return bytes.fromhex(self.token_in[2:]) < bytes.fromhex(self.token_out[2:])
 
+    @property
+    def amount_out_less_token_fee(self) -> int:
+        return pricers.out_from_transfer(self.token_out, self.amount_out)
+
 def construct_from_found_arbitrage(fa: find_circuit.find.FoundArbitrage, coinbase_xfer: int, target_block: int):
     """
     Simple wrapper over construct() which transforms the input into expected named tuple.
@@ -54,7 +58,7 @@ def construct_from_found_arbitrage(fa: find_circuit.find.FoundArbitrage, coinbas
             token_in = token_in,
             token_out = token_out,
         ))
-        last_out = amt_out
+        last_out = pricers.out_from_transfer(token_out, amt_out)
     assert last_out > fa.amount_in
 
     return construct(exchanges, coinbase_xfer, target_block)    
@@ -67,6 +71,9 @@ def construct(
     ):
     assert 2 <= len(exchanges) <= 3
     assert 0 <= coinbase_xfer <= MAX_COINBASE_XFER
+
+    for e in exchanges:
+        l.debug(e)
 
     univ3_chain: typing.List[ExchangeRecord] = []
     univ2_chain: typing.List[ExchangeRecord] = []
@@ -103,7 +110,7 @@ def construct(
     if len(univ2_chain) > 0:
         # sanity check -- uniswap v2s must pay for each other
         assert univ2_chain[-1].token_out == univ3_chain[-1].token_in
-        assert univ2_chain[-1].amount_out >= univ3_chain[-1].amount_in
+        assert univ2_chain[-1].amount_out_less_token_fee >= univ3_chain[-1].amount_in
         # sanity check -- the token input should be available from the first v3 exchange
         assert univ3_chain[0].token_out == univ2_chain[0].token_in
 
@@ -118,7 +125,7 @@ def construct(
     # Handle each situation separately, I suppose. This makes the logic perhaps a bit more readable (but repeated).
 
     if len(univ3_chain) == 1 and len(univ2_chain) == 1:
-        if univ3_chain[0].amount_out > univ2_chain[0].amount_in:
+        if univ3_chain[0].amount_out_less_token_fee > univ2_chain[0].amount_in:
             # SITUATION
             #   (uv3) -- profit --> (uv2) --> (uv3)
             #
@@ -149,7 +156,7 @@ def construct(
             #   uv3 -> self
             #     self -> uv2
             #     uv2 -> uv3
-            assert univ2_chain[0].amount_out > univ3_chain[0].amount_in
+            assert univ2_chain[0].amount_out_less_token_fee > univ3_chain[0].amount_in
             excs = [
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[0].address,
@@ -166,7 +173,7 @@ def construct(
                 )
             ]
     elif len(univ3_chain) == 1 and len(univ2_chain) == 2:
-        if univ3_chain[0].amount_out > univ2_chain[0].amount_in:
+        if univ3_chain[0].amount_out_less_token_fee > univ2_chain[0].amount_in:
             l.debug('Cycle situation 3')
             # SITUATION
             #   (uv3) -- profit --> (uv2a) --> (uv2b) --> (uv3)
@@ -197,7 +204,7 @@ def construct(
                     recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
                 )
             ]
-        elif univ2_chain[0].amount_out > univ2_chain[1].amount_in:
+        elif univ2_chain[0].amount_out_less_token_fee > univ2_chain[1].amount_in:
             l.debug('Cycle situation 4')
             # SITUATION
             #   (uv3) --> (uv2a) -- profit --> (uv2b) --> (uv3)
@@ -229,7 +236,7 @@ def construct(
                 )
             ]
         else:
-            assert univ2_chain[1].amount_out > univ3_chain[0].amount_in
+            assert univ2_chain[1].amount_out_less_token_fee > univ3_chain[0].amount_in
             l.debug('Cycle situation 5')
             # SITUATION
             #   (uv3) --> (uv2a) --> (uv2b) -- profit --> (uv3)
@@ -261,7 +268,7 @@ def construct(
                 ),
             ]
     elif len(univ3_chain) == 2 and len(univ2_chain) == 1:
-        if univ3_chain[0].amount_in < univ3_chain[1].amount_out:
+        if univ3_chain[0].amount_in < univ3_chain[1].amount_out_less_token_fee:
             l.debug('Cycle situation 6')
             # SITUATION
             #   (uv3_1) -- profit --> (uv3_0) --> (uv2) --> (uv3_1)
@@ -291,7 +298,7 @@ def construct(
                     recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
                 ),
             ]
-        elif univ3_chain[0].amount_out > univ2_chain[0].amount_in:
+        elif univ3_chain[0].amount_out_less_token_fee > univ2_chain[0].amount_in:
             l.debug('Cycle situation 7')
             # SITUATION
             #   (uv3_1) --> (uv3_0) -- profit --> (uv2) --> (uv3_1)
@@ -322,7 +329,7 @@ def construct(
                 ),
             ]
         else:
-            assert univ2_chain[0].amount_out > univ3_chain[1].amount_in
+            assert univ2_chain[0].amount_out_less_token_fee > univ3_chain[1].amount_in
             l.debug('Cycle situation 8')
             # SITUATION
             #   (uv3_1) --> (uv3_0) --> (uv2) -- profit --> (uv3_1)
@@ -361,13 +368,13 @@ def construct(
         # (uv3_2) --> (uv3_1) --> (uv3_0) --> (uv3_2) // implicit profit possible along any of these
         
         # rotate so that profit is at the beginning
-        while not (univ3_chain[0].amount_out > univ3_chain[-1].amount_in):
+        while not (univ3_chain[0].amount_out_less_token_fee > univ3_chain[-1].amount_in):
             univ3_chain = univ3_chain[1:] + univ3_chain[:1]
 
         # ensure invariant(s) hold
         for ex1, ex2 in zip(univ3_chain, (univ3_chain[1:] + univ3_chain[:1])):
             assert ex1.token_in == ex2.token_out
-        assert univ3_chain[0].amount_out > univ3_chain[-1].amount_in
+        assert univ3_chain[0].amount_out_less_token_fee > univ3_chain[-1].amount_in
 
         # NORMALIZED SITUATION
         # (uv3_2) --> (uv3_1) --> (uv3_0) -- profit --> (uv3_2)
@@ -379,7 +386,7 @@ def construct(
 
         for i, exchange in list(enumerate(univ3_chain)):
             assert exchange.token_out == univ3_chain[i-1].token_in
-            if exchange.amount_out > univ3_chain[i-1].amount_in:
+            if exchange.amount_out_less_token_fee > univ3_chain[i-1].amount_in:
                 # we're taking profit, must send to self
                 recipient = shooter.encoder.FundsRecipient.SHOOTER
             else:

@@ -228,7 +228,7 @@ def get_arbitrages_from_sample(w3: web3.Web3, fout: io.TextIOWrapper) -> typing.
     progress_reporter = ProgressReporter(l, len(all_txns), 0)
     seen_point = False
     for _, txn_hash in all_txns:
-        if txn_hash != bytes.fromhex('37716d597b1879304b0279008aab51424f552f05f1491cef5b068531aa2fcee6'):
+        if txn_hash != bytes.fromhex('28d5f036e455619472c9235fd503d0b1b941e9a5680428e5e880df3610053416'):
             if not seen_point:
                 continue
         else:
@@ -302,15 +302,17 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
             exc = univ2.events.Swap().processLog(log)
             exchange = log['address']
             is_v2 = True
-            zero_for_one = exc['args']['amount0In'] > 0
+            zero_for_one = exc['args']['amount1Out'] > 0
             if zero_for_one:
-                assert exc['args']['amount1In'] == 0
+                if exc['args']['amount1In'] > 0:
+                    l.warning(f"Found amount1In={exc['args']['amount1In']} when zeroForOne; weird")
                 assert exc['args']['amount0Out'] == 0
                 amount_in = exc['args']['amount0In']
                 amount_out = exc['args']['amount1Out']
                 (token_in, token_out) = pairs[exchange]
             else:
-                assert exc['args']['amount0In'] == 0
+                if exc['args']['amount0In'] > 0:
+                    l.warning(f"Found amount0In={exc['args']['amount0In']} when zeroForOne; weird")
                 assert exc['args']['amount1Out'] == 0
                 amount_in = exc['args']['amount1In']
                 amount_out = exc['args']['amount0Out']
