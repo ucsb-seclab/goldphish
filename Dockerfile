@@ -8,7 +8,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_17.x | bash -
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y python3 python3-pip nodejs yarn psmisc
 
-RUN pip install web3 numpy scipy tabulate pytest networkx
+RUN pip install web3 numpy scipy tabulate pytest networkx cachetools
 
 WORKDIR /opt/goldphish
 

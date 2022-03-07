@@ -1,7 +1,7 @@
 """
 find_circuit/find.py
 
-Finds a profitable arbitrage circuit
+Finds a profitable arbitrage circuit given point-in-time params.
 """
 import math
 import typing
@@ -129,9 +129,6 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
         run_exc = lambda i: pc.sample(math.ceil(i), block_identifier)
         # try each direction
         for _ in range(2):
-            print('testing', pc.circuit)
-            print('directions', pc._directions)
-            print('pivot', pc.pivot_token)
 
             # quickly try pushing 100 tokens -- if unprofitable, fail
             quick_test_amount_in = 100

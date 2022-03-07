@@ -47,6 +47,7 @@ class UniswapV3Pricer(BaseExchangePricer):
 
     def __init__(self, w3: web3.Web3, address: str, token0: str, token1: str, fee: int) -> None:
         assert web3.Web3.isChecksumAddress(address)
+        assert fee in [100, 500, 3_000, 10_000]
         self.address = address
         self.contract = w3.eth.contract(
             address = address,
@@ -58,8 +59,14 @@ class UniswapV3Pricer(BaseExchangePricer):
         self.known_token0_bal = None
         self.known_token1_bal = None
         self.fee = fee
-        # tick_spacing is constant
-        self.tick_spacing = self.contract.functions.tickSpacing().call()
+        # tick_spacing is constant throughout contract's life
+        self.tick_spacing = {
+            # for mapping see: https://github.com/Uniswap/v3-core/blob/main/contracts/UniswapV3Factory.sol#L26
+            100:     1,
+            500:    10,
+            3_000:  60,
+            10_000: 200,
+        }[fee]
         self.tick_cache = {}
         self.tick_bitmap_cache = {}
         self.slot0_cache = None
@@ -77,8 +84,6 @@ class UniswapV3Pricer(BaseExchangePricer):
         assert self.last_block_observed is None or self.last_block_observed <= block_identifier
         if self.liquidity_cache is None:
             self.liquidity_cache = self.contract.functions.liquidity().call(block_identifier=block_identifier)
-        old_lq = self.contract.functions.liquidity().call(block_identifier=block_identifier)
-        assert self.liquidity_cache == old_lq, f'expected {self.liquidity_cache} == {old_lq}'
         return self.liquidity_cache
 
     def quote_token0_to_token1(self, amount0, block_identifier) -> int:
@@ -110,6 +115,9 @@ class UniswapV3Pricer(BaseExchangePricer):
         assert isinstance(zero_for_one, bool)
         
         (sqrt_price_x96, tick) = self.get_slot0(block_identifier)
+        if sqrt_price_x96 == 0:
+            # this is not initialized; you cannot get any token out
+            return (0, 0)
         liquidity = self.get_liquidity(block_identifier)
 
         if zero_for_one:
@@ -134,6 +142,11 @@ class UniswapV3Pricer(BaseExchangePricer):
                 tick, zero_for_one,
                 block_identifier
             )
+
+            if next_tick_num < UniswapV3Pricer.MIN_TICK:
+                next_tick_num = UniswapV3Pricer.MIN_TICK
+            elif next_tick_num > UniswapV3Pricer.MAX_TICK:
+                next_tick_num = UniswapV3Pricer.MAX_TICK
             
             sqrt_price_next_X96 = UniswapV3Pricer.get_sqrt_ratio_at_tick(next_tick_num)
             
@@ -500,7 +513,7 @@ class UniswapV3Pricer(BaseExchangePricer):
         """
         Observe the logs emitted in a block and update internal state appropriately.
         NOTE: receipts _must_ be in sorted order of increasing log index
-        """        
+        """
         if len(receipts) == 0:
             return
 

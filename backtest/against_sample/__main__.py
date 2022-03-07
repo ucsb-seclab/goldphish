@@ -227,12 +227,13 @@ def get_arbitrages_from_sample(w3: web3.Web3, fout: io.TextIOWrapper) -> typing.
     fout.write('# transaction hash, rejection reason\n')
     progress_reporter = ProgressReporter(l, len(all_txns), 0)
     seen_point = False
-    for _, txn_hash in all_txns:
-        if txn_hash != bytes.fromhex('28d5f036e455619472c9235fd503d0b1b941e9a5680428e5e880df3610053416'):
-            if not seen_point:
-                continue
-        else:
-            seen_point = True
+    for i, (_, txn_hash) in enumerate(all_txns):
+        # if txn_hash != bytes.fromhex('d7648abaa8e35e221bff38e85ccfbe3382602b9a9ea5a494cb685c20f3ab5837'):
+        #     if not seen_point:
+        #         continue
+        # else:
+        #     seen_point = True
+        #     progress_reporter = ProgressReporter(l, len(all_txns), i + 1)
         try:
             receipt = w3.eth.get_transaction_receipt(txn_hash)
 
@@ -276,7 +277,16 @@ def get_arbitrages_from_sample(w3: web3.Web3, fout: io.TextIOWrapper) -> typing.
                     fout.write(f'{txn_hash.hex()},at least one token was bought or sold more than once\n')
                     fout.flush()
                     continue
-            
+
+            # ensure that it actually made profit
+            maybe_profit = backtest.utils.parse_logs_for_net_profit(receipt['logs'])
+            profit = maybe_profit['0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'][SAMPLE_ADDR]
+            if profit < 0:
+                l.warning(f'Transaction lost money: {receipt["transactionHash"].hex()} WETH wei lost: {profit} ({w3.fromWei(-profit, "ether")} ether)')
+                fout.write(f'{txn_hash.hex()},this transaction lost money\n')
+                fout.flush()
+                continue
+
             yield receipt
         finally:
             progress_reporter.observe(1)
@@ -464,38 +474,6 @@ def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.Tex
                     decoded = decode_trace_calls(trace_theirs['result']['structLogs'], their_txn, receipt)
                     pretty_print_trace(decoded, their_txn, receipt)
                     print('------------------------------------------------------')
-
-                    # # attempt repro their shot
-                    # for w3_fork2 in backtest.utils.get_ganache_fork(w3, receipt['blockNumber'] - 1, unlock = [their_txn['from']]):
-                    #     backtest.utils.replay_to_txn(
-                    #         w3,
-                    #         w3_fork2,
-                    #         receipt,
-                    #     )
-                    #     new_block_tip = w3_fork2.eth.get_block('latest')['number']
-                    #     old_block_target_bin = int.to_bytes(receipt['blockNumber'], length=5, byteorder='big', signed=False)
-                    #     new_block_target_bin = int.to_bytes(new_block_tip + 1, length=5, byteorder='big', signed=False)
-                    #     print('old block target', old_block_target_bin.hex())
-                    #     print('new block target', old_block_target_bin.hex())
-                    #     old_input = their_txn['input']
-                    #     print('old input', old_input)
-                    #     assert old_block_target_bin.hex() in old_input
-                    #     new_input = old_input.replace(old_block_target_bin.hex(), new_block_target_bin.hex())
-                    #     new_txn: web3.types.TxParams = {
-                    #         'gas': their_txn['gas'],
-                    #         'chainId': their_txn['chainId'],
-                    #         'maxFeePerGas': their_txn['maxFeePerGas'],
-                    #         'maxPriorityFeePerGas': their_txn['maxPriorityFeePerGas'],
-                    #         'from': their_txn['from'],
-                    #         'to': their_txn['to'],
-                    #         'nonce': their_txn['nonce'],
-                    #         'input': new_input
-                    #     }
-                    #     print(new_txn)
-                    #     txn_hash = w3_fork2.eth.send_transaction(new_txn)
-                    #     new_reshoot_receipt = w3_fork2.eth.wait_for_transaction_receipt(txn_hash)
-                    #     print(new_reshoot_receipt)
-
 
                     raise Exception('status should be success')
 

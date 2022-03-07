@@ -67,6 +67,8 @@ class UniswapV2Pricer(BaseExchangePricer):
     def exact_token0_to_token1(self, token0_amount, block_identifier=int) -> int:
         # based off https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol#L43
         bal0, bal1 = self.get_balances(block_identifier)
+        if bal0 == 0 or bal1 == 0:
+            return 0 # no amount can be taken out
         amt_in_with_fee = token0_amount * 997
         numerator = amt_in_with_fee * bal1
         denominator = bal0 * 1000 + amt_in_with_fee
@@ -75,6 +77,8 @@ class UniswapV2Pricer(BaseExchangePricer):
     def exact_token1_to_token0(self, token1_amount, block_identifier=int) -> int:
         # based off https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol#L43
         bal0, bal1 = self.get_balances(block_identifier)
+        if bal0 == 0 or bal1 == 0:
+            return 0 # no amount can be taken out
         amt_in_with_fee = token1_amount * 997
         numerator = amt_in_with_fee * bal0
         denominator = bal1 * 1000 + amt_in_with_fee
