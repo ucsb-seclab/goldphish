@@ -1,9 +1,13 @@
 import typing
 import web3
+import web3.types
 from eth_utils import event_abi_to_log_topic
 from utils import get_abi
+import logging
 
 from pricers.base import BaseExchangePricer
+
+l = logging.getLogger(__name__)
 
 Tick = typing.NamedTuple('Tick', [
     ('id', int),
@@ -123,19 +127,19 @@ class UniswapV3Pricer(BaseExchangePricer):
         if zero_for_one:
             if sqrt_price_limitX96 == None:
                 sqrt_price_limitX96 = UniswapV3Pricer.MIN_SQRT_RATIO + 1
-            assert sqrt_price_limitX96 < sqrt_price_x96
+            assert sqrt_price_limitX96 <= sqrt_price_x96, f'expected {sqrt_price_limitX96} <= {sqrt_price_x96}'
             assert sqrt_price_limitX96 > UniswapV3Pricer.MIN_SQRT_RATIO
         else:
             if sqrt_price_limitX96 == None:
                 sqrt_price_limitX96 = UniswapV3Pricer.MAX_SQRT_RATIO - 1
-            assert sqrt_price_limitX96 > sqrt_price_x96
+            assert sqrt_price_limitX96 >= sqrt_price_x96, f'expected {sqrt_price_limitX96} <= {sqrt_price_x96}'
             assert sqrt_price_limitX96 < UniswapV3Pricer.MAX_SQRT_RATIO
 
         amount_specified_remaining = amount_specified
         amount_calculated = 0
 
         while amount_specified_remaining != 0 and sqrt_price_x96 != sqrt_price_limitX96:
-            # print(f'amount_specified_remaining={amount_specified_remaining} sqrt_price_limit={sqrt_price_limitX96} sqrt_price={sqrt_price_x96}')
+            # print(f'amount_specified_remaining={amount_specified_remaining} sqrt_price_limit={sqrt_price_limitX96} sqrt_price={sqrt_price_x96} liquidity={liquidity} tick={tick}')
             sqrt_price_start_x96 = sqrt_price_x96
             # compute tickNext
             next_tick_num, initialized = self.next_initialized_tick_within_one_word(
@@ -177,9 +181,11 @@ class UniswapV3Pricer(BaseExchangePricer):
                         liquidity -= tick_obj.liquidity_net
                     else:
                         liquidity += tick_obj.liquidity_net
+                    assert liquidity >= 0
                 tick = next_tick_num - 1 if zero_for_one else next_tick_num
             elif sqrt_price_x96 != sqrt_price_start_x96:
-                tick = UniswapV3Pricer.get_tick_at_sqrt_ratio(sqrt_price_x96)
+                raise NotImplementedError('never got around to this')
+                # tick = UniswapV3Pricer.get_tick_at_sqrt_ratio(sqrt_price_x96)
 
         if zero_for_one:
             amount0 = amount_specified - amount_specified_remaining
@@ -201,6 +207,7 @@ class UniswapV3Pricer(BaseExchangePricer):
         ) -> typing.Tuple[int, int, int, int]:
         # note: assume exactIn = true
         assert amount_remaining >= 0
+        assert liquidity >= 0
         zero_for_one = sqrt_ratio_currentx96 >= sqrt_ratio_targetx96
         amount_remaining_less_fee = amount_remaining * ((10 ** 6) - fee_pips) // (10 ** 6)
 
@@ -358,7 +365,7 @@ class UniswapV3Pricer(BaseExchangePricer):
             if initialized:
                 ret = (compressed + 1 + UniswapV3Pricer.least_significant_bit(masked) - bit_pos) * self.tick_spacing
             else:
-                ret = (compressed + 1 + ((1 << 8) - 1)) * self.tick_spacing
+                ret = (compressed + 1 + ((1 << 8) - 1) - bit_pos) * self.tick_spacing
 
         return ret, initialized
 
