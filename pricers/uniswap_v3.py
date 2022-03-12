@@ -1,5 +1,6 @@
 import typing
 import web3
+import web3.contract
 import web3.types
 from eth_utils import event_abi_to_log_topic
 from utils import get_abi
@@ -53,15 +54,8 @@ class UniswapV3Pricer(BaseExchangePricer):
         assert web3.Web3.isChecksumAddress(address)
         assert fee in [100, 500, 3_000, 10_000]
         self.address = address
-        self.contract = w3.eth.contract(
-            address = address,
-            abi = get_abi('uniswap_v3/IUniswapV3Pool.json')['abi']
-        )
-        self.w3 = w3
         self.token0 = token0
         self.token1 = token1
-        self.known_token0_bal = None
-        self.known_token1_bal = None
         self.fee = fee
         # tick_spacing is constant throughout contract's life
         self.tick_spacing = {
@@ -71,11 +65,7 @@ class UniswapV3Pricer(BaseExchangePricer):
             3_000:  60,
             10_000: 200,
         }[fee]
-        self.tick_cache = {}
-        self.tick_bitmap_cache = {}
-        self.slot0_cache = None
-        self.liquidity_cache = None
-        self.last_block_observed = None
+        self.set_web3(w3)
 
     def get_slot0(self, block_identifier) -> typing.Tuple[int, int]:
         assert self.last_block_observed is None or self.last_block_observed <= block_identifier
@@ -528,8 +518,8 @@ class UniswapV3Pricer(BaseExchangePricer):
         assert self.last_block_observed is None or self.last_block_observed < block_num
         self.last_block_observed = block_num
 
-        # use the last Swap() to update the price and tick of slot0
-        for log in reversed(receipts):
+        # if any of the logs are a burn or mint, dump the liquidity cache
+        for log in receipts:
             if len(log['topics']) > 0 and log['topics'][0] == UNIV3_SWAP_EVENT_TOPIC:
                 swap = self.contract.events.Swap().processLog(log)
                 sqrt_price_x96 = swap['args']['sqrtPriceX96']
@@ -539,14 +529,36 @@ class UniswapV3Pricer(BaseExchangePricer):
                     sqrt_price_x96, tick
                 )
                 self.liquidity_cache = liquidity
-                break
-        
-        # if any of the logs are a burn or mint, dump the liquidity cache
-        for log in receipts:
-            if len(log['topics']) > 0 and log['topics'][0] in [UNIV3_BURN_EVENT_TOPIC, UNIV3_MINT_EVENT_TOPIC]:
-                self.slot0_cache = None
-                self.tick_bitmap_cache.clear()
-                self.tick_cache.clear()
-                self.liquidity_cache = None
-                break
+            elif len(log['topics']) > 0 and log['topics'][0] in [UNIV3_BURN_EVENT_TOPIC, UNIV3_MINT_EVENT_TOPIC]:
+                if log['topics'][0] == UNIV3_BURN_EVENT_TOPIC:
+                    event = self.contract.events.Burn().processLog(log)
+                else:
+                    event = self.contract.events.Mint().processLog(log)
+                tick_lower = event['args']['tickLower']
+                tick_upper = event['args']['tickUpper']
+                word_lower = (tick_lower // self.tick_spacing) >> 8
+                word_upper = (tick_upper // self.tick_spacing) >> 8
+                self.tick_bitmap_cache.pop(word_lower, None)
+                self.tick_bitmap_cache.pop(word_upper, None)
+                self.tick_cache.pop(tick_lower, None)
+                self.tick_cache.pop(tick_upper, None)
+                if self.slot0_cache is not None \
+                    and self.liquidity_cache is not None \
+                    and event['args']['amount'] != 0 \
+                    and self.slot0_cache[1] < tick_upper:
+                    self.liquidity_cache += event['args']['amount']
+
+    def set_web3(self, w3: web3.Web3):
+        self.contract = w3.eth.contract(
+            address = self.address,
+            abi = get_abi('uniswap_v3/IUniswapV3Pool.json')['abi']
+        )
+        self.w3 = w3
+        self.known_token0_bal = None
+        self.known_token1_bal = None
+        self.tick_cache = {}
+        self.tick_bitmap_cache = {}
+        self.slot0_cache = None
+        self.liquidity_cache = None
+        self.last_block_observed = None
 

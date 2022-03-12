@@ -34,23 +34,9 @@ class UniswapV2Pricer(BaseExchangePricer):
     def __init__(self, w3: web3.Web3, address: str, token0: str, token1: str) -> None:
         assert web3.Web3.isChecksumAddress(address)
         self.address = address
-        self.contract = w3.eth.contract(
-            address = address,
-            abi = get_abi('uniswap_v2/IUniswapV2Pair.json')['abi']
-        )
-        self.w3 = w3
-        self.token0_contract = w3.eth.contract(
-            address = token0,
-            abi = get_abi('erc20.abi.json')
-        )
-        self.token1_contract = w3.eth.contract(
-            address = token1,
-            abi = get_abi('erc20.abi.json')
-        )
         self.token0 = token0
         self.token1 = token1
-        self.known_token0_bal = None
-        self.known_token1_bal = None
+        self.set_web3(w3)
 
     def get_balances(self, block_identifier) -> typing.Tuple[int, int]:
         if self.known_token0_bal is None or self.known_token1_bal is None:
@@ -58,13 +44,13 @@ class UniswapV2Pricer(BaseExchangePricer):
             self.known_token1_bal = self.token1_contract.functions.balanceOf(self.address).call(block_identifier=block_identifier)
         return (self.known_token0_bal, self.known_token1_bal)
 
-    def quote_token0_to_token1(self, token0_amount, block_identifier=int) -> int:
+    def quote_token0_to_token1(self, token0_amount, block_identifier: int) -> int:
         return self.exact_token0_to_token1(token0_amount, block_identifier)
 
-    def quote_token1_to_token0(self, token1_amount, block_identifier=int) -> int:
+    def quote_token1_to_token0(self, token1_amount, block_identifier: int) -> int:
         return self.exact_token1_to_token0(token1_amount, block_identifier)
 
-    def exact_token0_to_token1(self, token0_amount, block_identifier=int) -> int:
+    def exact_token0_to_token1(self, token0_amount, block_identifier: int) -> int:
         # based off https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol#L43
         bal0, bal1 = self.get_balances(block_identifier)
         if bal0 == 0 or bal1 == 0:
@@ -72,7 +58,8 @@ class UniswapV2Pricer(BaseExchangePricer):
         amt_in_with_fee = token0_amount * 997
         numerator = amt_in_with_fee * bal1
         denominator = bal0 * 1000 + amt_in_with_fee
-        return numerator // denominator
+        ret = numerator // denominator
+        return ret
 
     def exact_token1_to_token0(self, token1_amount, block_identifier=int) -> int:
         # based off https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol#L43
@@ -104,3 +91,21 @@ class UniswapV2Pricer(BaseExchangePricer):
                 self.known_token0_bal = bal0
                 self.known_token1_bal = bal1
                 return # this is all we care about -- the last Sync done
+
+    def set_web3(self, w3: web3.Web3):
+        self.contract = w3.eth.contract(
+            address = self.address,
+            abi = get_abi('uniswap_v2/IUniswapV2Pair.json')['abi']
+        )
+        self.w3 = w3
+        self.token0_contract = w3.eth.contract(
+            address = self.token0,
+            abi = get_abi('erc20.abi.json')
+        )
+        self.token1_contract = w3.eth.contract(
+            address = self.token1,
+            abi = get_abi('erc20.abi.json')
+        )
+        self.known_token0_bal = None
+        self.known_token1_bal = None
+

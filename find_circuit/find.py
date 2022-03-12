@@ -10,6 +10,7 @@ import logging
 import scipy.optimize
 
 import pricers.base
+from utils import WETH_ADDRESS
 
 l = logging.getLogger(__name__)
 
@@ -89,6 +90,7 @@ class PricingCircuit:
                 assert last_token == p.token1
                 curr_amt = p.exact_token1_to_token0(curr_amt, block_identifier)
                 last_token = p.token0
+            assert curr_amt >= 0, 'negative token balance is not possible'
         assert last_token == self.pivot_token
         return curr_amt
 
@@ -108,7 +110,7 @@ class PricingCircuit:
         self._directions = list(not x for x in reversed(self._directions))
 
 
-def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], block_identifier: int) -> typing.List[FoundArbitrage]:
+def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], block_identifier: int, only_weth_pivot = False) -> typing.List[FoundArbitrage]:
     assert len(exchanges) in [2, 3]
 
     # for all exchange pairs, ensure they share either (1) token (if len 3) or (2) tokens (if len 2)
@@ -130,34 +132,35 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
         # try each direction
         for _ in range(2):
 
-            # quickly try pushing 100 tokens -- if unprofitable, fail
-            quick_test_amount_in = 100
-            quick_test_amount_out = pc.sample(100, block_identifier)
+            if not (only_weth_pivot and pc.pivot_token != WETH_ADDRESS):
+                # quickly try pushing 100 tokens -- if unprofitable, fail
+                quick_test_amount_in = 100
+                quick_test_amount_out = pc.sample(100, block_identifier)
 
-            if quick_test_amount_out > quick_test_amount_in:
-                # this may be profitable
-                result = scipy.optimize.minimize_scalar(
-                    fun = lambda x: - (run_exc(x) - x),
-                    bounds = (
-                        100, # only a little
-                        (1_000 * (10 ** 18)) # a shit-ton
-                    ),
-                    method='bounded'
-                )
-                if result.fun < 0:
-                    amount_in = math.ceil(result.x)
-                    expected_profit = pc.sample(amount_in, block_identifier) - amount_in
-                    if expected_profit < 0:
-                        l.warning('fun indicated profit but expected profit did not!')
-                    else:
-                        to_add = FoundArbitrage(
-                            amount_in   = amount_in,
-                            directions  = pc.directions,
-                            circuit     = pc.circuit,
-                            pivot_token = pc.pivot_token,
-                            profit      = expected_profit,
-                        )
-                        ret.append(to_add)
+                if quick_test_amount_out > quick_test_amount_in:
+                    # this may be profitable
+                    result = scipy.optimize.minimize_scalar(
+                        fun = lambda x: - (run_exc(x) - x),
+                        bounds = (
+                            100, # only a little
+                            (1_000 * (10 ** 18)) # a shit-ton
+                        ),
+                        method='bounded'
+                    )
+                    if result.fun < 0:
+                        amount_in = math.ceil(result.x)
+                        expected_profit = pc.sample(amount_in, block_identifier) - amount_in
+                        if expected_profit < 0:
+                            l.warning('fun indicated profit but expected profit did not!')
+                        else:
+                            to_add = FoundArbitrage(
+                                amount_in   = amount_in,
+                                directions  = pc.directions,
+                                circuit     = pc.circuit,
+                                pivot_token = pc.pivot_token,
+                                profit      = expected_profit,
+                            )
+                            ret.append(to_add)
             pc.flip()
         pc.rotate()
     return ret

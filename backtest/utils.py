@@ -53,6 +53,7 @@ def get_ganache_fork(w3: web3.Web3, target_block: int, unlock: typing.Optional[t
 
     assert isinstance(target_block, int)
     assert target_block > 0
+    l.debug(f'Forking at block {target_block:,}')
     
     extra_args = []
     if unlock is not None:
@@ -101,6 +102,12 @@ def get_ganache_fork(w3: web3.Web3, target_block: int, unlock: typing.Optional[t
     l.debug(f'tip after fork {tip["number"]:,}')
 
     w3.provider.make_request('miner_stop', [])
+
+    old_str = w3.provider.__str__
+    def new_str(*args, **kwargs):
+        s = old_str(*args, **kwargs)
+        print('GANACHE ' + s)
+    w3.provider.__str__ = new_str
 
     # patch wait to make a mine block request
     old_wait = w3.eth.wait_for_transaction_receipt

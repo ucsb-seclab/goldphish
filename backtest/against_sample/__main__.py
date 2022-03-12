@@ -292,7 +292,6 @@ def get_arbitrages_from_sample(w3: web3.Web3, fout: io.TextIOWrapper) -> typing.
             progress_reporter.observe(1)
 
 def reshoot_arbitrage(w3: web3.Web3, receipt: web3.types.TxReceipt, fout: io.TextIOWrapper, fout_rejects: io.TextIOWrapper):
-    # 0xc3b0273c28fe7fb0ec71a8e27e67383f62919cc555db4119af6a40b63d991918
     l.debug(f'Re-shooting {receipt["transactionHash"].hex()}')
     # attempt to re-run this arbitrage using our own shooter, and record the results
 

@@ -17,14 +17,14 @@ from utils import WETH_ADDRESS
 l = logging.getLogger(__name__)
 
 
-def profitable_circuits(modified_exchanges_last_block: typing.Set[str], pool: pricers.PricerPool, block_number: int) -> typing.Iterator[FoundArbitrage]:
+def profitable_circuits(modified_exchanges_last_block: typing.Set[str], pool: pricers.PricerPool, block_number: int, only_weth_pivot = False) -> typing.Iterator[FoundArbitrage]:
     found_circuits: typing.Dict[typing.Any, FoundArbitrage] = {}
     for circuit in propose_circuits(modified_exchanges_last_block, pool, block_number):
         if any(not pool.is_uniswap_v2(x) for x in circuit):
-            l.debug(f'testing ' + str(circuit))
+            # l.debug(f'testing ' + str(circuit))
             # there MUST be a uniswap v3 in here to consider it
             circuit_pricers = [pool.get_pricer_for(a) for a in circuit]
-            for fa in detect_arbitrages(circuit_pricers, block_number):
+            for fa in detect_arbitrages(circuit_pricers, block_number, only_weth_pivot = only_weth_pivot):
                 key = tuple(sorted(p.address for p in fa.circuit))
                 if key in found_circuits:
                     if found_circuits[key].profit < fa.profit:

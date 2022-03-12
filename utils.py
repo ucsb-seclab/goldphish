@@ -5,7 +5,9 @@ import time
 import logging
 import scipy.stats
 import logging
+import logging.handlers
 import random
+import sys
 import web3
 import web3.types
 import web3.contract
@@ -19,6 +21,55 @@ UNI_ADDRESS = '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984'
 WBTC_ADDRESS = '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599'
 
 _abi_cache = {}
+
+
+# copy-pasted: https://stackoverflow.com/questions/384076/how-can-i-color-python-logging-output
+class ColoredFormatter(logging.Formatter):
+
+    grey = "\x1b[38;20m"
+    blue = "\033[38;5;111m"
+    yellow = "\x1b[33;20m"
+    red = "\x1b[31;20m"
+    bold_red = "\x1b[31;1m"
+    reset = "\u001b[0m"
+    format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    FORMATS = {
+        logging.DEBUG: grey + format + reset,
+        logging.INFO: blue + format + reset,
+        logging.WARNING: yellow + format + reset,
+        logging.ERROR: red + format + reset,
+        logging.CRITICAL: bold_red + format + reset
+    }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+
+def setup_logging(activity_name = None):
+    if activity_name is None:
+        fname = '/mnt/goldphish/tmp/log.txt'
+    else:
+        fname = f'/mnt/goldphish/tmp/{activity_name}_log.txt'
+    root_logger = logging.getLogger()
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(ColoredFormatter())
+    fh = logging.handlers.WatchedFileHandler(
+        fname
+    )
+    fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(fmt)
+    root_logger.addHandler(sh)
+    root_logger.addHandler(fh)
+    root_logger.setLevel(logging.DEBUG)
+
+    # silence some annoying logs from subsystems
+    for lname in ['websockets.protocol', 'web3.providers.WebsocketProvider',
+                  'web3.RequestManager', 'websockets.server', 'asyncio']:
+        logging.getLogger(lname).setLevel(logging.WARNING)
+
 
 def read_mem(start, read_len, mem):
     b = b''
