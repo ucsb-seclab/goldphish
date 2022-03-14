@@ -21,6 +21,13 @@ class FoundArbitrage(typing.NamedTuple):
     pivot_token: str
     profit: int
 
+    @property
+    def tokens(self) -> typing.Set[str]:
+        ret = set()
+        for exc in self.circuit:
+            ret.add(exc.token0)
+            ret.add(exc.token1)
+        return ret
 
 class PricingCircuit:
     _circuit: typing.List[pricers.base.BaseExchangePricer]

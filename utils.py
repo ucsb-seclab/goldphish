@@ -48,7 +48,7 @@ class ColoredFormatter(logging.Formatter):
         return formatter.format(record)
 
 
-def setup_logging(activity_name = None):
+def setup_logging(activity_name = None, suppress: typing.List[str] = []):
     if activity_name is None:
         fname = '/mnt/goldphish/tmp/log.txt'
     else:
@@ -67,7 +67,7 @@ def setup_logging(activity_name = None):
 
     # silence some annoying logs from subsystems
     for lname in ['websockets.protocol', 'web3.providers.WebsocketProvider',
-                  'web3.RequestManager', 'websockets.server', 'asyncio']:
+                  'web3.RequestManager', 'websockets.server', 'asyncio'] + suppress:
         logging.getLogger(lname).setLevel(logging.WARNING)
 
 
@@ -97,6 +97,10 @@ def pretty_print_trace(parsed, txn: web3.types.TxData, receipt: web3.types.TxRec
         padding = '    ' * depth
         if item['type'] == 'REVERT':
             print(padding + 'REVERT ' + web3.Web3.toText(item['message']))
+        elif item['type'] == 'RETURN':
+            print(padding + 'RETURN')
+            for i in range(0, len(item['data']), 32):
+                print(padding + '  ' + item['data'][i:i+32].hex())
         elif 'CALL' in item['type']:
             gas_usage =  item['gasStart'] - item['gasEnd']
             print(padding + item['type'] + ' ' + item['callee'] + f' gas consumed = {gas_usage:,} [{item["traceStart"]}, {item["traceEnd"]}]')
@@ -138,6 +142,8 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
 
     ctx = {
         'type': 'root',
+        'from': txn['from'],
+        'callee': txn['to'],
         'traceStart': 0,
         'gasStart': trace[0]['gas'],
         'actions': [],
@@ -154,6 +160,14 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
             ctx['actions'].append({
                 'type': 'REVERT',
                 'message': message,
+            })
+        if sl['op'] == 'RETURN':
+            ret_offset = int(sl['stack'][-1], base=16)
+            ret_len = int(sl['stack'][-1], base=16)
+            b = read_mem(ret_offset, ret_len, sl['memory'])
+            ctx['actions'].append({
+                'type': 'RETURN',
+                'data': b,
             })
         if sl['op'] == 'RETURN' or sl['op'] == 'STOP' or sl['op'] == 'REVERT':
             if i + 1 < len(trace):
@@ -172,6 +186,7 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
                 'gasStart': sl['gas'],
                 'traceStart': i,
                 'callee': web3.Web3.toChecksumAddress(dest),
+                'from': ctx['callee'],
                 'args': b,
                 'actions': []
             })
@@ -187,6 +202,7 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
                 'gasStart': sl['gas'],
                 'traceStart': i,
                 'callee': web3.Web3.toChecksumAddress(dest),
+                'from': ctx['callee'],
                 'args': b,
                 'actions': []
             })
@@ -202,6 +218,7 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
                 'gasStart': sl['gas'],
                 'traceStart': i,
                 'callee': web3.Web3.toChecksumAddress(dest),
+                'from': ctx['callee'],
                 'args': b,
                 'actions': []
             })

@@ -244,6 +244,7 @@ class UniswapV3Pricer(BaseExchangePricer):
     def get_next_sqrt_price_from_input(sqrt_pX96: int, liquidity: int, amount_in: int, zero_for_one: bool) -> int:
         assert sqrt_pX96 > 0
         assert liquidity > 0
+        assert amount_in >= 0
 
         if zero_for_one:
             # getNextSqrtPriceFromAmount0RoundingUp
@@ -274,7 +275,7 @@ class UniswapV3Pricer(BaseExchangePricer):
         if roundUp is None:
             roundUp = not (liquidity < 0)
 
-        if roundUp:
+        if roundUp == True:
             # roundUp = true
             return UniswapV3Pricer.div_rounding_up(
                 UniswapV3Pricer.mul_div_rounding_up(numerator1, numerator2, sqrt_ratio_bX96),
@@ -282,6 +283,7 @@ class UniswapV3Pricer(BaseExchangePricer):
             )
         else:
             # roundUp = false
+            assert roundUp == False
             return UniswapV3Pricer.mul_div(numerator1, numerator2, sqrt_ratio_bX96) // sqrt_ratio_aX96
 
     @staticmethod
@@ -300,6 +302,9 @@ class UniswapV3Pricer(BaseExchangePricer):
 
     @staticmethod
     def mul_div(a, b, d):
+        assert a >= 0
+        assert b >= 0
+        assert d > 0
         return (a * b) // d
 
     @staticmethod
@@ -312,10 +317,26 @@ class UniswapV3Pricer(BaseExchangePricer):
     @staticmethod
     def div_rounding_up(x, y):
         # UnsafeMath
+        assert x >= 0
+        assert y > 0
         tmp = (x // y)
         if x % y > 0:
              return tmp + 1
         return tmp
+
+    @staticmethod
+    def div(x, y):
+        """
+        Returns x / y as done by EVM semantics (rounds toward zero)
+        """
+        assert isinstance(x, int)
+        assert isinstance(y, int)
+        result = x // y
+        if result < 0 and x % y != 0:
+            # python rounded to -inf, we need to bump up by 1 to round toward zero
+            return result + 1
+        return result
+
 
     @staticmethod
     def mod(x: int, y: int) -> int:
@@ -454,8 +475,6 @@ class UniswapV3Pricer(BaseExchangePricer):
             ratio = 0x100000000000000000000000000000000
         else:
             ratio = 0xfffcb933bd6fad37aa2d162d1a594001
-        if abs_tick & 0x2 != 0:
-            ratio = (ratio * 0xfff97272373d413259a46990580e213a) >> 128
         if abs_tick & 0x2 != 0:
             ratio = (ratio * 0xfff97272373d413259a46990580e213a) >> 128
         if abs_tick & 0x4 != 0:

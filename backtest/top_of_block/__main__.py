@@ -1,6 +1,7 @@
 import argparse
 import collections
 import io
+import itertools
 import os
 import typing
 import networkx as nx
@@ -162,7 +163,7 @@ def load_pool(w3: web3.Web3) -> pricers.PricerPool:
         for line in fin:
             if line.startswith('2'):
                 _, address, origin_block, token0, token1, bal0, bal1 = line.strip().split(',')
-                
+
                 origin_block = int(origin_block)
                 bal0 = int(bal0)
                 bal1 = int(bal1)
@@ -212,7 +213,7 @@ def get_relevant_logs(w3: web3.Web3, start_block: int, end_block: int) -> typing
     gather = collections.defaultdict(lambda: [])
     for log in logs:
         gather[log['blockNumber']].append(log)
-    
+
     for i in range(start_block, end_block + 1):
         yield (i, gather[i])
 
@@ -333,12 +334,15 @@ def do_verify(w3: web3.Web3):
                 # time to reshoot
                 maybe_gas = check_reshoot(w3, fa, block_number)
                 if maybe_gas is not None:
-                    block = w3.eth.get_block(block_number + 1)
-                    gasprice = w3.eth.get_transaction_receipt(block['transactions'][-1])['effectiveGasPrice']
+                    for i in itertools.count(1):
+                        block = w3.eth.get_block(block_number + i)
+                        if len(block['transactions']) > 0:
+                            gasprice = w3.eth.get_transaction_receipt(block['transactions'][-1])['effectiveGasPrice']
+                            break
                     total_fee = gasprice * maybe_gas
                     net_profit = fa.profit - total_fee
                     profit_sz = {True: 'Profitable', False: 'NotProfitable'}[net_profit > 0]
-                    fout.write(f'{line.strip()}!{gasprice}!{maybe_gas}!{net_profit}!{net_profit / (10 ** 18)}!{profit_sz}\n')
+                    fout.write(f'{line.strip()}!{gasprice}/{block["number"]}!{maybe_gas}!{net_profit}!{net_profit / (10 ** 18)}!{profit_sz}\n')
                     fout.flush()
                 else:
                     sha = hashlib.sha1(line.strip().encode('ascii')).hexdigest()
@@ -356,7 +360,7 @@ def check_reshoot(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number: 
     Attempts re-shoot and returns gas usage on success. On failure, returns None.
     """
     shooter_address, receipt, maybe_trace = shoot(w3, fa, block_number, do_trace = TraceMode.ON_FAIL)
-    
+
     if receipt['status'] != 1:
         trace, txn = maybe_trace
         print('----------------------trace---------------------------')
@@ -380,7 +384,7 @@ def do_diagnose(w3: web3.Web3):
                 address, reason = line.strip().split(',')
                 assert w3.isChecksumAddress(address)
                 naughty_tokens.add(address)
-    
+
     l.debug(f'Already know about {len(naughty_tokens)} naughty tokens')
 
     uniswap_v2_exchanges, uniswap_v3_exchanges = load_exchanges()
@@ -395,7 +399,7 @@ def do_diagnose(w3: web3.Web3):
                 l.debug('got to end of file, sleeping a bit')
                 time.sleep(20)
                 continue
-            
+
             if not line.startswith('FAILED:'):
                 # the shoot worked, no need to diagnose
                 continue
@@ -422,7 +426,7 @@ def do_diagnose(w3: web3.Web3):
                 else:
                     token0, token1, fee = uniswap_v3_exchanges[address]
                     pricer = pricers.UniswapV3Pricer(w3, address, token0, token1, fee)
-                
+
                 all_tokens.add(token0)
                 all_tokens.add(token1)
                 circuit.append(pricer)
@@ -436,7 +440,7 @@ def do_diagnose(w3: web3.Web3):
 
             fa = find_circuit.FoundArbitrage(amount_in, circuit, directions, pivot_token=WETH_ADDRESS, profit = profit)
 
-            try:            
+            try:
                 maybe_naughty_token, failure_reason = diagnose_single(w3, fa, block_number)
             except:
                 sha = hashlib.sha1(line.encode('ascii')).hexdigest()
@@ -450,7 +454,7 @@ def do_diagnose(w3: web3.Web3):
                 fout_naughty.write(f'{new_naughty_token},{reason}\n')
                 fout_naughty.flush()
                 naughty_tokens.add(new_naughty_token)
-                l.info(f'Found new naughty token: {new_naughty_token}')
+                l.info(f'Found new naughty token: {new_naughty_token} | {reason}')
 
 
 erc20 = web3.Web3().eth.contract(address = b'\x00' * 20, abi=get_abi('erc20.abi.json'))
@@ -463,26 +467,35 @@ def diagnose_single(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number
     Returns the new naughty token, reason for naughtiness, and the reason for failure
     """
 
-    # double-check balances of exchanges to make sure they can handle this volume
-    amount_in = fa.amount_in
+    # recording prior balances also helps with failure diagnosis below
+    known_balances = {}
+    for exc in fa.circuit:
+        for token in [exc.token0, exc.token1]:
+            token_contract = w3.eth.contract(
+                address = token,
+                abi = get_abi('erc20.abi.json'),
+            )
+            bal = token_contract.functions.balanceOf(exc.address).call(block_identifier=block_number)
+            l.debug(f'balance | token={token} balance={bal:,}')
+            known_balances[token, exc.address] = bal
+
+    # records the expected amount of transfer out of each exchange
+    expected_amounts_out: typing.Dict[typing.Tuple[str, str], int] = {}
+    amount = fa.amount_in
     for exc, dxn in zip(fa.circuit, fa.directions):
         if dxn == True:
             token_out = exc.token1
-            amount_out = exc.exact_token0_to_token1(amount_in, block_number)
+            amount_out = exc.exact_token0_to_token1(amount, block_number)
         else:
             assert dxn == False
             token_out = exc.token0
-            amount_out = exc.exact_token1_to_token0(amount_in, block_number)
-        # ensure that this exchange's token balance is enough to support this amount out
-        token_contract = w3.eth.contract(
-            address = token_out,
-            abi = get_abi('erc20.abi.json'),
-        )
-        bal = token_contract.functions.balanceOf(exc.address).call(block_identifier=block_number)
-        assert amount_out < bal, f'wanted {amount_out} out but only have {bal}'
-        amount_in = amount_out
+            amount_out = exc.exact_token1_to_token0(amount, block_number)
+        expected_amounts_out[exc.address, token_out] = amount_out
 
     shooter_address, receipt, (trace, txn) = shoot(w3, fa, block_number, do_trace = TraceMode.ALWAYS)
+
+    exchanges: typing.Set[str] = set(x.address for x in fa.circuit)
+
     decoded = decode_trace_calls(trace, txn, receipt)
     print('----------------------trace---------------------------')
     pretty_print_trace(decoded, txn, receipt)
@@ -497,22 +510,35 @@ def diagnose_single(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number
     else:
         # if we saw a revert() in the first call to a token's transfer() or any balanceOf(), it is bugged
         called_transfer = set()
+        # known_balances already holds a dict (token, address) -> int as seen returned by balanceOf
 
-        stack = [(0, x) for x in reversed(decoded['actions'])]
+        stack = [(0, decoded)]
         while len(stack) > 0:
             depth, item = stack.pop()
             if 'CALL' in item['type']:
                 method_sel = item['args'][:4].hex()
+                callee = item['callee']
                 if method_sel == ERC20_BALANCEOF_SELECTOR:
-                    # if there's a revert here, it's a naughty token - TODO
-                    pass
+                    # record the balance
+                    if item['actions'][-1]['type'] == 'REVERT':
+                        return ((callee, 'reverted in balanceOf'), 'naughty token - balanceOf reverted')
+                    if item['actions'][-1]['type'] == 'RETURN':
+                        balance_of_addr = w3.toChecksumAddress(item['args'][12 + 4 : 32 + 4])
+                        got_balance = int.from_bytes(item['actions'][-1]['data'][:32], byteorder='big', signed=False)
+
+                        # ensure that it returns what we expect, if we are expecting a particular return value
+                        if (callee, balance_of_addr) in known_balances:
+                            if got_balance != known_balances[callee, balance_of_addr]:
+                                return ((callee, 'unexpected balanceOf after transfer'), 'naughty token - balanceOf after transfer was unusual')
+                        known_balances[callee,balance_of_addr] = got_balance
+
                 elif method_sel == ERC20_TRANSFER_SELECTOR:
                     # if the first transfer() reverts, this is a broken token
-                    callee = item['callee']
                     if callee not in called_transfer:
                         if len(item['actions']) > 0 and item['actions'][-1]['type'] == 'REVERT':
                             return ((callee, 'transfer reverts'), 'naughty token - transfer reverts')
                         called_transfer.add(callee)
+
                     # if transfer() emits a Transfer event in the wrong amount, the semantics are different
                     (_, args) = erc20.decode_function_input(item['args'])
                     recipient = args['_to']
@@ -520,6 +546,26 @@ def diagnose_single(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number
                     for action in item['actions']:
                         if action['type'] == 'TRANSFER' and action['to'] == recipient and action['value'] != value:
                             return ((callee, 'weird transfer event'), 'naughty token - transfer emitted weird event')
+
+                    # if we knew the balance of the sender, record the expected change
+                    if (callee, item['from']) in known_balances:
+                        known_balances[callee, item['from']] -= value
+
+                    # if we knew the balance of the recipient, record the expected change
+                    if (callee, recipient) in known_balances:
+                        known_balances[callee, recipient] += value
+
+                    # if this is sent from an exchange, ensure we are sending the expected amount
+                    if item['from'] in exchanges:
+                        assert (item['from'], callee) in expected_amounts_out
+                        expected_amount = expected_amounts_out[item['from'], callee]
+                        if expected_amount != value:
+                            exchange_addr = item['from']
+                            raise Exception(f'amount out from {exchange_addr} was not as expected: wanted {expected_amount:,} but got {value:,}')
+
+                for sub_action in reversed(item['actions']):
+                    stack.append((depth + 1, sub_action))
+            if item['type'] == 'root':
                 for sub_action in reversed(item['actions']):
                     stack.append((depth + 1, sub_action))
     raise Exception('himom')
@@ -584,10 +630,6 @@ def shoot(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number: int, do_
 
 
 def main():
-    #
-    # Set up logging
-    #
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, choices=['verify', 'diagnose'], help='verification mode', default=None)
     parser.add_argument('--verify', action='store_true', help='verification mode', default=False)
@@ -595,11 +637,11 @@ def main():
     args = parser.parse_args()
 
     if args.mode == 'verify':
-        setup_logging('top_block_verify')
+        setup_logging('top_block_verify', suppress=['shooter.deploy'])
     elif args.mode == 'diagnose':
-        setup_logging('top_block_diagnose')
+        setup_logging('top_block_diagnose', suppress=['shooter.deploy'])
     else:
-        setup_logging('top_block_candidates')
+        setup_logging('top_block_candidates', suppress=['shooter.deploy'])
 
     l.info('Booting up...')
 
