@@ -491,6 +491,7 @@ def diagnose_single(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number
             token_out = exc.token0
             amount_out = exc.exact_token1_to_token0(amount, block_number)
         expected_amounts_out[exc.address, token_out] = amount_out
+        amount = amount_out
 
     shooter_address, receipt, (trace, txn) = shoot(w3, fa, block_number, do_trace = TraceMode.ALWAYS)
 
@@ -679,8 +680,8 @@ def main():
 
             #
             # Load all candidate profitable arbitrages
-            with open(FNAME_CANDIDATE_CSV, mode='a') as fout, open('/mnt/goldphish/tmp/reshoot_log_top_block_errors.csv', mode='w') as fout_errors:
-                start_block = 12_507_540 # 12_369_621
+            with open(FNAME_CANDIDATE_CSV, mode='w') as fout, open('/mnt/goldphish/tmp/reshoot_log_top_block_errors.csv', mode='w') as fout_errors:
+                start_block = 12_369_621
                 end_block = w3.eth.get_block('latest')['number']
                 progress_reporter = ProgressReporter(l, end_block, start_block)
                 batch_size_blocks = 200
