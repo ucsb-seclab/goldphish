@@ -33,6 +33,7 @@ def funded_deployer() -> LocalAccount:
     ret: LocalAccount = Account.from_key(bytes.fromhex('0xab1179084d3336336d60b2ed654d99a21c2644cadd89fd3034ee592e931e4a77'[2:]))
     return ret
 
+
 def mine_block(w3: web3.Web3):
     block = w3.eth.get_block('latest')
     block_num_before = block['number']
@@ -43,6 +44,7 @@ def mine_block(w3: web3.Web3):
     block_num_after = int(bn_result['result'][2:], base=16)
 
     assert block_num_before + 1 == block_num_after, f'expected {block_num_before} + 1 == {block_num_after}'
+
 
 _next_ganache_port = 4444
 def get_ganache_fork(w3: web3.Web3, target_block: int, unlock: typing.Optional[typing.List[str]] = None) -> typing.Iterator[web3.Web3]:

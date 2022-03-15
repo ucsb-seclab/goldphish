@@ -11,6 +11,7 @@ import sys
 import web3
 import web3.types
 import web3.contract
+import random
 
 l = logging.getLogger(__name__)
 
@@ -48,18 +49,20 @@ class ColoredFormatter(logging.Formatter):
         return formatter.format(record)
 
 
-def setup_logging(activity_name = None, suppress: typing.List[str] = []):
+def setup_logging(activity_name = None, suppress: typing.List[str] = [], job_name: typing.Optional[str] = None):
+    if job_name is None:
+        job_name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=6))
     if activity_name is None:
-        fname = '/mnt/goldphish/tmp/log.txt'
+        fname = '/mnt/goldphish/tmp/logs/log.txt'
     else:
-        fname = f'/mnt/goldphish/tmp/{activity_name}_log.txt'
+        fname = f'/mnt/goldphish/tmp/logs/{activity_name}_{job_name}.txt'
     root_logger = logging.getLogger()
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(ColoredFormatter())
     fh = logging.handlers.WatchedFileHandler(
         fname
     )
-    fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fmt = logging.Formatter(f'%(asctime)s - {job_name} - %(name)s - %(levelname)s - %(message)s')
     fh.setFormatter(fmt)
     root_logger.addHandler(sh)
     root_logger.addHandler(fh)
