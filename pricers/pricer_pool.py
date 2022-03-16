@@ -124,8 +124,15 @@ class PricerPool:
 
         # if we have a pricer in the cache, force it to observe the block
         for address in gathered:
+            # construct uniswap v2 pricers right here and add them to cache immediately bc we can observe the Sync
+            if address not in self._cache and address in self._uniswap_v2_pools:
+                token0, token1 = self._uniswap_v2_pools[address]
+                pricer = UniswapV2Pricer(self._w3, address, token0, token1)
+                self._cache[address] = pricer
+
             if address in self._cache:
                 self._cache[address].observe_block(gathered[address])
+
             if address in self._uniswap_v2_pools or address in self._uniswap_v3_pools:
                 ret.add(address)
 

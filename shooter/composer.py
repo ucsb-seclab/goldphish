@@ -123,6 +123,8 @@ def construct(
     excs = []
 
     # Handle each situation separately, I suppose. This makes the logic perhaps a bit more readable (but repeated).
+    print('univ3_chain', univ3_chain)
+    print('univ2_chain', univ2_chain)
 
     if len(univ3_chain) == 1 and len(univ2_chain) == 1:
         if univ3_chain[0].amount_out_less_token_fee > univ2_chain[0].amount_in:
@@ -360,7 +362,7 @@ def construct(
                 ),
             ]
     else:
-        assert len(univ3_chain) == 3
+        assert 2 <= len(univ3_chain) <= 3
         assert len(univ2_chain) == 0
         l.debug(f'Cycle situation 9')
         # fortunately this is the easy one

@@ -67,17 +67,23 @@ class UniswapV3Pricer(BaseExchangePricer):
         }[fee]
         self.set_web3(w3)
 
-    def get_slot0(self, block_identifier) -> typing.Tuple[int, int]:
+    def get_slot0(self, block_identifier, use_cache = True) -> typing.Tuple[int, int]:
         assert self.last_block_observed is None or self.last_block_observed <= block_identifier
-        if self.slot0_cache is None:
+        if use_cache == False or self.slot0_cache is None:
             (sqrt_ratio_x96, tick, _, _, _, _, _) = self.contract.functions.slot0().call(block_identifier=block_identifier)
+            if use_cache == False:
+                return (sqrt_ratio_x96, tick)
             self.slot0_cache = (sqrt_ratio_x96, tick)
         return self.slot0_cache
 
-    def get_liquidity(self, block_identifier) -> int:
+    def get_liquidity(self, block_identifier, use_cache = True) -> int:
         assert self.last_block_observed is None or self.last_block_observed <= block_identifier
-        if self.liquidity_cache is None:
-            self.liquidity_cache = self.contract.functions.liquidity().call(block_identifier=block_identifier)
+        if use_cache == False or self.liquidity_cache is None:
+            got = self.contract.functions.liquidity().call(block_identifier=block_identifier)
+            if use_cache == False:
+                l.debug(f'not using cache')
+                return got
+            self.liquidity_cache = got
         return self.liquidity_cache
 
     def quote_token0_to_token1(self, amount0, block_identifier) -> int:
@@ -530,6 +536,8 @@ class UniswapV3Pricer(BaseExchangePricer):
         Observe the logs emitted in a block and update internal state appropriately.
         NOTE: receipts _must_ be in sorted order of increasing log index
         """
+        assert self.address == receipts[0]['address']
+
         if len(receipts) == 0:
             return
 
@@ -561,11 +569,20 @@ class UniswapV3Pricer(BaseExchangePricer):
                 self.tick_bitmap_cache.pop(word_upper, None)
                 self.tick_cache.pop(tick_lower, None)
                 self.tick_cache.pop(tick_upper, None)
-                if self.slot0_cache is not None \
-                    and self.liquidity_cache is not None \
-                    and event['args']['amount'] != 0 \
-                    and self.slot0_cache[1] < tick_upper:
-                    self.liquidity_cache += event['args']['amount']
+                if self.liquidity_cache is not None and event['args']['amount'] != 0:
+                    if self.slot0_cache is not None:
+                        if tick_lower <= self.slot0_cache[1] < tick_upper:
+                            if event['event'] == 'Burn':
+                                self.liquidity_cache -= event['args']['amount']
+                            else:
+                                self.liquidity_cache += event['args']['amount']
+                        else:
+                            pass # nothing to do here, liquidity does not change
+                    else:
+                        # not sure what to do here bc we dont know the current tick so we don't know if we're in
+                        # or out of range
+                        self.liquidity_cache = None
+
 
     def set_web3(self, w3: web3.Web3):
         self.contract = w3.eth.contract(

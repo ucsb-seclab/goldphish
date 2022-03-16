@@ -2,6 +2,7 @@ import collections
 import subprocess
 import time
 import typing
+import tempfile
 import web3
 import web3.types
 import logging
@@ -47,83 +48,90 @@ def mine_block(w3: web3.Web3):
 
 
 _next_ganache_port = 4444
-def get_ganache_fork(w3: web3.Web3, target_block: int, unlock: typing.Optional[typing.List[str]] = None) -> typing.Iterator[web3.Web3]:
-    global _next_ganache_port
+class GanacheContextManager:
 
-    old_block = w3.eth.get_block(target_block)
-    old_ts = old_block['timestamp']
+    def __init__(self, w3: web3.Web3, target_block: int, unlock: typing.Optional[typing.List[str]] = None) -> None:
+        global _next_ganache_port
+        self.tmpdir = tempfile.TemporaryDirectory()
+        old_block = w3.eth.get_block(target_block)
+        old_ts = old_block['timestamp']
 
-    assert isinstance(target_block, int)
-    assert target_block > 0
-    l.debug(f'Forking at block {target_block:,}')
+        assert isinstance(target_block, int)
+        assert target_block > 0
+        l.debug(f'Forking at block {target_block:,}')
+        
+        extra_args = []
+        if unlock is not None:
+            extra_args = ['--wallet.unlockedAccounts', ','.join(unlock)]
+
+        self.p = subprocess.Popen(
+            [
+                'yarn',
+                'ganache-cli',
+                '--database.dbPath', self.tmpdir.name,
+                '--fork.url', 'ws://172.17.0.1:8546',
+                '--server.ws',
+                '--server.port', str(_next_ganache_port),
+                '--fork.blockNumber', str(target_block),
+                '--wallet.accounts', f'{funded_deployer().key.hex()},{web3.Web3.toWei(100, "ether")}',
+                '--chain.chainId', '1',
+                '--chain.time', str(old_ts * 1_000), # unit conversion needed for some reason -- blame javascript
+                '--miner.coinbase', web3.Web3.toChecksumAddress(b'\xa0' * 20) + ' ',
+                '--miner.blockTime', '100',
+                '--miner.blockGasLimit', str(60_000_000),
+                *extra_args
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        provider = web3.WebsocketProvider(
+            f'ws://127.0.0.1:{_next_ganache_port}',
+            websocket_timeout=60 * 5,
+            websocket_kwargs={
+                'max_size': 1024 * 1024 * 1024, # 1 Gb max payload
+            },
+        )
+
+        w3 = web3.Web3(
+            provider
+        )
+
+        _next_ganache_port += 1
+        assert _next_ganache_port < 9000
+
+        while not w3.isConnected():
+            time.sleep(0.1)
+
+        assert w3.isConnected()
+        tip = w3.eth.get_block('latest')
+        l.debug(f'tip after fork {tip["number"]:,}')
+
+        w3.provider.make_request('miner_stop', [])
+
+        old_str = w3.provider.__str__
+        def new_str(*args, **kwargs):
+            s = old_str(*args, **kwargs)
+            print('GANACHE ' + s)
+        w3.provider.__str__ = new_str
+
+        # patch wait to make a mine block request
+        old_wait = w3.eth.wait_for_transaction_receipt
+        def new_wait(*args, **kwargs):
+            mine_block(w3)
+            return old_wait(*args, **kwargs)
+        w3.eth.wait_for_transaction_receipt = new_wait
+
+        self.w3 = w3
+
+    def __enter__(self) -> web3.Web3:
+        return self.w3
     
-    extra_args = []
-    if unlock is not None:
-        extra_args = ['--wallet.unlockedAccounts', ','.join(unlock)]
-
-    p = subprocess.Popen(
-        [
-            'yarn',
-            'ganache-cli',
-            '--fork.url', 'ws://172.17.0.1:8546',
-            '--server.ws',
-            '--server.port', str(_next_ganache_port),
-            '--fork.blockNumber', str(target_block),
-            '--wallet.accounts', f'{funded_deployer().key.hex()},{web3.Web3.toWei(100, "ether")}',
-            '--chain.chainId', '1',
-            '--chain.time', str(old_ts * 1_000), # unit conversion needed for some reason -- blame javascript
-            '--miner.coinbase', web3.Web3.toChecksumAddress(b'\xa0' * 20) + ' ',
-            '--miner.blockTime', '100',
-            '--miner.blockGasLimit', str(60_000_000),
-            *extra_args
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    provider = web3.WebsocketProvider(
-        f'ws://127.0.0.1:{_next_ganache_port}',
-        websocket_timeout=60 * 5,
-        websocket_kwargs={
-            'max_size': 1024 * 1024 * 1024, # 1 Gb max payload
-        },
-    )
-
-    w3 = web3.Web3(
-        provider
-    )
-
-    _next_ganache_port += 1
-    assert _next_ganache_port < 9000
-
-    while not w3.isConnected():
-        time.sleep(0.1)
-
-    assert w3.isConnected()
-    tip = w3.eth.get_block('latest')
-    l.debug(f'tip after fork {tip["number"]:,}')
-
-    w3.provider.make_request('miner_stop', [])
-
-    old_str = w3.provider.__str__
-    def new_str(*args, **kwargs):
-        s = old_str(*args, **kwargs)
-        print('GANACHE ' + s)
-    w3.provider.__str__ = new_str
-
-    # patch wait to make a mine block request
-    old_wait = w3.eth.wait_for_transaction_receipt
-    def new_wait(*args, **kwargs):
-        mine_block(w3)
-        return old_wait(*args, **kwargs)
-    w3.eth.wait_for_transaction_receipt = new_wait
-
-    yield w3
-
-    # force kill node, sorry
-    p.kill()
-    p.wait()
-    subprocess.check_call(['killall', 'node'])
-
-
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        # force kill node, sorry
+        self.p.kill()
+        self.p.wait()
+        subprocess.check_call(['killall', '-9', 'node'])
+        subprocess.call(['killall', 'sh'])
+        self.tmpdir.cleanup()
 

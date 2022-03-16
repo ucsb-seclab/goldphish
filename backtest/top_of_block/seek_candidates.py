@@ -11,10 +11,11 @@ import psycopg2
 import psycopg2.extensions
 
 from backtest.top_of_block.common import connect_db
-from backtest.top_of_block.constants import FNAME_CANDIDATE_CSV, FNAME_EXCHANGES_WITH_BALANCES, IMPORTANT_TOPICS_HEX, MIN_PROFIT_PREFILTER, THRESHOLDS, univ2_fname, univ3_fname
+from backtest.top_of_block.constants import FNAME_EXCHANGES_WITH_BALANCES, IMPORTANT_TOPICS_HEX, MIN_PROFIT_PREFILTER, THRESHOLDS, univ2_fname, univ3_fname
 import pricers
 import find_circuit
 from pricers.uniswap_v2 import UniswapV2Pricer
+from pricers.uniswap_v3 import UniswapV3Pricer
 from utils import ProgressReporter, get_abi
 
 
@@ -33,7 +34,8 @@ def seek_candidates(w3: web3.Web3):
 
         #
         # Load all candidate profitable arbitrages
-        start_block = 12_369_621
+        start_block = get_resume_point(curr)
+        l.info(f'Starting analysis from block {start_block:,}')
         end_block = w3.eth.get_block('latest')['number']
         progress_reporter = ProgressReporter(l, end_block, start_block)
         batch_size_blocks = 200
@@ -85,6 +87,14 @@ def setup_db(curr: psycopg2.extensions.cursor):
         """
     )
     curr.connection.commit()
+
+
+def get_resume_point(curr: psycopg2.extensions.cursor):
+    curr.execute('SELECT MAX(block_number) FROM candidate_arbitrages')
+    (resume_point,) = curr.fetchone()
+    if resume_point is None:
+        return 12_369_621
+    return resume_point + 1
 
 
 def load_exchange_balances(w3: web3.Web3):
@@ -236,14 +246,60 @@ def process_candidates(w3: web3.Web3, pool: pricers.PricerPool, block_number: in
             n_ignored += 1
             continue
 
+        if False:
+            # some debugging
+            exchange_outs = {}
+            amount = p.amount_in
+            for exc, dxn in zip(p.circuit, p.directions):
+                if dxn == True:
+                    amount_out = exc.exact_token0_to_token1(amount, block_identifier=block_number)
+                else:
+                    amount_out = exc.exact_token1_to_token0(amount, block_identifier=block_number)
+                l.debug(f'{exc.address} out={amount_out}')
+                amount = amount_out
+                exchange_outs[exc.address] = amount_out
+            if amount != p.amount_in + p.profit:
+                l.warning(f'did not match up with profit! computed amount_out={amount_out} with profit={p.profit}')
+            # run it again using fresh pricers
+            amount = p.amount_in
+            for exc, dxn in zip(p.circuit, p.directions):
+                if isinstance(exc, UniswapV2Pricer):
+                    pricer = UniswapV2Pricer(w3, exc.address, exc.token0, exc.token1)
+                else:
+                    assert isinstance(exc, UniswapV3Pricer)
+                    pricer = UniswapV3Pricer(w3, exc.address, exc.token0, exc.token1, exc.fee)
+                if dxn == True:
+                    amount_out = pricer.exact_token0_to_token1(amount, block_identifier=block_number)
+                else:
+                    amount_out = pricer.exact_token1_to_token0(amount, block_identifier=block_number)
+                l.debug(f'fresh {exc.address} out={amount_out}')
+                if exchange_outs[exc.address] != amount_out:
+                    l.debug(f'Amount_out {exc.address} changed from {exchange_outs[exc.address]} to {amount_out}')
+                amount = amount_out
+            if amount != p.amount_in + p.profit:
+                l.debug('This did not match after fresh pricer!!!!!!!! weird!!!!')
+                l.debug('----------------------------')
+                l.debug(f'Found arbitrage')
+                l.debug(f'block_number ..... {block_number}')
+                l.debug(f'amount_in ........ {p.amount_in}')
+                l.debug(f'expected profit .. {p.profit}')
+                for p, dxn in zip(p.circuit, p.directions):
+                    l.debug(f'    address={p.address} zeroForOne={dxn}')
+                l.debug('----------------------------')
+                raise Exception('what is this')
+
+
         # this is potentially profitable, log as a candidate
         curr.execute(
             """
             INSERT INTO candidate_arbitrages (block_number, exchanges, directions, amount_in, profit_no_fee)
             VALUES (%s, %s, %s, %s, %s)
+            RETURNING (id)
             """,
             (block_number, [bytes.fromhex(x.address[2:]) for x in p.circuit], p.directions, p.amount_in, p.profit)
         )
+        (inserted_id,) = curr.fetchone()
+        # l.debug(f'inserted candidate id={inserted_id}')
         n_found += 1
 
     if n_ignored > 0:

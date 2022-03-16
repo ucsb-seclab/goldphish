@@ -9,6 +9,7 @@ for i in `seq 0 $(($1 - 1))`; do
         --network ethereum-measurement-net \
         -v/home/robert/Source/goldphish:/mnt/goldphish \
         -it \
+        --init \
         --cpuset-cpus "$i" \
         -d \
         --rm \

@@ -8,6 +8,7 @@ import typing
 
 import logging
 import scipy.optimize
+import pricers.token_transfer
 
 import pricers.base
 from utils import WETH_ADDRESS
@@ -97,6 +98,7 @@ class PricingCircuit:
                 assert last_token == p.token1
                 curr_amt = p.exact_token1_to_token0(curr_amt, block_identifier)
                 last_token = p.token0
+            curr_amt = pricers.token_transfer.out_from_transfer(last_token, curr_amt)
             assert curr_amt >= 0, 'negative token balance is not possible'
         assert last_token == self.pivot_token
         return curr_amt

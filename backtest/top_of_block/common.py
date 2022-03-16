@@ -12,8 +12,7 @@ import find_circuit
 import shooter
 
 from utils import get_abi
-from ..utils import funded_deployer, mine_block
-from ..utils import get_ganache_fork
+from ..utils import GanacheContextManager, funded_deployer, mine_block
 from .constants import univ2_fname, univ3_fname
 
 
@@ -77,9 +76,9 @@ def load_exchanges() -> typing.Tuple[typing.Dict[str, typing.Tuple[str, str]], t
     return (uniswap_v2_exchanges, uniswap_v3_exchanges)
 
 
-def shoot(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number: int, do_trace: TraceMode = TraceMode.NEVER) -> typing.Tuple[str, web3.types.TxReceipt, typing.Optional[typing.Any]]:
+def shoot(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number: int, do_trace: TraceMode = TraceMode.NEVER, gaslimit: typing.Optional[int] = None) -> typing.Tuple[str, web3.types.TxReceipt, typing.Optional[typing.Any]]:
     account = funded_deployer()
-    for ganache in get_ganache_fork(w3, block_number):
+    with GanacheContextManager(w3, block_number) as ganache:
 
         for pricer in fa.circuit:
             pricer.set_web3(ganache)
@@ -107,6 +106,9 @@ def shoot(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number: int, do_
 
         l.debug(f'About to shoot {shot.hex()}')
 
+        if gaslimit is None:
+            gaslimit = 10_000_000
+
         txn: web3.types.TxParams = {
             'chainId': ganache.eth.chain_id,
             'from': account.address,
@@ -114,7 +116,7 @@ def shoot(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number: int, do_
             'value': 0,
             'nonce': ganache.eth.get_transaction_count(account.address),
             'data': shot,
-            'gas': 10_000_000, # huge gas to avoid any out of gas error
+            'gas': gaslimit,
             'maxPriorityFeePerGas': 2,
             'maxFeePerGas': 1000 * (10 ** 9),
         }

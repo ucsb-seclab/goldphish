@@ -46,8 +46,6 @@ def propose_circuits(modified_exchanges_last_block: typing.Set[str], pool: price
 
 
 def _propose_circuits_exchange(address: str, pool: pricers.PricerPool, block_number: int) -> typing.Iterator[typing.List[str]]:
-    already_proposed = set()
-
     # There are several situations here.
 
     # First, we need to find out whether this exchange has WETH or not;

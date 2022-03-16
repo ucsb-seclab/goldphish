@@ -8,11 +8,10 @@ import typing
 import web3
 from backtest.top_of_block.common import TraceMode, connect_db, load_exchanges, shoot
 
-from backtest.top_of_block.constants import FNAME_CANDIDATE_CSV, FNAME_VERIFY_RESULT
 from backtest.utils import parse_logs_for_net_profit
 import find_circuit
 import pricers
-from utils import WETH_ADDRESS, decode_trace_calls, pretty_print_trace
+from utils import WETH_ADDRESS
 
 l = logging.getLogger(__name__)
 
@@ -90,7 +89,7 @@ def get_candidate_arbitrages(w3: web3.Web3, curr: psycopg2.extensions.cursor) ->
             SELECT id
             FROM candidate_arbitrages
             WHERE verify_run = false AND verify_started IS NULL
-            ORDER BY block_number ASC
+            ORDER BY profit_no_fee DESC
             LIMIT 1
             FOR UPDATE
             """
@@ -118,13 +117,13 @@ def get_candidate_arbitrages(w3: web3.Web3, curr: psycopg2.extensions.cursor) ->
 
         assert len(exchanges) == len(directions)
 
+        exchanges = [web3.Web3.toChecksumAddress(x.tobytes()) for x in exchanges]
+
         # reconstruct found arbitrage
         amount_in = int(amount_in)
         profit = int(profit)
         circuit: typing.List[pricers.BaseExchangePricer] = []
-        for exc in exchanges:
-            address = web3.Web3.toChecksumAddress(exc.tobytes())
-            
+        for address in exchanges:            
             if address in uniswap_v2_exchanges:
                 token0, token1 = uniswap_v2_exchanges[address]
                 pricer = pricers.UniswapV2Pricer(w3, address, token0, token1)
@@ -149,6 +148,8 @@ def get_candidate_arbitrages(w3: web3.Web3, curr: psycopg2.extensions.cursor) ->
         )
 
         l.debug(f'Verifying candidate arbitrage id={id_:,} block_number={block_number:,} expected_profit={w3.fromWei(profit, "ether"):.6f} ETH')
+        for t in fa.tokens:
+            l.debug(f'uses token {t}')
 
         yield block_number, id_, fa
 
@@ -168,14 +169,14 @@ def check_reshoot(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number: 
     """
     Attempts re-shoot and returns gas usage on success. On failure, returns None.
     """
-    shooter_address, receipt, maybe_trace = shoot(w3, fa, block_number, do_trace = TraceMode.ON_FAIL)
+    shooter_address, receipt, _ = shoot(w3, fa, block_number, do_trace = TraceMode.NEVER)
 
     if receipt['status'] != 1:
-        trace, txn = maybe_trace
-        print('----------------------trace---------------------------')
-        decoded = decode_trace_calls(trace, txn, receipt)
-        pretty_print_trace(decoded, txn, receipt)
-        print('------------------------------------------------------')
+        # trace, txn = maybe_trace
+        # print('----------------------trace---------------------------')
+        # decoded = decode_trace_calls(trace, txn, receipt)
+        # pretty_print_trace(decoded, txn, receipt)
+        # print('------------------------------------------------------')
         return None
 
     movements = parse_logs_for_net_profit(receipt['logs'])
