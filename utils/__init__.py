@@ -13,6 +13,9 @@ import web3.types
 import web3.contract
 import random
 
+
+from .profiling import get_measurement, reset_measurement, profile
+
 l = logging.getLogger(__name__)
 
 WETH_ADDRESS = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
@@ -252,7 +255,7 @@ def get_abi(abiname) -> typing.Any:
     abi_dir = os.path.abspath(
         os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            'abis'
+            '../abis'
         )
     )
     if not os.path.isdir(abi_dir):

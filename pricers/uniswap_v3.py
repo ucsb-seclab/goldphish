@@ -3,7 +3,7 @@ import web3
 import web3.contract
 import web3.types
 from eth_utils import event_abi_to_log_topic
-from utils import get_abi
+from utils import get_abi, profile
 import logging
 
 from pricers.base import BaseExchangePricer
@@ -70,7 +70,8 @@ class UniswapV3Pricer(BaseExchangePricer):
     def get_slot0(self, block_identifier, use_cache = True) -> typing.Tuple[int, int]:
         assert self.last_block_observed is None or self.last_block_observed <= block_identifier
         if use_cache == False or self.slot0_cache is None:
-            (sqrt_ratio_x96, tick, _, _, _, _, _) = self.contract.functions.slot0().call(block_identifier=block_identifier)
+            with profile('uniswap_v3_fetch'):
+                (sqrt_ratio_x96, tick, _, _, _, _, _) = self.contract.functions.slot0().call(block_identifier=block_identifier)
             if use_cache == False:
                 return (sqrt_ratio_x96, tick)
             self.slot0_cache = (sqrt_ratio_x96, tick)
@@ -79,7 +80,8 @@ class UniswapV3Pricer(BaseExchangePricer):
     def get_liquidity(self, block_identifier, use_cache = True) -> int:
         assert self.last_block_observed is None or self.last_block_observed <= block_identifier
         if use_cache == False or self.liquidity_cache is None:
-            got = self.contract.functions.liquidity().call(block_identifier=block_identifier)
+            with profile('uniswap_v3_fetch'):
+                got = self.contract.functions.liquidity().call(block_identifier=block_identifier)
             if use_cache == False:
                 l.debug(f'not using cache')
                 return got
@@ -112,8 +114,9 @@ class UniswapV3Pricer(BaseExchangePricer):
         """
         returns: (amount0, amount1)
         """
+        assert amount_specified >= 0
         assert isinstance(zero_for_one, bool)
-        
+
         (sqrt_price_x96, tick) = self.get_slot0(block_identifier)
         if sqrt_price_x96 == 0:
             # this is not initialized; you cannot get any token out
@@ -147,9 +150,9 @@ class UniswapV3Pricer(BaseExchangePricer):
                 next_tick_num = UniswapV3Pricer.MIN_TICK
             elif next_tick_num > UniswapV3Pricer.MAX_TICK:
                 next_tick_num = UniswapV3Pricer.MAX_TICK
-            
+
             sqrt_price_next_X96 = UniswapV3Pricer.get_sqrt_ratio_at_tick(next_tick_num)
-            
+
             if zero_for_one:
                 use_limit = sqrt_price_next_X96 < sqrt_price_limitX96
             else:
@@ -168,6 +171,7 @@ class UniswapV3Pricer(BaseExchangePricer):
 
             # assume exact_input = true
             amount_specified_remaining -= (amount_in + fee_amount)
+            assert amount_specified_remaining >= 0
             amount_calculated = amount_calculated - amount_out
 
             if sqrt_price_next_X96 == sqrt_price_next_X96:
@@ -295,10 +299,10 @@ class UniswapV3Pricer(BaseExchangePricer):
     @staticmethod
     def get_amount1_delta(sqrt_ratio_aX96: int, sqrt_ratio_bX96: int, liquidity: int, roundUp: bool = None):
         sqrt_ratio_aX96, sqrt_ratio_bX96 = sorted([sqrt_ratio_aX96, sqrt_ratio_bX96])
-        
+
         if roundUp is None:
             roundUp = not (liquidity < 0)
-        
+
         if roundUp:
             # roundUp = true
             return UniswapV3Pricer.mul_div_rounding_up(liquidity, sqrt_ratio_bX96 - sqrt_ratio_aX96, 0x1000000000000000000000000)
@@ -389,18 +393,20 @@ class UniswapV3Pricer(BaseExchangePricer):
 
     def get_tick_bitmap_word(self, word_idx, block_identifier) -> int:
         if word_idx not in self.tick_bitmap_cache:
-            self.tick_bitmap_cache[word_idx] = \
-                self.contract.functions.tickBitmap(word_idx).call(block_identifier=block_identifier)
+            with profile('uniswap_v3_fetch'):
+                self.tick_bitmap_cache[word_idx] = \
+                    self.contract.functions.tickBitmap(word_idx).call(block_identifier=block_identifier)
         return self.tick_bitmap_cache[word_idx]
 
     def tick_at(self, tick: int, block_identifier) -> Tick:
         assert UniswapV3Pricer.MIN_TICK <= tick
         assert tick <= UniswapV3Pricer.MAX_TICK
         if tick not in self.tick_cache:
-            self.tick_cache[tick] = Tick(
-                tick,
-                *self.contract.functions.ticks(tick).call(block_identifier=block_identifier)
-            )
+            with profile('uniswap_v3_fetch'):
+                self.tick_cache[tick] = Tick(
+                    tick,
+                    *self.contract.functions.ticks(tick).call(block_identifier=block_identifier)
+                )
         return self.tick_cache[tick]
 
     @staticmethod
@@ -468,7 +474,7 @@ class UniswapV3Pricer(BaseExchangePricer):
             r += 2
         if x >= 0x2:
             r += 1
-        
+
         return r
 
     @staticmethod
@@ -521,14 +527,14 @@ class UniswapV3Pricer(BaseExchangePricer):
             ratio = (ratio * 0x48a170391f7dc42444e8fa2) >> 128
 
         if tick_num > 0:
-            uint256_max = (1 << 256) - 1 
+            uint256_max = (1 << 256) - 1
             ratio = (uint256_max) // ratio
-        
+
         if ratio % (1 << 32) == 0:
             to_add = 0
         else:
             to_add = 1
-        
+
         return (ratio >> 32) + to_add
 
     def observe_block(self, receipts: typing.List[web3.types.LogReceipt]):

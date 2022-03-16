@@ -10,9 +10,11 @@ import logging
 import web3
 import time
 import web3.types
+
+from utils.profiling import inc_measurement
 from .find import detect_arbitrages, FoundArbitrage
 
-from utils import WETH_ADDRESS
+from utils import WETH_ADDRESS, profile
 
 l = logging.getLogger(__name__)
 
@@ -40,9 +42,21 @@ def propose_circuits(modified_exchanges_last_block: typing.Set[str], pool: price
 
     Uses DFS to find WETH-containing cycles.
     """
-
+    elapsed = 0.0
     for m in modified_exchanges_last_block:
-        yield from _propose_circuits_exchange(m, pool, block_number)
+        start = time.time()
+        it = _propose_circuits_exchange(m, pool, block_number)
+        elapsed += time.time() - start
+        while True:
+            start = time.time()
+            try:
+                n = next(it)
+                elapsed += time.time() - start
+                yield n
+            except StopIteration:
+                elapsed += time.time() - start
+                break
+    inc_measurement('propose_circuits', elapsed)
 
 
 def _propose_circuits_exchange(address: str, pool: pricers.PricerPool, block_number: int) -> typing.Iterator[typing.List[str]]:

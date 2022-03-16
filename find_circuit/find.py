@@ -4,14 +4,18 @@ find_circuit/find.py
 Finds a profitable arbitrage circuit given point-in-time params.
 """
 import math
+import time
 import typing
 
+import random
 import logging
 import scipy.optimize
 import pricers.token_transfer
+import web3
 
 import pricers.base
 from utils import WETH_ADDRESS
+from utils.profiling import profile, inc_measurement
 
 l = logging.getLogger(__name__)
 
@@ -137,39 +141,44 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
 
     # for each rotation
     for _ in range(len(exchanges)):
-        run_exc = lambda i: pc.sample(math.ceil(i), block_identifier)
+        def run_exc(i):
+            return pc.sample(math.ceil(i), block_identifier) if i >= 0 else (i ** 2) # use -i here to encourage optimizer to explore toward +direction
         # try each direction
         for _ in range(2):
 
             if not (only_weth_pivot and pc.pivot_token != WETH_ADDRESS):
                 # quickly try pushing 100 tokens -- if unprofitable, fail
-                quick_test_amount_in = 100
-                quick_test_amount_out = pc.sample(100, block_identifier)
+                with profile('pricing_quick_check'):
+                    quick_test_amount_in = 100
+                    quick_test_amount_out1 = pc.sample(100, block_identifier)
 
-                if quick_test_amount_out > quick_test_amount_in:
-                    # this may be profitable
-                    result = scipy.optimize.minimize_scalar(
-                        fun = lambda x: - (run_exc(x) - x),
-                        bounds = (
-                            100, # only a little
-                            (1_000 * (10 ** 18)) # a shit-ton
-                        ),
-                        method='bounded'
-                    )
-                    if result.fun < 0:
-                        amount_in = math.ceil(result.x)
-                        expected_profit = pc.sample(amount_in, block_identifier) - amount_in
-                        if expected_profit < 0:
-                            l.warning('fun indicated profit but expected profit did not!')
-                        else:
-                            to_add = FoundArbitrage(
-                                amount_in   = amount_in,
-                                directions  = pc.directions,
-                                circuit     = pc.circuit,
-                                pivot_token = pc.pivot_token,
-                                profit      = expected_profit,
-                            )
-                            ret.append(to_add)
+                with profile('pricing_optimize'):
+                    if quick_test_amount_out1 > quick_test_amount_in:
+                        # this may be profitable
+                        result = scipy.optimize.minimize_scalar(
+                            fun = lambda x: - (run_exc(x) - x),
+                            bounds = (
+                                100, # only a little
+                                (1_000 * (10 ** 18)) # a shit-ton
+                            ),
+                            method='bounded'
+                        )
+
+
+                        if result.fun < 0:
+                            amount_in = math.ceil(result.x)
+                            expected_profit = pc.sample(amount_in, block_identifier) - amount_in
+                            if expected_profit < 0:
+                                l.warning('fun indicated profit but expected profit did not!')
+                            else:
+                                to_add = FoundArbitrage(
+                                    amount_in   = amount_in,
+                                    directions  = pc.directions,
+                                    circuit     = pc.circuit,
+                                    pivot_token = pc.pivot_token,
+                                    profit      = expected_profit,
+                                )
+                                ret.append(to_add)
             pc.flip()
         pc.rotate()
     return ret

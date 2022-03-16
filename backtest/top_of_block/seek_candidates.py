@@ -17,6 +17,7 @@ import find_circuit
 from pricers.uniswap_v2 import UniswapV2Pricer
 from pricers.uniswap_v3 import UniswapV3Pricer
 from utils import ProgressReporter, get_abi
+import utils.profiling
 
 
 l = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ def seek_candidates(w3: web3.Web3):
             n_logs = 0
             for block_number, logs in get_relevant_logs(w3, curr_block, this_end_block):
                 updated_exchanges = pricer.observe_block(logs)
+                utils.profiling.maybe_log()
                 while True:
                     try:
                         process_candidates(w3, pricer, block_number, updated_exchanges, curr)
