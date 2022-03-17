@@ -22,6 +22,12 @@ import utils.profiling
 
 l = logging.getLogger(__name__)
 
+LOG_BATCH_SIZE = 200
+RESERVATION_SIZE = 1 * 24 * 60 * 60 // 13 # about 1 days' worth
+# LOG_BATCH_SIZE = 2
+# RESERVATION_SIZE = 40
+
+
 def seek_candidates(w3: web3.Web3):
     l.info('Starting candidate searching')
     db = connect_db()
@@ -31,38 +37,59 @@ def seek_candidates(w3: web3.Web3):
     try:
         setup_db(curr)
         load_exchange_balances(w3)
-        pricer = load_pool(w3)
 
         #
         # Load all candidate profitable arbitrages
-        start_block = get_resume_point(curr)
-        l.info(f'Starting analysis from block {start_block:,}')
-        end_block = w3.eth.get_block('latest')['number']
+        start_block = 12_420_534 # 12_369_621
+        end_block = 14_324_572 # w3.eth.get_block('latest')['number']
+        l.info(f'Doing analysis from block {start_block:,} to block {end_block:,}')
         progress_reporter = ProgressReporter(l, end_block, start_block)
-        batch_size_blocks = 200
-        curr_block = start_block
-        while curr_block < end_block:
-            this_end_block = min(curr_block + batch_size_blocks - 1, end_block)
-            n_logs = 0
-            for block_number, logs in get_relevant_logs(w3, curr_block, this_end_block):
-                updated_exchanges = pricer.observe_block(logs)
-                utils.profiling.maybe_log()
-                while True:
-                    try:
-                        process_candidates(w3, pricer, block_number, updated_exchanges, curr)
-                        db.commit()
-                        break
-                    except Exception as e:
-                        db.rollback()
-                        if 'execution aborted (timeout = 5s)' in str(e):
-                            l.exception('Encountered timeout, trying again in a little bit')
-                            time.sleep(30)
-                        else:
-                            raise e
-                progress_reporter.observe(n_items=1)
-                n_logs += len(logs)
-            l.debug(f'Found {n_logs} logs this batch')
-            curr_block = this_end_block + 1
+        batch_size_blocks = 200 # batch size for getting logs
+        last_processed_block = None
+        while True:
+            maybe_rez = get_reservation(curr, start_block, end_block)
+            if maybe_rez is None:
+                # we're at the end
+                break
+
+            reservation_id, reservation_start, reservation_end = maybe_rez
+            pricer = load_pool(w3)
+            if last_processed_block is not None:
+                assert last_processed_block < reservation_start
+                progress_reporter.observe(n_items=((reservation_start - last_processed_block) - 1))
+
+            curr_block = reservation_start
+            while curr_block < reservation_end:
+                this_end_block = min(curr_block + batch_size_blocks - 1, reservation_end)
+                n_logs = 0
+                for block_number, logs in get_relevant_logs(w3, curr_block, this_end_block):
+                    updated_exchanges = pricer.observe_block(logs)
+                    utils.profiling.maybe_log()
+                    while True:
+                        try:
+                            process_candidates(w3, pricer, block_number, updated_exchanges, curr)
+                            db.commit()
+                            break
+                        except Exception as e:
+                            db.rollback()
+                            if 'execution aborted (timeout = 5s)' in str(e):
+                                l.exception('Encountered timeout, trying again in a little bit')
+                                time.sleep(30)
+                            else:
+                                raise e
+                    n_logs += len(logs)
+                l.debug(f'Found {n_logs} logs this batch')
+                progress_reporter.observe(n_items = (this_end_block - curr_block)  + 1)
+                curr_block = this_end_block + 1
+                last_processed_block = this_end_block
+
+            # mark reservation as completed
+            l.debug(f'Completed reservation id={reservation_id:,}')
+            curr.execute(
+                'UPDATE candidate_arbitrage_reservations SET completed_on = NOW()::timestamp WHERE id = %s',
+                (reservation_id,)
+            )
+            curr.connection.commit()
 
     except Exception as e:
         l.exception('top-level exception')
@@ -86,17 +113,81 @@ def setup_db(curr: psycopg2.extensions.cursor):
 
         CREATE INDEX IF NOT EXISTS idx_candidate_arbitrages_block_number ON candidate_arbitrages (block_number);
         CREATE INDEX IF NOT EXISTS idx_candidate_arbitrages_verify_run ON candidate_arbitrages (verify_run);
+
+        CREATE TABLE IF NOT EXISTS candidate_arbitrage_reservations (
+            id                 SERIAL PRIMARY KEY NOT NULL,
+            block_number_start INTEGER NOT NULL,
+            block_number_end   INTEGER NOT NULL,
+            claimed_on         TIMESTAMP WITHOUT TIME ZONE,
+            completed_on       TIMESTAMP WITHOUT TIME ZONE 
+        );
         """
     )
     curr.connection.commit()
 
 
-def get_resume_point(curr: psycopg2.extensions.cursor):
-    curr.execute('SELECT MAX(block_number) FROM candidate_arbitrages')
-    (resume_point,) = curr.fetchone()
-    if resume_point is None:
-        return 12_369_621
-    return resume_point + 1
+def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_block: int) -> typing.Optional[typing.Tuple[int, int, int]]:
+    curr.execute('BEGIN TRANSACTION')
+    curr.execute('LOCK TABLE candidate_arbitrage_reservations') # for safety
+    query_do_reservation = '''
+        UPDATE candidate_arbitrage_reservations car
+        SET claimed_on = NOW()::timestamp
+        FROM (
+            SELECT id
+            FROM candidate_arbitrage_reservations
+            WHERE claimed_on IS NULL AND completed_on IS NULL
+            ORDER BY block_number_start ASC
+            LIMIT 1
+        ) x
+        WHERE car.id = x.id
+        RETURNING car.id, car.block_number_start, car.block_number_end
+    '''
+    curr.execute(query_do_reservation)
+    maybe_row = curr.fetchall()
+
+    if len(maybe_row) == 0:
+        # no reservations left -- are we at the end, or just need to insert some?
+        curr.execute('SELECT MAX(block_number_end) FROM candidate_arbitrage_reservations')
+
+        maybe_last_reservation = curr.fetchone()[0]
+        if maybe_last_reservation:
+            assert maybe_last_reservation > start_block
+
+            # if we're at the end return None to indicate quit
+            if maybe_last_reservation >= end_block:
+                l.info(f'Reached end of reservations.')
+                curr.execute('ROLLBACK reserve')
+                return None
+
+            start_block = maybe_last_reservation + 1
+
+        l.info(f'Inserting more reservations into the database...')
+        for i in range(10):
+            batch_start = start_block + i * RESERVATION_SIZE
+            batch_end = min(end_block, start_block + (i + 1) * RESERVATION_SIZE - 1)
+            if batch_start >= batch_end:
+                # we reached the end
+                break
+            curr.execute(
+                'INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end) VALUES (%s, %s)',
+                (batch_start, batch_end)
+            )
+
+        # insert done, select our reservation
+        curr.execute(query_do_reservation)
+        maybe_row = curr.fetchall()
+
+    assert len(maybe_row) == 1
+    id_, start, end = maybe_row[0]
+    assert start >= start_block
+    assert end <= end_block
+    assert start <= end
+
+    l.info(f'Processing reservation id={id_:,} from={start:,} to end={end:,} ({end - start:,} blocks)')
+
+    curr.execute('COMMIT')
+
+    return id_, start, end
 
 
 def load_exchange_balances(w3: web3.Web3):

@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# utility for spawning a whole bunch of verifiers
-echo "[*] spawning $(($2 - $1 + 1)) verifiers";
+# utility for spawning a whole bunch of searchers
+echo "[*] spawning $(($2 - $1 + 1)) searchers";
 
 for i in `seq $1 $2`; do
     docker run \
-        --name "arbitrage-verify$i" \
+        --name "arbitrage-search$i" \
         --network ethereum-measurement-net \
         -v/home/robert/Source/goldphish:/mnt/goldphish \
         -it \
@@ -14,7 +14,6 @@ for i in `seq $1 $2`; do
         -d \
         --rm \
         ethereum-arb python3 -m backtest.top_of_block \
-            --mode verify \
-            --job-name "verify$i";
+            --job-name "search$i";
 done
 

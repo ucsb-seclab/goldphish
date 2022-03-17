@@ -6,6 +6,7 @@ import time
 import typing
 import logging
 
+ENABLED = False
 PRINT_INTERVAL_SECONDS = 2 * 60
 
 _global_profile: typing.Dict[str, float] = {}
@@ -20,6 +21,9 @@ def maybe_log():
     all profiling info.
     """
     global _last_log
+    if not ENABLED:
+        return
+
     if time.time() < _last_log + PRINT_INTERVAL_SECONDS:
         # too soon
         return
@@ -42,6 +46,8 @@ def reset_measurement(name: str):
     """
     Sets this measurement back to zero
     """
+    if not ENABLED:
+        return
     _global_profile[name] = 0
 
 
@@ -49,6 +55,8 @@ def inc_measurement(name: str, elapsed: float):
     """
     increase measurement by the given amount
     """
+    if not ENABLED:
+        return
     _global_profile[name] = _global_profile.get(name, 0) + elapsed
 
 
@@ -61,9 +69,13 @@ class ProfilerContextManager:
         self._start = None
 
     def __enter__(self) -> None:
+        if not ENABLED:
+            return
         self._start = time.time()
 
     def __exit__(self, exc_type, exc_value, exc_traceback):
+        if not ENABLED:
+            return
         elapsed = time.time() - self._start
         _global_profile[self._name] = _global_profile.get(self._name, 0) + elapsed
 
