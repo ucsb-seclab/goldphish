@@ -24,8 +24,9 @@ l = logging.getLogger(__name__)
 
 LOG_BATCH_SIZE = 200
 RESERVATION_SIZE = 1 * 24 * 60 * 60 // 13 # about 1 days' worth
-# LOG_BATCH_SIZE = 2
-# RESERVATION_SIZE = 40
+
+
+DEBUG = False
 
 
 def seek_candidates(w3: web3.Web3):
@@ -68,7 +69,8 @@ def seek_candidates(w3: web3.Web3):
                     while True:
                         try:
                             process_candidates(w3, pricer, block_number, updated_exchanges, curr)
-                            db.commit()
+                            if not DEBUG:
+                                db.commit()
                             break
                         except Exception as e:
                             db.rollback()
@@ -85,11 +87,12 @@ def seek_candidates(w3: web3.Web3):
 
             # mark reservation as completed
             l.debug(f'Completed reservation id={reservation_id:,}')
-            curr.execute(
-                'UPDATE candidate_arbitrage_reservations SET completed_on = NOW()::timestamp WHERE id = %s',
-                (reservation_id,)
-            )
-            curr.connection.commit()
+            if not DEBUG:
+                curr.execute(
+                    'UPDATE candidate_arbitrage_reservations SET completed_on = NOW()::timestamp WHERE id = %s',
+                    (reservation_id,)
+                )
+                curr.connection.commit()
 
     except Exception as e:
         l.exception('top-level exception')
@@ -126,7 +129,7 @@ def setup_db(curr: psycopg2.extensions.cursor):
     curr.connection.commit()
 
 
-def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_block: int) -> typing.Optional[typing.Tuple[int, int, int]]:
+def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_block: int) -> typing.Optional[typing.Tuple[int, int, int]]:    
     curr.execute('BEGIN TRANSACTION')
     curr.execute('LOCK TABLE candidate_arbitrage_reservations') # for safety
     query_do_reservation = '''
@@ -185,7 +188,8 @@ def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_bloc
 
     l.info(f'Processing reservation id={id_:,} from={start:,} to end={end:,} ({end - start:,} blocks)')
 
-    curr.execute('COMMIT')
+    if not DEBUG:
+        curr.execute('COMMIT')
 
     return id_, start, end
 
@@ -339,15 +343,18 @@ def process_candidates(w3: web3.Web3, pool: pricers.PricerPool, block_number: in
             n_ignored += 1
             continue
 
-        if False:
+        if True:
             # some debugging
             exchange_outs = {}
             amount = p.amount_in
             for exc, dxn in zip(p.circuit, p.directions):
                 if dxn == True:
                     amount_out = exc.exact_token0_to_token1(amount, block_identifier=block_number)
+                    token_out = exc.token1
                 else:
                     amount_out = exc.exact_token1_to_token0(amount, block_identifier=block_number)
+                    token_out = exc.token0
+                amount_out = pricers.token_transfer.out_from_transfer(token_out, amount_out)
                 l.debug(f'{exc.address} out={amount_out}')
                 amount = amount_out
                 exchange_outs[exc.address] = amount_out
@@ -363,8 +370,11 @@ def process_candidates(w3: web3.Web3, pool: pricers.PricerPool, block_number: in
                     pricer = UniswapV3Pricer(w3, exc.address, exc.token0, exc.token1, exc.fee)
                 if dxn == True:
                     amount_out = pricer.exact_token0_to_token1(amount, block_identifier=block_number)
+                    token_out = pricer.token1
                 else:
                     amount_out = pricer.exact_token1_to_token0(amount, block_identifier=block_number)
+                    token_out = pricer.token0
+                amount_out = pricers.token_transfer.out_from_transfer(token_out, amount_out)
                 l.debug(f'fresh {exc.address} out={amount_out}')
                 if exchange_outs[exc.address] != amount_out:
                     l.debug(f'Amount_out {exc.address} changed from {exchange_outs[exc.address]} to {amount_out}')
