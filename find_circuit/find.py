@@ -4,14 +4,12 @@ find_circuit/find.py
 Finds a profitable arbitrage circuit given point-in-time params.
 """
 import math
-import time
 import typing
 
-import random
 import logging
 import scipy.optimize
 import pricers.token_transfer
-import web3
+from pricers.uniswap_v3 import NotEnoughLiqudityException
 
 import pricers.base
 from utils import WETH_ADDRESS
@@ -142,7 +140,12 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
     # for each rotation
     for _ in range(len(exchanges)):
         def run_exc(i):
-            return pc.sample(math.ceil(i), block_identifier) if i >= 0 else (i ** 2) # use -i here to encourage optimizer to explore toward +direction
+            try:
+                return pc.sample(math.ceil(i), block_identifier) if i >= 0 else -(i + 1000) # encourage optimizer to explore toward +direction
+            except NotEnoughLiqudityException as e:
+                # encourage going toward available liquidity
+                return -(1000 + e.remaining)
+
         # try each direction
         for _ in range(2):
 
@@ -150,16 +153,42 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
                 # quickly try pushing 100 tokens -- if unprofitable, fail
                 with profile('pricing_quick_check'):
                     quick_test_amount_in = 100
-                    quick_test_amount_out1 = pc.sample(100, block_identifier)
+                    try:
+                        quick_test_amount_out1 = pc.sample(100, block_identifier)
+                    except NotEnoughLiqudityException:
+                        # not profitable most likely
+                        continue
+
 
                 with profile('pricing_optimize'):
                     if quick_test_amount_out1 > quick_test_amount_in:
                         # this may be profitable
+
+                        # search for crossing-point where liquidity does not run out
+                        lower_bound = 100
+                        upper_bound = (1_000 * (10 ** 18)) # a shit-ton
+                        try:
+                            pc.sample(upper_bound, block_identifier)
+                        except NotEnoughLiqudityException:
+                            # we need to adjust upper_bound down juuuust until it's in liquidity range
+                            # do this by binary-search
+                            search_lower = lower_bound
+                            search_upper = upper_bound
+                            while search_lower < search_upper - 1:
+                                midpoint = (search_lower + search_upper) // 2
+                                try:
+                                    pc.sample(midpoint, block_identifier)
+                                    search_lower = midpoint
+                                except NotEnoughLiqudityException:
+                                    search_upper = midpoint
+                            upper_bound = search_lower
+
+
                         result = scipy.optimize.minimize_scalar(
                             fun = lambda x: - (run_exc(x) - x),
                             bounds = (
-                                100, # only a little
-                                (1_000 * (10 ** 18)) # a shit-ton
+                                lower_bound, # only a little
+                                upper_bound, # a shit-ton
                             ),
                             method='bounded'
                         )

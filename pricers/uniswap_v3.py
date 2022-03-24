@@ -31,6 +31,24 @@ UNIV3_BURN_EVENT_TOPIC = event_abi_to_log_topic(generic_uv3.events.Burn().abi)
 UNIV3_MINT_EVENT_TOPIC = event_abi_to_log_topic(generic_uv3.events.Mint().abi)
 
 
+class NotEnoughLiqudityException(Exception):
+    """
+    Thrown when there is not enough liquidity to complete the given swap.
+    Returns (amount0, amount1, remaining) where amount0 and amount1 are
+    the amounts of token0, token1 in (or out), and remaining is how much
+    input remained when liquidity ran out.
+    """
+    amount0: int
+    amount1: int
+    remaining: int
+
+    def __init__(self, amount0, amount1, remaining, *args: object) -> None:
+        super().__init__(*args)
+        self.amount0 = amount0
+        self.amount1 = amount1
+        self.remaining = remaining
+
+
 class UniswapV3Pricer(BaseExchangePricer):
     MIN_TICK = -887272
     MAX_TICK = 887272
@@ -138,7 +156,8 @@ class UniswapV3Pricer(BaseExchangePricer):
         amount_calculated = 0
 
         while amount_specified_remaining != 0 and sqrt_price_x96 != sqrt_price_limitX96:
-            # print(f'amount_specified_remaining={amount_specified_remaining} sqrt_price_limit={sqrt_price_limitX96} sqrt_price={sqrt_price_x96} liquidity={liquidity} tick={tick}')
+            # if self.address == '0x7cf70eD6213F08b70316bD80F7c2ddDc94E41aC5':
+            #     print(f'amount_specified_remaining={amount_specified_remaining} sqrt_price_limit={sqrt_price_limitX96} sqrt_price={sqrt_price_x96} liquidity={liquidity} tick={tick}')
             sqrt_price_start_x96 = sqrt_price_x96
             # compute tickNext
             next_tick_num, initialized = self.next_initialized_tick_within_one_word(
@@ -193,6 +212,9 @@ class UniswapV3Pricer(BaseExchangePricer):
         else:
             amount0 = amount_calculated
             amount1 = amount_specified - amount_specified_remaining
+
+        if amount_specified_remaining != 0:
+            raise NotEnoughLiqudityException(amount0, amount1, amount_specified_remaining, 'ran out of liquidity')
 
         return (amount0, amount1)
 
