@@ -8,6 +8,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_17.x | bash -
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y python3 python3-pip nodejs yarn psmisc
 
+RUN npm i -g npm node-gyp@9.0.0 @mapbox/node-pre-gyp@1.0.8
 RUN pip install web3 numpy scipy tabulate pytest networkx cachetools psycopg2-binary
 
 WORKDIR /opt/goldphish
@@ -21,10 +22,11 @@ COPY hardhat.config.js .
 COPY contracts contracts
 RUN yarn hardhat compile
 
-# COPY vend vend
+# install ganache dependencies
+COPY vend/ganache/package.json ./vend/ganache/package.json
+RUN cd ./vend/ganache && npm install
 
-# # build ganache
-# RUN cd vend/ganache && npm install
-# RUN cd vend/ganache && npm ci
+COPY vend/ ./vend
 
+# copy in our ganache build
 COPY . ./

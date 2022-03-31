@@ -5,6 +5,7 @@ and synthesizes the input data for the shooter.
 
 import typing
 import logging
+from pricers.uniswap_v3 import NotEnoughLiqudityException
 
 import shooter.encoder
 import pricers
@@ -13,6 +14,7 @@ import find_circuit.find
 from .constants import MAX_COINBASE_XFER, WETH_ADDRESS
 
 l = logging.getLogger(__name__)
+
 
 class ExchangeRecord(typing.NamedTuple):
     is_uniswap_v2: bool
@@ -30,6 +32,27 @@ class ExchangeRecord(typing.NamedTuple):
     def amount_out_less_token_fee(self) -> int:
         return pricers.out_from_transfer(self.token_out, self.amount_out)
 
+class ConstructionException(Exception):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+
+class NotEnoughOutException(ConstructionException):
+    """
+    When the arbitrage doesn't have enough output
+    """
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+
+class CouldSaveOneWeiException(ConstructionException):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+
 def construct_from_found_arbitrage(fa: find_circuit.find.FoundArbitrage, coinbase_xfer: int, target_block: int):
     """
     Simple wrapper over construct() which transforms the input into expected named tuple.
@@ -39,27 +62,48 @@ def construct_from_found_arbitrage(fa: find_circuit.find.FoundArbitrage, coinbas
     exchanges: typing.List[ExchangeRecord] = []
 
     last_out = fa.amount_in
-    for dxn, p in zip(fa.directions, fa.circuit):
-        if dxn == True:
-            # zeroForOne
-            amt_out = p.exact_token0_to_token1(last_out, target_block - 1)
-            token_in = p.token0
-            token_out = p.token1
-        else:
-            assert dxn == False
-            amt_out = p.exact_token1_to_token0(last_out, target_block - 1)
-            token_in = p.token1
-            token_out = p.token0
-        exchanges.append(ExchangeRecord(
-            is_uniswap_v2 = isinstance(p, pricers.uniswap_v2.UniswapV2Pricer),
-            address = p.address,
-            amount_in = last_out,
-            amount_out = amt_out,
-            token_in = token_in,
-            token_out = token_out,
-        ))
-        last_out = pricers.out_from_transfer(token_out, amt_out)
-    assert last_out > fa.amount_in
+    # this should be taken care-of earlier, but check for it now.
+    # you might be able to save 1 wei
+    if fa.directions[0] == True:
+        assert fa.circuit[0].token0 == WETH_ADDRESS
+        out_normal = fa.circuit[0].exact_token0_to_token1(fa.amount_in, block_identifier=target_block - 1)
+        out_reduced_by_1 = fa.circuit[0].exact_token0_to_token1(fa.amount_in - 1, block_identifier=target_block - 1)
+    else:
+        assert fa.circuit[0].token1 == WETH_ADDRESS
+        out_normal = fa.circuit[0].exact_token1_to_token0(fa.amount_in, block_identifier=target_block - 1)
+        out_reduced_by_1 = fa.circuit[0].exact_token1_to_token0(fa.amount_in - 1, block_identifier=target_block - 1)
+
+    if out_normal == out_reduced_by_1:
+        raise CouldSaveOneWeiException('could save 1 wei by reducing amount_in by 1')
+
+    try:
+        for dxn, p in zip(fa.directions, fa.circuit):
+            if dxn == True:
+                # zeroForOne
+                amt_out = p.exact_token0_to_token1(last_out, target_block - 1)
+                token_in = p.token0
+                token_out = p.token1
+            else:
+                assert dxn == False
+                amt_out = p.exact_token1_to_token0(last_out, target_block - 1)
+                token_in = p.token1
+                token_out = p.token0
+            exchanges.append(ExchangeRecord(
+                is_uniswap_v2 = isinstance(p, pricers.uniswap_v2.UniswapV2Pricer),
+                address = p.address,
+                amount_in = last_out,
+                amount_out = amt_out,
+                token_in = token_in,
+                token_out = token_out,
+            ))
+            last_out = pricers.out_from_transfer(token_out, amt_out)
+        if last_out <= fa.amount_in:
+            raise NotEnoughOutException('arbitrage did not result in profit')
+    except NotEnoughLiqudityException:
+        l.warning('Not enough liquidity to construct this....')
+        raise ConstructionException('not enough liquidity')
+
+    # see if we can take advantage of rounding error to save 1 wei
 
     return construct(exchanges, coinbase_xfer, target_block)    
 

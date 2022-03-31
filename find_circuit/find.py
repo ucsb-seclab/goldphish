@@ -3,6 +3,7 @@ find_circuit/find.py
 
 Finds a profitable arbitrage circuit given point-in-time params.
 """
+import itertools
 import math
 import typing
 
@@ -32,37 +33,41 @@ class FoundArbitrage(typing.NamedTuple):
             ret.add(exc.token1)
         return ret
 
+    def __hash__(self) -> int:
+        return hash((self.amount_in, tuple(self.circuit), tuple(self.directions), self.pivot_token, self.profit))
+
 class PricingCircuit:
     _circuit: typing.List[pricers.base.BaseExchangePricer]
     _directions: typing.List[bool]
 
-    def __init__(self, _circuit: typing.List[pricers.base.BaseExchangePricer]) -> None:
+    def __init__(self, _circuit: typing.List[pricers.base.BaseExchangePricer], _directions: typing.Optional[typing.List[bool]] = None) -> None:
         self._circuit = _circuit
         _circuit_pairs = list(zip(_circuit, _circuit[1:] + [_circuit[0]]))
 
-        # assume we start zeroForOne, if that doesn't hold
-        # (this is only possible when circuit is len 3), then assume not zeroForOne
-        _directions = [True]
-        if _circuit_pairs[0][0].token1 not in [_circuit_pairs[0][1].token0, _circuit_pairs[0][1].token1]:
-            assert _circuit_pairs[0][0].token0 in [_circuit_pairs[0][1].token0, _circuit_pairs[0][1].token1]
-            _directions = [False]
-        
-        for i, (p1, p2) in list(enumerate(_circuit_pairs))[1:]:
-            prev_exc = _circuit_pairs[i - 1][0]
-            if _directions[i - 1] == True:
-                # previous direction was zeroForOne
-                prev_token = prev_exc.token1
-            else:
-                prev_token = prev_exc.token0
+        if _directions is None:
+            # assume we start zeroForOne, if that doesn't hold
+            # (this is only possible when circuit is len 3), then assume not zeroForOne
+            _directions = [True]
+            if _circuit_pairs[0][0].token1 not in [_circuit_pairs[0][1].token0, _circuit_pairs[0][1].token1]:
+                assert _circuit_pairs[0][0].token0 in [_circuit_pairs[0][1].token0, _circuit_pairs[0][1].token1]
+                _directions = [False]
+            
+            for i, (p1, p2) in list(enumerate(_circuit_pairs))[1:]:
+                prev_exc = _circuit_pairs[i - 1][0]
+                if _directions[i - 1] == True:
+                    # previous direction was zeroForOne
+                    prev_token = prev_exc.token1
+                else:
+                    prev_token = prev_exc.token0
 
-            if prev_token == p1.token0:
-                next_token = p1.token1
-                _directions.append(True)
-            else:
-                next_token = p1.token0
-                _directions.append(False)
+                if prev_token == p1.token0:
+                    next_token = p1.token1
+                    _directions.append(True)
+                else:
+                    next_token = p1.token0
+                    _directions.append(False)
 
-            assert next_token in [p2.token0, p2.token1]
+                assert next_token in [p2.token0, p2.token1]
 
         self._directions = _directions
         assert len(self._circuit) == len(self._directions)
@@ -197,7 +202,31 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
                         if result.fun < 0:
                             amount_in = math.ceil(result.x)
                             expected_profit = pc.sample(amount_in, block_identifier) - amount_in
-                            if expected_profit < 0:
+
+                            # if reducing input by 1 wei results in the same amount out, then use that value (rounding gets fucky)
+                            for i in itertools.count(1):
+                                if pc.directions[0] == True:
+                                    assert pc.circuit[0].token0 == WETH_ADDRESS
+                                    out_normal = pc.circuit[0].exact_token0_to_token1(amount_in, block_identifier=block_identifier)
+                                    out_reduced_by_1 = pc.circuit[0].exact_token0_to_token1(amount_in - 1, block_identifier=block_identifier)
+                                else:
+                                    assert pc.circuit[0].token1 == WETH_ADDRESS
+                                    out_normal = pc.circuit[0].exact_token1_to_token0(amount_in, block_identifier=block_identifier)
+                                    out_reduced_by_1 = pc.circuit[0].exact_token1_to_token0(amount_in - 1, block_identifier=block_identifier)
+                                
+                                if out_normal == out_reduced_by_1:
+                                    l.debug(f'Reducing input amount by {i} wei for rounding reasons')
+                                    amount_in -= 1
+                                    expected_profit += 1
+                                else:
+                                    break
+
+                            for i in itertools.count(1):
+                                trying_amount_in = amount_in - i
+                                expected_profit_new = pc.sample(trying_amount_in, block_identifier) - amount_in
+                                if expected_profit_new < expected_profit:
+                                    break # profit going down, give up
+                            if expected_profit <= 0:
                                 l.warning('fun indicated profit but expected profit did not!')
                             else:
                                 to_add = FoundArbitrage(

@@ -1,3 +1,4 @@
+from asyncio import gather
 import collections
 import typing
 import time
@@ -7,6 +8,7 @@ import web3.types
 from .base import BaseExchangePricer
 from .uniswap_v2 import UniswapV2Pricer
 from .uniswap_v3 import UniswapV3Pricer
+from .token_balance_changing_logs import CACHE_INVALIDATING_TOKEN_LOGS
 import cachetools
 
 
@@ -118,7 +120,7 @@ class PricerPool:
         ret = set()
 
         # gather block logs by address
-        gathered = collections.defaultdict(lambda: [])
+        gathered: typing.Dict[str, typing.List[web3.types.LogReceipt]] = collections.defaultdict(lambda: [])
         for log in logs:
             gathered[log['address']].append(log)
 
@@ -135,6 +137,26 @@ class PricerPool:
 
             if address in self._uniswap_v2_pools or address in self._uniswap_v3_pools:
                 ret.add(address)
+
+        invalidated_tokens = set()
+        for address in gathered:
+            if address in CACHE_INVALIDATING_TOKEN_LOGS:
+                important_topics = CACHE_INVALIDATING_TOKEN_LOGS[address]
+                for log in gathered[address]:
+                    if len(log['topics']) > 0 and log['topics'][0] in important_topics:
+                        # ugh, we need to do invalidation
+                        invalidated_tokens.add(address)
+                        break
+
+        for address in invalidated_tokens:
+            for pool_address in self._token_to_pools[address]:
+                # invalidate only if uniswap v2 (v3 doesn't care about balance shuffling?)
+                if pool_address in self._uniswap_v2_pools:
+                    # mark exchange as changed
+                    ret.add(pool_address)
+                    if pool_address in self._cache:
+                        # invalidate cache
+                        del self._cache[pool_address]
 
         return ret
 

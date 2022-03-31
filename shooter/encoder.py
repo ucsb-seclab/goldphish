@@ -30,6 +30,11 @@ class UniswapV3Record(typing.NamedTuple):
     zero_for_one: bool
     recipient: FundsRecipient
 
+class ExceedsEncodableParamsException(Exception):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
 def encode_basic(
         target_block: int,
         amount_in: int,
@@ -43,7 +48,8 @@ def encode_basic(
     """
     assert isinstance(amount_in, int)
     assert 0 <= amount_in
-    assert amount_in <= MAX_AMOUNT_IN_SWAP
+    if amount_in > MAX_AMOUNT_IN_SWAP:
+        raise ExceedsEncodableParamsException('amount_in too big')
     assert isinstance(target_block, int)
     assert 0 <= target_block
 
@@ -102,8 +108,8 @@ def encode_basic(
         # add address
         first_line |= int(ex.address[2:], base=16)
 
-        if isinstance(ex, UniswapV2Record) and ex.amount_in_explicit > 0:
-            assert ex.amount_in_explicit <= MAX_AMOUNT_IN_UNISWAP_V2
+        if isinstance(ex, UniswapV2Record) and ex.amount_in_explicit > MAX_AMOUNT_IN_UNISWAP_V2:
+            raise ExceedsEncodableParamsException(f'amount_in for {ex.address} exceeds limits')
 
         can_infer_amount_out = isinstance(ex, UniswapV2Record) and i == len(exchanges) - 1 and ex.recipient == FundsRecipient.MSG_SENDER
         if can_infer_amount_out:
@@ -112,13 +118,15 @@ def encode_basic(
             can_infer_all_amounts = isinstance(exchanges[i-1], UniswapV3Record) and isinstance(ex, UniswapV3Record) and ex.recipient == FundsRecipient.MSG_SENDER
             if not can_infer_all_amounts:
                 # add amount out
-                assert ex.amount_out <= MAX_AMOUNT_OUT
+                if ex.amount_out > MAX_AMOUNT_OUT:
+                    raise ExceedsEncodableParamsException(f'exceeds max amount_out {ex.address}')
                 first_line |= ex.amount_out << 160
 
         ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
 
         if not can_infer_amount_out and isinstance(ex, UniswapV2Record) and ex.amount_in_explicit > 0:
-            assert ex.amount_in_explicit < MAX_AMOUNT_IN_UNISWAP_V2
+            if ex.amount_in_explicit >= MAX_AMOUNT_IN_UNISWAP_V2:
+                raise ExceedsEncodableParamsException(f'exceeds max amount_in_explicit: {ex.address}')
             ret += int.to_bytes(
                 ex.amount_in_explicit << 160,
                 length=32,

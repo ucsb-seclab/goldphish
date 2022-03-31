@@ -10,7 +10,8 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-dist/
+# vend/dist permitted
+./dist/
 downloads/
 eggs/
 .eggs/

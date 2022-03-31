@@ -23,8 +23,6 @@ def profitable_circuits(modified_exchanges_last_block: typing.Set[str], pool: pr
     found_circuits: typing.Dict[typing.Any, FoundArbitrage] = {}
     for circuit in propose_circuits(modified_exchanges_last_block, pool, block_number):
         if any(not pool.is_uniswap_v2(x) for x in circuit):
-            if {web3.Web3.toChecksumAddress('0xc2e9f25be6257c210d7adf0d4cd6e3e881ba25f8'), web3.Web3.toChecksumAddress('0x9bfea6fac60406554b33f4f8d43dc101cf7a8034'), web3.Web3.toChecksumAddress('0xd1f99e919f782c001a6c47408c8ea20ba5e14d46')}.intersection(circuit) == 0:
-                continue
             # l.debug(f'testing ' + str(circuit))
             # there MUST be a uniswap v3 in here to consider it
             circuit_pricers = [pool.get_pricer_for(a) for a in circuit]
