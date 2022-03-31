@@ -41,7 +41,7 @@ def seek_candidates(w3: web3.Web3):
 
         #
         # Load all candidate profitable arbitrages
-        start_block = 12_420_534 # 12_369_621
+        start_block = 12_369_621
         end_block = 14_324_572 # w3.eth.get_block('latest')['number']
         l.info(f'Doing analysis from block {start_block:,} to block {end_block:,}')
         progress_reporter = ProgressReporter(l, end_block, start_block)
@@ -129,7 +129,7 @@ def setup_db(curr: psycopg2.extensions.cursor):
     curr.connection.commit()
 
 
-def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_block: int) -> typing.Optional[typing.Tuple[int, int, int]]:    
+def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_block: int) -> typing.Optional[typing.Tuple[int, int, int]]:
     curr.execute('BEGIN TRANSACTION')
     curr.execute('LOCK TABLE candidate_arbitrage_reservations') # for safety
     query_do_reservation = '''
@@ -159,7 +159,7 @@ def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_bloc
             # if we're at the end return None to indicate quit
             if maybe_last_reservation >= end_block:
                 l.info(f'Reached end of reservations.')
-                curr.execute('ROLLBACK reserve')
+                curr.execute('ROLLBACK')
                 return None
 
             start_block = maybe_last_reservation + 1
@@ -343,7 +343,7 @@ def process_candidates(w3: web3.Web3, pool: pricers.PricerPool, block_number: in
             n_ignored += 1
             continue
 
-        if True:
+        if False:
             # some debugging
             exchange_outs = {}
             amount = p.amount_in
