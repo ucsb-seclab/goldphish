@@ -62,7 +62,7 @@ contract Shooter is
         }
 
         assembly {
-            function getAmountOut(line) -> amountOut {
+            function getAmount(line) -> amountOut {
                 amountOut := and(shr(160, line), 0xfffffffffffffffffffffff)
             }
             function getZeroForOne(line) -> zeroForOne {
@@ -95,7 +95,7 @@ contract Shooter is
                 if and(last_line, shl(252, 0x1)) {
                     // this is uniswap v3
 
-                    let amountOutNeg
+                    let amountIn := getAmount(last_line)
 
                     mstore(0x80, shl(224, 0x128acb08)) // method selector for uniswap v3 swap()
 
@@ -103,19 +103,10 @@ contract Shooter is
                     case 0 {
                         // shooter (self)
                         mstore(0x84, address())
-                        amountOutNeg := getAmountOut(last_line)
                     }
                     case 1 {
                         // msg_sender
                         mstore(0x84, caller())
-                        // as a gas savings, in this instance we get amountOut from known args
-                        switch sgt(amount0Delta, 0)
-                        case 0 {
-                            amountOutNeg := amount1Delta
-                        }
-                        default {
-                            amountOutNeg := amount0Delta
-                        }
                     }
                     default {
                         // recipient is next uniswap v2 exchange -- unfortunately, we need to scan calldata for it
@@ -131,7 +122,6 @@ contract Shooter is
                             }
                         }
                         if iszero(lt(i, cdsize)) { revert(0,0) }
-                        amountOutNeg := getAmountOut(last_line)
                     }
 
 
@@ -149,7 +139,7 @@ contract Shooter is
                     }
 
                     // set amountOut (must negate to indicate amount out)
-                    mstore(0xc4, sub(0, amountOutNeg))
+                    mstore(0xc4, amountIn)
 
                     // store the bytes calldata data (For callback)
                     mstore(0x104, 0xa0)
@@ -189,10 +179,10 @@ contract Shooter is
                     // amountOut, so requiredInput is encoded where amountOut usually is
                     switch shr(254, last_line)
                     case 0 {
-                        amountOut := getAmountOut(last_line)
+                        amountOut := getAmount(last_line)
                     }
                     default {
-                        requiredInput := getAmountOut(last_line)
+                        requiredInput := getAmount(last_line)
                         switch sgt(amount0Delta, 0) // amountOut = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
                         case 0 {
                             amountOut := amount1Delta
@@ -218,7 +208,7 @@ contract Shooter is
                         calldata_idx := add(calldata_idx, 0x20)
                     }
                     // this is true regardless of extradata
-                    amountOut := getAmountOut(last_line)
+                    amountOut := getAmount(last_line)
                 }
 
                 if requiredInput {
@@ -274,6 +264,7 @@ contract Shooter is
                 }
             }
         }
+        return;
     }
 
     fallback(bytes calldata input) external payable returns (bytes memory) {
@@ -394,6 +385,7 @@ contract Shooter is
                     if iszero(status) { revert(0,0) }
                 }
             }
+            stop()
         }
     }
 

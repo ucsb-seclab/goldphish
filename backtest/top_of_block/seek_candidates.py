@@ -12,6 +12,7 @@ import psycopg2.extensions
 
 from backtest.top_of_block.common import connect_db
 from backtest.top_of_block.constants import FNAME_EXCHANGES_WITH_BALANCES, IMPORTANT_TOPICS_HEX, MIN_PROFIT_PREFILTER, THRESHOLDS, univ2_fname, univ3_fname
+from backtest.utils import CancellationToken
 import pricers
 import find_circuit
 from pricers.uniswap_v2 import UniswapV2Pricer
@@ -26,77 +27,98 @@ LOG_BATCH_SIZE = 200
 RESERVATION_SIZE = 1 * 24 * 60 * 60 // 13 # about 1 days' worth
 
 
-DEBUG = False
+DEBUG = True
 
 
-def seek_candidates(w3: web3.Web3):
+def seek_candidates(w3: web3.Web3, job_name: str, worker_name: str):
     l.info('Starting candidate searching')
     db = connect_db()
     curr = db.cursor()
     time.sleep(4)
 
-    try:
-        setup_db(curr)
-        load_exchange_balances(w3)
+    setup_db(curr)
+    load_exchange_balances(w3)
+    cancellation_token = CancellationToken(job_name, worker_name, connect_db())
 
-        #
-        # Load all candidate profitable arbitrages
-        start_block = 12_369_621
-        end_block = 14_324_572 # w3.eth.get_block('latest')['number']
-        l.info(f'Doing analysis from block {start_block:,} to block {end_block:,}')
-        progress_reporter = ProgressReporter(l, end_block, start_block)
-        batch_size_blocks = 200 # batch size for getting logs
-        last_processed_block = None
-        while True:
-            maybe_rez = get_reservation(curr, start_block, end_block)
-            if maybe_rez is None:
-                # we're at the end
+    #
+    # Load all candidate profitable arbitrages
+    start_block = 12_369_621
+    end_block = 14_324_572 # w3.eth.get_block('latest')['number']
+    l.info(f'Doing analysis from block {start_block:,} to block {end_block:,}')
+    progress_reporter = ProgressReporter(l, end_block, start_block)
+    batch_size_blocks = 200 # batch size for getting logs
+    last_processed_block = None
+    while not cancellation_token.cancel_requested():
+        maybe_rez = get_reservation(curr, start_block, end_block)
+        if maybe_rez is None:
+            # we're at the end
+            break
+
+        reservation_id, reservation_start, reservation_end = maybe_rez
+        pricer = load_pool(w3)
+        if last_processed_block is not None:
+            assert last_processed_block < reservation_start
+            progress_reporter.observe(n_items=((reservation_start - last_processed_block) - 1))
+
+        curr_block = reservation_start
+        while curr_block <= reservation_end:
+            this_end_block = min(curr_block + batch_size_blocks - 1, reservation_end)
+            for block_number, logs in get_relevant_logs(w3, curr_block, this_end_block):
+                updated_exchanges = pricer.observe_block(logs)
+                utils.profiling.maybe_log()
+                while True:
+                    try:
+                        process_candidates(w3, pricer, block_number, updated_exchanges, curr)
+                        if not DEBUG:
+                            db.commit()
+                        break
+                    except Exception as e:
+                        db.rollback()
+                        if 'execution aborted (timeout = 5s)' in str(e):
+                            l.exception('Encountered timeout, trying again in a little bit')
+                            time.sleep(30)
+                        else:
+                            raise e
+
+            progress_reporter.observe(n_items = (this_end_block - curr_block)  + 1)
+            curr_block = this_end_block + 1
+            last_processed_block = this_end_block
+
+            if cancellation_token.cancel_requested():
+                l.info('exiting due to cancellation requested')
                 break
 
-            reservation_id, reservation_start, reservation_end = maybe_rez
-            pricer = load_pool(w3)
-            if last_processed_block is not None:
-                assert last_processed_block < reservation_start
-                progress_reporter.observe(n_items=((reservation_start - last_processed_block) - 1))
-
-            curr_block = reservation_start
-            while curr_block < reservation_end:
-                this_end_block = min(curr_block + batch_size_blocks - 1, reservation_end)
-                n_logs = 0
-                for block_number, logs in get_relevant_logs(w3, curr_block, this_end_block):
-                    updated_exchanges = pricer.observe_block(logs)
-                    utils.profiling.maybe_log()
-                    while True:
-                        try:
-                            process_candidates(w3, pricer, block_number, updated_exchanges, curr)
-                            if not DEBUG:
-                                db.commit()
-                            break
-                        except Exception as e:
-                            db.rollback()
-                            if 'execution aborted (timeout = 5s)' in str(e):
-                                l.exception('Encountered timeout, trying again in a little bit')
-                                time.sleep(30)
-                            else:
-                                raise e
-                    n_logs += len(logs)
-                l.debug(f'Found {n_logs} logs this batch')
-                progress_reporter.observe(n_items = (this_end_block - curr_block)  + 1)
-                curr_block = this_end_block + 1
-                last_processed_block = this_end_block
-
-            # mark reservation as completed
-            l.debug(f'Completed reservation id={reservation_id:,}')
-            if not DEBUG:
+        # mark reservation as completed
+        if not DEBUG:
+            if not cancellation_token.cancel_requested():
+                assert this_end_block == reservation_end
+                l.debug(f'Completed reservation id={reservation_id:,}')
                 curr.execute(
                     'UPDATE candidate_arbitrage_reservations SET completed_on = NOW()::timestamp WHERE id = %s',
                     (reservation_id,)
                 )
-                curr.connection.commit()
-
-    except Exception as e:
-        l.exception('top-level exception')
-        raise e
+                db.commit()
+            else:
+                # cancellation was requested
+                if curr_block <= reservation_end:
+                    l.info('Splitting off unifinished reservation into new one')
+                    curr.execute(
+                        '''
+                        UPDATE candidate_arbitrage_reservations SET block_number_end = %s, completed_on = NOW()::timestamp WHERE id = %s
+                        ''',
+                        (this_end_block, reservation_id),
+                    )
+                    curr.execute(
+                        '''
+                        INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end)
+                        VALUES (%s, %s)
+                        RETURNING id
+                        ''',
+                        (curr_block, reservation_end)
+                    )
+                    (new_id,) = curr.fetchone()
+                    l.debug(f'Created new reservation id={new_id:,} {curr_block:,} -> {reservation_end:,}')
+                    db.commit()
 
 
 def setup_db(curr: psycopg2.extensions.cursor):
@@ -130,6 +152,10 @@ def setup_db(curr: psycopg2.extensions.cursor):
 
 
 def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_block: int) -> typing.Optional[typing.Tuple[int, int, int]]:
+    if DEBUG:
+        return (
+            -1, 13_395_340, 13_395_349
+        )
     curr.execute('BEGIN TRANSACTION')
     curr.execute('LOCK TABLE candidate_arbitrage_reservations') # for safety
     query_do_reservation = '''
@@ -343,7 +369,7 @@ def process_candidates(w3: web3.Web3, pool: pricers.PricerPool, block_number: in
             n_ignored += 1
             continue
 
-        if False:
+        if DEBUG:
             # some debugging
             exchange_outs = {}
             amount = p.amount_in

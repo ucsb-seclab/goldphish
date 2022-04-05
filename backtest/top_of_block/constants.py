@@ -3,6 +3,7 @@ import typing
 import web3
 import web3.contract
 from eth_utils import event_abi_to_log_topic
+from pricers.token_balance_changing_logs import CACHE_INVALIDATING_TOKEN_LOGS
 
 from utils import WETH_ADDRESS, USDC_ADDRESS, TETHER_ADDRESS, UNI_ADDRESS, WBTC_ADDRESS, get_abi
 
@@ -25,7 +26,8 @@ univ2: web3.contract.Contract = web3.Web3().eth.contract(
 IMPORTANT_TOPICS.append(event_abi_to_log_topic(univ2.events.Mint().abi))
 IMPORTANT_TOPICS.append(event_abi_to_log_topic(univ2.events.Burn().abi))
 IMPORTANT_TOPICS.append(event_abi_to_log_topic(univ2.events.Swap().abi))
-IMPORTANT_TOPICS.append(event_abi_to_log_topic(univ2.events.Sync().abi))
+UNISWAP_V2_SYNC_TOPIC = event_abi_to_log_topic(univ2.events.Sync().abi)
+IMPORTANT_TOPICS.append(UNISWAP_V2_SYNC_TOPIC)
 
 univ3: web3.contract.Contract = web3.Web3().eth.contract(
     address=None,
@@ -37,6 +39,10 @@ IMPORTANT_TOPICS.append(event_abi_to_log_topic(univ3.events.Initialize().abi))
 IMPORTANT_TOPICS.append(event_abi_to_log_topic(univ3.events.SetFeeProtocol().abi)) # I'm not sure this is ever used?
 IMPORTANT_TOPICS.append(event_abi_to_log_topic(univ3.events.CollectProtocol().abi)) # I'm not sure this is ever used?
 IMPORTANT_TOPICS.append(event_abi_to_log_topic(univ3.events.Swap().abi))
+
+for val in CACHE_INVALIDATING_TOKEN_LOGS.values():
+    for v in val:
+        IMPORTANT_TOPICS.append(v)
 
 IMPORTANT_TOPICS_HEX: typing.List[str] = ['0x' + x.hex() for x in IMPORTANT_TOPICS]
 

@@ -14,6 +14,6 @@ for i in `seq $1 $2`; do
         -d \
         --rm \
         ethereum-arb python3 -m backtest.top_of_block \
-            --job-name "search$i";
+            --worker-name "search$i";
 done
 

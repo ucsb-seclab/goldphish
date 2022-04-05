@@ -1,18 +1,21 @@
+import itertools
 import psycopg2
 import psycopg2.extensions
-import hashlib
 import logging
-import os
 import time
 import typing
 import web3
+import web3._utils.filters
+import web3.types
+import web3.contract
+from backtest.top_of_block.verify import check_candidates
 from backtest.utils import parse_logs_for_net_profit
 
 import pricers
 import find_circuit
-from backtest.top_of_block.common import TraceMode, connect_db, load_exchanges, load_naughty_tokens, shoot
+from backtest.top_of_block.common import TraceMode, WrappedFoundArbitrage, connect_db, load_exchanges, load_naughty_tokens, shoot
+from backtest.top_of_block.constants import UNISWAP_V2_SYNC_TOPIC, univ2
 
-from backtest.top_of_block.constants import FNAME_VERIFY_RESULT, NAUGHTY_TOKEN_FNAME
 from utils import WETH_ADDRESS, decode_trace_calls, get_abi, pretty_print_trace
 
 l = logging.getLogger(__name__)
@@ -42,27 +45,36 @@ def do_diagnose(w3: web3.Web3):
             curr.connection.commit()
             continue
 
-        maybe_naughty_token, failure_reason = diagnose_single(w3, fa, block_number)
+        diagnosis = diagnose_single(w3, curr, fa, block_number)
 
-        curr.execute(
-            """
-            UPDATE failed_arbitrages SET diagnosis = %s WHERE id = %s
-            """,
-            (failure_reason, failed_arbitrage_id,)
-        )
-        assert curr.rowcount == 1
+        if isinstance(diagnosis, DiagnosisNaughtyToken):
+            curr.execute(
+                """
+                UPDATE failed_arbitrages SET diagnosis = %s WHERE id = %s
+                """,
+                (MSG_FAIL_USED_NAUGHTY_TOKEN, failed_arbitrage_id,)
+            )
+            assert curr.rowcount == 1
 
-        if maybe_naughty_token is not None:
-            new_naughty_token, reason = maybe_naughty_token
             curr.execute(
                 """
                 INSERT INTO naughty_tokens (address, reason, diagnosed_from) VALUES (%s, %s, %s)
                 """,
-                (bytes.fromhex(new_naughty_token[2:]), reason, failed_arbitrage_id)
+                (bytes.fromhex(diagnosis.address[2:]), diagnosis.root_cause, failed_arbitrage_id)
             )
             assert curr.rowcount == 1
-            naughty_tokens.add(new_naughty_token)
-            l.info(f'Found new naughty token: {new_naughty_token} | {reason}')
+            naughty_tokens.add(diagnosis.address)
+            l.info(f'Found new naughty token: {diagnosis.address} | {diagnosis.root_cause}')
+        else:
+            assert isinstance(diagnosis, DiagnosisNotEncodable)
+            curr.execute(
+                """
+                UPDATE failed_arbitrages SET diagnosis = %s WHERE id = %s
+                """,
+                ('not encodable', failed_arbitrage_id,)
+            )
+            assert curr.rowcount == 1
+
         curr.connection.commit()
 
 
@@ -73,14 +85,14 @@ def setup_db(curr: psycopg2.extensions.cursor):
             id             SERIAL PRIMARY KEY NOT NULL,
             address        BYTEA NOT NULL,
             reason         TEXT NOT NULL,
-            diagnosed_from INTEGER NOT NULL REFERENCES failed_arbitrages (id) ON DELETE SET NULL
+            diagnosed_from INTEGER NOT NULL REFERENCES failed_arbitrages (id) ON DELETE CASCADE
         );
         """
     )
     curr.connection.commit()
 
 
-def get_failed_arbitrages(w3: web3.Web3, curr: psycopg2.extensions.cursor) -> typing.Iterator[typing.Tuple[int, int, find_circuit.FoundArbitrage]]:
+def get_failed_arbitrages(w3: web3.Web3, curr: psycopg2.extensions.cursor) -> typing.Iterator[typing.Tuple[int, int, WrappedFoundArbitrage]]:
     """
     Continuously polls for candidate arbitrages in a sleep-loop.
     """
@@ -139,12 +151,15 @@ def get_failed_arbitrages(w3: web3.Web3, curr: psycopg2.extensions.cursor) -> ty
             assert directions[0] == False
             assert circuit[0].token1 == WETH_ADDRESS
 
-        fa = find_circuit.FoundArbitrage(
-            amount_in = amount_in,
-            circuit = circuit,
-            directions = directions,
-            pivot_token = WETH_ADDRESS,
-            profit = profit
+        fa = WrappedFoundArbitrage(
+                find_circuit.FoundArbitrage(
+                amount_in = amount_in,
+                circuit = circuit,
+                directions = directions,
+                pivot_token = WETH_ADDRESS,
+                profit = profit
+            ),
+            candidate_id
         )
 
         l.debug(f'Diagnosing failed arbitrage id={id_:,} candidate_id={candidate_id} block_number={block_number:,} expected_profit={w3.fromWei(profit, "ether"):.6f} ETH')
@@ -156,7 +171,22 @@ erc20 = web3.Web3().eth.contract(address = b'\x00' * 20, abi=get_abi('erc20.abi.
 ERC20_BALANCEOF_SELECTOR = erc20.functions.balanceOf(web3.Web3.toChecksumAddress(b'\x00' * 20)).selector[2:]
 ERC20_TRANSFER_SELECTOR = erc20.functions.transfer(web3.Web3.toChecksumAddress(b'\x00' * 20), 10).selector[2:]
 
-def diagnose_single(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number: int) -> typing.Tuple[typing.Optional[typing.Tuple[str, str]], str]:
+
+class DiagnosisNaughtyToken(typing.NamedTuple):
+    address: str
+    root_cause: str
+
+
+class DiagnosisNotEncodable(typing.NamedTuple):
+    pass
+
+
+def diagnose_single(
+        w3: web3.Web3,
+        curr: psycopg2.extensions.cursor,
+        fa: WrappedFoundArbitrage,
+        block_number: int
+    ) -> typing.Union[DiagnosisNaughtyToken, DiagnosisNotEncodable]:
     """
     Diagnoses the given re-shoot failure.
     Returns the new naughty token, reason for naughtiness, and the reason for failure
@@ -186,23 +216,38 @@ def diagnose_single(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number
             token_out = exc.token0
             amount_out = exc.exact_token1_to_token0(amount, block_number)
         expected_amounts_out[exc.address, token_out] = amount_out
-        amount = amount_out
+        amount = pricers.out_from_transfer(token_out, amount_out)
 
-    shooter_address, receipt, (trace, txn) = shoot(w3, fa, block_number, do_trace = TraceMode.ALWAYS)
+    # if this doesn't match the expected profit, figure out why
+    computed_profit = amount - fa.amount_in
+    if computed_profit != fa.profit:
+        for pricer in fa.circuit:
+            l.debug(str(pricer) + ' ' + pricer.address)
+        l.info(f'Computed ({computed_profit}) and expected profit ({fa.profit}) mismatch')
+        maybe_naughty_token = diagnose_output_mismatch(w3, curr, fa, amount, block_number)
+        if maybe_naughty_token is not None:
+            return DiagnosisNaughtyToken(maybe_naughty_token, 'unexpected balance change with no logs')
+        raise Exception('what')
+        return
+
+    shooter_address, (shoot_result,) = shoot(w3, [fa], block_number, gaslimit=300_000, do_trace = TraceMode.ALWAYS)
+
+    if shoot_result.encodable == False:
+        return DiagnosisNotEncodable()
 
     exchanges: typing.Set[str] = set(x.address for x in fa.circuit)
 
-    decoded = decode_trace_calls(trace, txn, receipt)
+    decoded = decode_trace_calls(shoot_result.trace, shoot_result.tx_params, shoot_result.receipt)
     print('----------------------trace---------------------------')
-    pretty_print_trace(decoded, txn, receipt)
+    pretty_print_trace(decoded, shoot_result.tx_params, shoot_result.receipt)
     print('------------------------------------------------------')
 
-    if receipt['status'] == 1:
+    if shoot_result.receipt['status'] == 1:
         expected_profit = fa.profit
-        movements = parse_logs_for_net_profit(receipt['logs'])
+        movements = parse_logs_for_net_profit(shoot_result.receipt['logs'])
         actual_profit = movements[WETH_ADDRESS][shooter_address]
         assert actual_profit == expected_profit, f'expected {actual_profit:,} == {expected_profit:,}'
-        raise NotImplementedError('hmm')
+        raise NotImplementedError('no failure here, unexpected!')
     else:
         # if we saw a revert() in the first call to a token's transfer() or any balanceOf(), it is bugged
         called_transfer = set()
@@ -217,7 +262,7 @@ def diagnose_single(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number
                 if method_sel == ERC20_BALANCEOF_SELECTOR:
                     # record the balance
                     if item['actions'][-1]['type'] == 'REVERT':
-                        return ((callee, 'reverted in balanceOf'), MSG_FAIL_USED_NAUGHTY_TOKEN)
+                        return DiagnosisNaughtyToken(callee, 'reverted in balanceOf')
                     if item['actions'][-1]['type'] == 'RETURN':
                         balance_of_addr = w3.toChecksumAddress(item['args'][12 + 4 : 32 + 4])
                         got_balance = int.from_bytes(item['actions'][-1]['data'][:32], byteorder='big', signed=False)
@@ -225,14 +270,14 @@ def diagnose_single(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number
                         # ensure that it returns what we expect, if we are expecting a particular return value
                         if (callee, balance_of_addr) in known_balances:
                             if got_balance != known_balances[callee, balance_of_addr]:
-                                return ((callee, 'unexpected balanceOf after transfer'), MSG_FAIL_USED_NAUGHTY_TOKEN)
+                                return DiagnosisNaughtyToken(callee, 'unexpected balanceOf after transfer')
                         known_balances[callee,balance_of_addr] = got_balance
 
                 elif method_sel == ERC20_TRANSFER_SELECTOR:
                     # if the first transfer() reverts, this is a broken token
                     if callee not in called_transfer:
                         if len(item['actions']) > 0 and item['actions'][-1]['type'] == 'REVERT':
-                            return ((callee, 'transfer reverts'), MSG_FAIL_USED_NAUGHTY_TOKEN)
+                            return DiagnosisNaughtyToken(callee, 'transfer reverts')
                         called_transfer.add(callee)
 
                     # if transfer() emits a Transfer event in the wrong amount, the semantics are different
@@ -241,7 +286,7 @@ def diagnose_single(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number
                     value = args['_value']
                     for action in item['actions']:
                         if action['type'] == 'TRANSFER' and action['to'] == recipient and action['value'] != value:
-                            return ((callee, 'weird transfer event'), MSG_FAIL_USED_NAUGHTY_TOKEN)
+                            return DiagnosisNaughtyToken(callee, 'weird transfer event')
 
                     # if we knew the balance of the sender, record the expected change
                     if (callee, item['from']) in known_balances:
@@ -264,4 +309,149 @@ def diagnose_single(w3: web3.Web3, fa: find_circuit.FoundArbitrage, block_number
             if item['type'] == 'root':
                 for sub_action in reversed(item['actions']):
                     stack.append((depth + 1, sub_action))
+    raise Exception('himom')
+
+
+def diagnose_output_mismatch(
+        w3: web3.Web3,
+        curr: psycopg2.extensions.cursor,
+        fa: find_circuit.FoundArbitrage,
+        amount: int,
+        block_number: int
+    ) -> typing.Optional[str]:
+    """
+    Diagnose the reason for amout_out mismatch -- if because of a weird token that changes balances with no logs,
+    returns the token address.
+    """
+    all_uniswap_v2s: typing.List[pricers.UniswapV2Pricer] = []
+    for p in fa.circuit:
+        if isinstance(p, pricers.UniswapV2Pricer):
+            all_uniswap_v2s.append(p)
+    
+    if len(all_uniswap_v2s) == 0:
+        raise NotImplementedError('not sure about how to handle this yet')
+
+    last_syncs: typing.List[typing.Tuple[pricers.UniswapV2Pricer, typing.Any, typing.Set[str]]] = []
+    # check for balance mismatches
+    for p in all_uniswap_v2s:
+        last_sync = get_last_uniswap_v2_sync(w3, p.address, block_number)
+        l.debug(f'last sync from {p.address} was on {last_sync["blockNumber"]}')
+
+        sync = p.contract.events.Sync().processLog(last_sync)
+        # see if this matches what we think is the case on this block
+        bal0_real = p.token0_contract.functions.balanceOf(p.address).call(block_identifier=block_number)
+        bal1_real = p.token1_contract.functions.balanceOf(p.address).call(block_identifier=block_number)
+
+        brokens = set()
+        if bal0_real != sync['args']['reserve0']:
+            l.warning(f'Balance mismatch: {p.address} token={p.token0} sync said {sync["args"]["reserve0"]} but balance said {bal0_real}')
+            brokens.add(p.token0)
+        if bal1_real != sync['args']['reserve1']:
+            brokens.add(p.token1)
+            l.warning(f'Balance mismatch: {p.address} token={p.token1} sync said {sync["args"]["reserve1"]} but balance said {bal1_real}')
+
+        last_syncs.append((p, sync, brokens))
+
+    # go over each broken thing and see if a Transfer() happened after Sync()
+    for p, sync, broken_tokens in last_syncs:
+        if len(broken_tokens) == 0:
+            # nothing here to diagnose
+            continue
+
+        for token_addr in broken_tokens:
+            contract: web3.contract.Contract = w3.eth.contract(
+                address = token_addr,
+                abi = get_abi('erc20.abi.json'),
+            )
+            f = contract.events.Transfer().build_filter()
+            f.fromBlock = sync['blockNumber']
+            f.toBlock = block_number
+            f.args.to.match_single(p.address)
+            logs = f.deploy(w3).get_all_entries()
+
+            for log in logs:
+                if log['blockNumber'] > sync['blockNumber'] or (sync['blockNumber'] == log['blockNumber'] and sync['logIndex'] < log['logIndex']):
+                    l.warning(f'Found transfer into exchange after Sync')
+                    l.warning(f'Sync {sync}')
+                    l.warning(f'Log {log}')
+                    raise Exception('Transfer after Sync()')
+            
+            # mysterious balance change
+            return token_addr
+
+    # at this point we have no clue about why/how the balance could have changed
+    raise Exception('unknown mismatch cause')
+
+
+def get_last_uniswap_v2_sync(w3: web3.Web3, address: str, on_or_before: int) -> web3.types.LogReceipt:
+    # get the last Sync() event emitted from this address
+    batch_size_blocks = 200
+    for i in itertools.count(0):
+        start_block = on_or_before - (i + 1) * batch_size_blocks + 1
+        end_block   = on_or_before - i * batch_size_blocks
+        assert start_block > 10_000_000
+        l.debug(f'Searching for recent Sync() of {address} from {start_block} to {end_block}')
+        f: web3._utils.filters.Filter = w3.eth.filter({
+            'address': address,
+            'topics': ['0x' + UNISWAP_V2_SYNC_TOPIC.hex()],
+            'fromBlock': start_block,
+            'toBlock': end_block,
+        })
+        logs = f.get_all_entries()
+        if len(logs) > 0:
+            return logs[-1]
+
+
+def diagnose_mismatched_profit(
+        w3: web3.Web3,
+        curr: psycopg2.extensions.cursor,
+        fa: WrappedFoundArbitrage,
+        block_number: int
+    ):
+    raise NotImplementedError('this was never finished')
+    pricer = find_circuit.find.PricingCircuit(fa.circuit, fa.directions)
+    remeasured_output = pricer.sample(fa.amount_in, block_number)
+    # there's a small bug sometimes where the profit gets fucked with (+/- 1 wei), see if that applies here
+    remeasured_profit = remeasured_output - fa.amount_in
+    diff = remeasured_profit - fa.profit
+    if diff == 0:
+        l.debug(f'saw no diff, so not diagnosing mismatched profit')
+        return False
+
+    l.warning(f'Saw profit diff of {diff}')
+
+    amount_in_to_try = fa.amount_in + diff
+    amount_out = pricer.sample(amount_in_to_try, block_number)
+    amount_out_default = pricer.sample(fa.amount_in, block_number)
+
+    if amount_out != amount_out_default:
+        raise NotImplementedError('not sure how to handle this either')
+    else:
+        l.info(f'same amount_out after subtracting {diff} from amount_in')
+
+    # this is the weird situation where everything is correct, we just forgot to adjust profit
+    # when we saved a few wei due to rounding
+    l.info('correcting prior circuit profit-finding error')
+
+    fa.fa = fa.fa._replace(profit = remeasured_profit)
+
+    curr.execute('SELECT EXISTS(SELECT 1 FROM verified_arbitrages WHERE candidate_id = %s)', (fa.id,))
+    (does_exist,) = curr.fetchone()
+    assert does_exist == False, 'should not have a verified arbitrage of this ID (inconsistent)'
+
+    curr.execute('SELECT id FROM failed_arbitrages WHERE candidate_id = %s', (fa.id,))
+    assert curr.rowcount == 1, f'should have 1 failed aritrage of this candidate_id, but have {curr.rowcount}'
+    (failed_arbitrage_id,) = curr.fetchone()
+
+    check_candidates(w3, curr, block_number, [fa])
+
+    curr.execute('SELECT EXISTS(SELECT 1 FROM verified_arbitrages WHERE candidate_id = %s)', (fa.id,))
+    (does_exist,) = curr.fetchone()
+    assert does_exist == True, 'should have a verified arbitrage of this ID now'
+
+    curr.execute('DELETE FROM failed_arbitrages WHERE id = %s', (failed_arbitrage_id,))
+    assert curr.rowcount == 1
+    curr.execute('UPDATE candidate_arbitrages SET profit_no_fee = %s WHERE id = %s', (remeasured_profit, fa.id))
+    assert curr.rowcount == 1
+
     raise Exception('himom')

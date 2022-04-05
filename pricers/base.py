@@ -43,7 +43,6 @@ class BaseExchangePricer:
     def observe_block(self, logs: typing.List[web3.types.LogReceipt]):
         pass
 
-
     def set_web3(self, w3: web3.Web3):
         """
         Used for moving a pricer onto a fork with minimal setup disruption

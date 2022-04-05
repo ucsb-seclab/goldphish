@@ -24,11 +24,19 @@ class UniswapV2Record(typing.NamedTuple):
     recipient: FundsRecipient
     zero_for_one: bool
 
+    @property
+    def amount(self):
+        return self.amount_out
+
 class UniswapV3Record(typing.NamedTuple):
     address: str
-    amount_out: int
+    amount_in: int
     zero_for_one: bool
     recipient: FundsRecipient
+
+    @property
+    def amount(self):
+        return self.amount_in
 
 class ExceedsEncodableParamsException(Exception):
 
@@ -85,7 +93,7 @@ def encode_basic(
         ret += int.to_bytes(second_line, length=32, byteorder='big', signed=False)
 
     for i, ex in zip(itertools.count(1), exchanges[1:]):
-        assert ex.amount_out > 0
+        assert ex.amount > 0
         assert len(ex.address) == 42
         assert web3.Web3.isChecksumAddress(ex.address)
         assert isinstance(ex.zero_for_one, bool)
@@ -115,12 +123,10 @@ def encode_basic(
         if can_infer_amount_out:
             first_line |= ex.amount_in_explicit << 160
         else:
-            can_infer_all_amounts = isinstance(exchanges[i-1], UniswapV3Record) and isinstance(ex, UniswapV3Record) and ex.recipient == FundsRecipient.MSG_SENDER
-            if not can_infer_all_amounts:
-                # add amount out
-                if ex.amount_out > MAX_AMOUNT_OUT:
-                    raise ExceedsEncodableParamsException(f'exceeds max amount_out {ex.address}')
-                first_line |= ex.amount_out << 160
+            # add amount out
+            if ex.amount > MAX_AMOUNT_OUT:
+                raise ExceedsEncodableParamsException(f'exceeds max amount {ex.address}')
+            first_line |= ex.amount << 160
 
         ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
 

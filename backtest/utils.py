@@ -1,7 +1,9 @@
 import collections
+import os
 import subprocess
 import time
 import typing
+import psycopg2.extensions
 import tempfile
 import web3
 import web3.types
@@ -47,6 +49,8 @@ def mine_block(w3: web3.Web3):
     assert block_num_before + 1 == block_num_after, f'expected {block_num_before} + 1 == {block_num_after}'
 
 
+_GANACHE_DIR = os.path.abspath(os.path.dirname(__file__) + '/../vend/ganache/dist')
+
 _next_ganache_port = 4444
 class GanacheContextManager:
 
@@ -66,8 +70,8 @@ class GanacheContextManager:
 
         self.p = subprocess.Popen(
             [
-                'yarn',
-                'ganache-cli',
+                'node',
+                'cli.js',
                 '--database.dbPath', self.tmpdir.name,
                 '--fork.url', 'ws://172.17.0.1:8546',
                 '--server.ws',
@@ -81,6 +85,7 @@ class GanacheContextManager:
                 '--miner.blockGasLimit', str(60_000_000),
                 *extra_args
             ],
+            cwd = _GANACHE_DIR,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
@@ -89,7 +94,8 @@ class GanacheContextManager:
             f'ws://127.0.0.1:{_next_ganache_port}',
             websocket_timeout=60 * 5,
             websocket_kwargs={
-                'max_size': 1024 * 1024 * 1024, # 1 Gb max payload
+                'max_size': 10 * 1024 * 1024 * 1024, # 10 Gb max payload
+                'ping_timeout': 60 * 5,
             },
         )
 
@@ -97,7 +103,7 @@ class GanacheContextManager:
             provider
         )
 
-        _next_ganache_port += 1
+        _next_ganache_port = ((_next_ganache_port - 4444 + 1) % 1024) + 4444
         assert _next_ganache_port < 9000
 
         while not w3.isConnected():
@@ -128,10 +134,70 @@ class GanacheContextManager:
         return self.w3
     
     def __exit__(self, exc_type, exc_value, exc_traceback):
+        l.debug(f'Killing ganache')
         # force kill node, sorry
         self.p.kill()
         self.p.wait()
-        subprocess.check_call(['killall', '-9', 'node'])
-        subprocess.call(['killall', 'sh'])
         self.tmpdir.cleanup()
 
+
+class CancellationToken:
+    """
+    Utility class for reporting cancellations.
+    """
+    HEARTBEAT_PERIOD_SECONDS = 60
+
+    def __init__(self, jobname: str, workername: str, conn: psycopg2.extensions.connection) -> None:
+        self.jobname = jobname
+        self.workername = workername
+        self.last_heartbeat = 0
+        self.cancel_requested_cache = None
+        self.conn = conn
+        self.curr = conn.cursor()
+
+        self.curr.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS job_control (
+                id                  SERIAL NOT NULL PRIMARY KEY,
+                job_name            TEXT NOT NULL,
+                worker_name         TEXT NOT NULL,
+                is_cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                last_heartbeat      TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()::timestamp
+            );
+
+            INSERT INTO job_control (job_name, worker_name) VALUES (%s, %s) RETURNING id;
+            ''',
+            (self.jobname, self.workername)
+        )
+        self._id = self.curr.fetchone()[0]
+        l.info(f'Assigned job_control id={self._id}')
+        self.conn.commit()
+
+    def heartbeat(self):
+        self.curr.execute(
+            '''
+            UPDATE job_control SET last_heartbeat = NOW()::timestamp WHERE id = %s
+            ''',
+            (self._id,)
+        )
+        self.conn.commit()
+
+    def cancel_requested(self) -> bool:
+        if self.cancel_requested_cache is None or self.last_heartbeat + CancellationToken.HEARTBEAT_PERIOD_SECONDS < time.time():
+            # query for cancellation
+            self.curr.execute(
+                '''
+                UPDATE job_control SET last_heartbeat = NOW()::timestamp WHERE id = %s RETURNING is_cancel_requested
+                ''',
+                (self._id,)
+            )
+            (is_cancel_requested,) = self.curr.fetchone()
+            assert isinstance(is_cancel_requested, bool)
+            if is_cancel_requested and not self.cancel_requested_cache:
+                l.info(f'Received requested cancellation!')
+            self.cancel_requested_cache = is_cancel_requested
+
+            self.conn.commit()
+            self.last_heartbeat = time.time()
+
+        return self.cancel_requested_cache

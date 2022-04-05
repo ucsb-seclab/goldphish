@@ -1,4 +1,6 @@
 import argparse
+import socket
+import time
 import web3
 import web3.types
 import web3.exceptions
@@ -19,20 +21,20 @@ l = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, choices=['verify', 'diagnose', 'trace'], help='verification mode', default=None)
-    parser.add_argument('--job-name', type=str, default=None, help='job name for log, must be POSIX path-safe')
+    parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
     parser.add_argument('--id', type=int, default=None, help='id to trace')
     parser.add_argument('--verify', action='store_true', help='verification mode', default=False)
 
     args = parser.parse_args()
 
-    if args.mode == 'verify':
-        setup_logging('top_block_verify', suppress=['shooter.deploy'], job_name = args.job_name)
-    elif args.mode == 'diagnose':
-        setup_logging('top_block_diagnose', suppress=['shooter.deploy'], job_name = args.job_name)
-    elif args.mode == 'trace':
-        setup_logging('top_block_trace_candidate', suppress=['shooter.deploy'], job_name = args.job_name)
+    if args.worker_name is None:
+        args.worker_name = socket.gethostname()
+
+    if args.mode is not None:
+        job_name = 'top_block_' + args.mode
     else:
-        setup_logging('top_block_candidates', suppress=['shooter.deploy'], job_name = args.job_name)
+        job_name = 'top_block_candidates'
+    setup_logging(job_name, suppress=['shooter.deploy'], worker_name = args.worker_name)
 
     l.info('Booting up...')
 
@@ -47,6 +49,7 @@ def main():
             'max_size': 1024 * 1024 * 1024, # 1 Gb max payload
         },
     ))
+
     if not w3.isConnected():
         l.error(f'Could not connect to web3')
         exit(1)
@@ -57,7 +60,7 @@ def main():
     try:
         if args.mode == 'verify':
             l.info(f'Verifying candidate arbitrages')
-            do_verify(w3)
+            do_verify(w3, job_name, args.worker_name)
         elif args.mode == 'diagnose':
             l.info(f'Diagnosing failures')
             do_diagnose(w3)
@@ -65,7 +68,7 @@ def main():
             assert args.id is not None
             print_trace(w3, args.id)
         else:
-            seek_candidates(w3)
+            seek_candidates(w3, job_name, args.worker_name)
     except:
         l.exception('fatal exception')
         raise

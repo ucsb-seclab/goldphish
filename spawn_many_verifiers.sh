@@ -15,6 +15,6 @@ for i in `seq $1 $2`; do
         --rm \
         ethereum-arb python3 -m backtest.top_of_block \
             --mode verify \
-            --job-name "verify$i";
+            --worker-name "verify$i";
 done
 

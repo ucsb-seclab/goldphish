@@ -1,3 +1,4 @@
+import datetime
 import typing
 import os
 import json
@@ -52,20 +53,22 @@ class ColoredFormatter(logging.Formatter):
         return formatter.format(record)
 
 
-def setup_logging(activity_name = None, suppress: typing.List[str] = [], job_name: typing.Optional[str] = None):
+def setup_logging(job_name = None, suppress: typing.List[str] = [], worker_name: typing.Optional[str] = None):
+    sz_date = datetime.datetime.utcnow().isoformat(sep='T')
+
+    if worker_name is None:
+        worker_name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=6))
     if job_name is None:
-        job_name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=6))
-    if activity_name is None:
         fname = '/mnt/goldphish/tmp/logs/log.txt'
     else:
-        fname = f'/mnt/goldphish/tmp/logs/{activity_name}_{job_name}.txt'
+        fname = f'/mnt/goldphish/tmp/logs/{job_name}_{sz_date}_{worker_name}.txt'
     root_logger = logging.getLogger()
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(ColoredFormatter())
     fh = logging.handlers.WatchedFileHandler(
         fname
     )
-    fmt = logging.Formatter(f'%(asctime)s - {job_name} - %(name)s - %(levelname)s - %(message)s')
+    fmt = logging.Formatter(f'%(asctime)s - {worker_name} - %(name)s - %(levelname)s - %(message)s')
     fh.setFormatter(fmt)
     root_logger.addHandler(sh)
     root_logger.addHandler(fh)
@@ -120,6 +123,14 @@ def pretty_print_trace(parsed, txn: web3.types.TxData, receipt: web3.types.TxRec
                 print(padding + 'sqrtPriceLimitX96  ' + hex(dec['sqrtPriceLimitX96']))
                 print(padding + 'len(calldata) .... ' + str(len(dec['data'])))
                 print(padding + 'calldata..' + dec['data'].hex())
+            elif method_sel == '022c0d9f':
+                print(padding + 'UniswapV2Pool.swap()')
+                (_, dec) = uv2.decode_function_input(item['args'])
+                print(padding + 'amount0Out ... ' + str(dec['amount0Out']) + ' ' + hex(dec['amount0Out']))
+                print(padding + 'amount1Out ... ' + str(dec['amount1Out']) + ' ' + hex(dec['amount1Out']))
+                print(padding + 'to ........... ' + dec['to'])
+                if len(dec['data']) > 0:
+                    print(padding + 'calldata..' + dec['data'].hex())
             else:
                 print(padding + method_sel)
                 for i in range(4, len(item['args']), 32):
@@ -401,6 +412,11 @@ class ProgressReporter:
 uv3: web3.contract.Contract = web3.Web3().eth.contract(
     address=b'\x00' * 20,
     abi=get_abi('uniswap_v3/IUniswapV3Pool.json')['abi'],
+)
+
+uv2: web3.contract.Contract = web3.Web3().eth.contract(
+    address=b'\x00' * 20,
+    abi=get_abi('uniswap_v2/IUniswapV2Pair.json')['abi'],
 )
 
 erc20: web3.contract.Contract = web3.Web3().eth.contract(

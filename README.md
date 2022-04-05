@@ -35,7 +35,7 @@ ffffffffffffffffffffffffffffffffffffffffffffffff # amount in, (extended) flash s
 # Following: series of Action records
 
 f # FLAGS
- fffffffffffffffffffffff # amountOut or, when amountOut can be inferred in uniswap v2, amountIn (see NOTE about amount in below)
+ fffffffffffffffffffffff # amountOut (v2) / amountIn (v3) or, when amountOut can be inferred in uniswap v2, amountIn (see NOTE about amount in below)
                         ffffffffffffffffffffffffffffffffffffffff # exchange address
 FLAGS:
 _ _ _ _ x x x x

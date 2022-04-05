@@ -88,6 +88,21 @@ def construct_from_found_arbitrage(fa: find_circuit.find.FoundArbitrage, coinbas
                 amt_out = p.exact_token1_to_token0(last_out, target_block - 1)
                 token_in = p.token1
                 token_out = p.token0
+            # if p.address == '0x7289bA7C7B3d82FaF5D8800EE9dD2Fa7ABA918C3':
+            #     fresh_pricer = pricers.UniswapV3Pricer(p.w3, p.address, p.token0, p.token1, p.fee)
+            #     if dxn == True:
+            #         new_amt_out = fresh_pricer.exact_token0_to_token1(last_out, target_block - 1)
+            #     else:
+            #         new_amt_out = fresh_pricer.exact_token1_to_token0(last_out, target_block - 1)
+            #     if new_amt_out == amt_out:
+            #         l.info('amount_outs match')
+            #     else:
+            #         l.error(f'amount_outs do not match, got {new_amt_out}')
+            #     if dxn == True:
+            #         alt_amt_out = p.exact_token0_to_token1(1010959910380, target_block - 1)
+            #     else:
+            #         alt_amt_out = p.exact_token1_to_token0(1010959910380, target_block - 1)
+            #     l.info(f'expected amt_out from 1010959910380 in is {alt_amt_out} (expected {new_amt_out} previously)')
             exchanges.append(ExchangeRecord(
                 is_uniswap_v2 = isinstance(p, pricers.uniswap_v2.UniswapV2Pricer),
                 address = p.address,
@@ -182,7 +197,7 @@ def construct(
             excs = [
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[0].address,
-                    amount_out = univ3_chain[0].amount_out,
+                    amount_in = univ3_chain[0].amount_in,
                     zero_for_one = univ3_chain[0].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.SHOOTER,
                 ),
@@ -206,7 +221,7 @@ def construct(
             excs = [
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[0].address,
-                    amount_out = univ3_chain[0].amount_out,
+                    amount_in = univ3_chain[0].amount_in,
                     zero_for_one = univ3_chain[0].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
                 ),
@@ -231,7 +246,7 @@ def construct(
             excs = [
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[0].address,
-                    amount_out = univ3_chain[0].amount_out,
+                    amount_in = univ3_chain[0].amount_in,
                     zero_for_one = univ3_chain[0].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.SHOOTER,
                 ),
@@ -262,7 +277,7 @@ def construct(
             excs = [
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[0].address,
-                    amount_out = univ3_chain[0].amount_out,
+                    amount_in = univ3_chain[0].amount_in,
                     zero_for_one = univ3_chain[0].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
                 ),
@@ -294,7 +309,7 @@ def construct(
             excs = [
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[0].address,
-                    amount_out = univ3_chain[0].amount_out,
+                    amount_in = univ3_chain[0].amount_in,
                     zero_for_one = univ3_chain[0].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
                 ),
@@ -326,13 +341,13 @@ def construct(
             excs = [
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[0].address,
-                    amount_out = univ3_chain[0].amount_out,
+                    amount_in = univ3_chain[0].amount_in,
                     zero_for_one = univ3_chain[0].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE, # here, means 'next uniswap v2 exchange'
                 ),
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[1].address,
-                    amount_out = univ3_chain[1].amount_out,
+                    amount_in = univ3_chain[1].amount_in,
                     zero_for_one = univ3_chain[1].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.SHOOTER,
                 ),
@@ -356,13 +371,13 @@ def construct(
             excs = [
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[0].address,
-                    amount_out = univ3_chain[0].amount_out,
+                    amount_in = univ3_chain[0].amount_in,
                     zero_for_one = univ3_chain[0].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.SHOOTER,
                 ),
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[1].address,
-                    amount_out = univ3_chain[1].amount_out,
+                    amount_in = univ3_chain[1].amount_in,
                     zero_for_one = univ3_chain[1].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
                 ),
@@ -387,13 +402,13 @@ def construct(
             excs = [
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[0].address,
-                    amount_out = univ3_chain[0].amount_out,
+                    amount_in = univ3_chain[0].amount_in,
                     zero_for_one = univ3_chain[0].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.NEXT_EXCHANGE,
                 ),
                 shooter.encoder.UniswapV3Record(
                     address = univ3_chain[1].address,
-                    amount_out = univ3_chain[1].amount_out,
+                    amount_in = univ3_chain[1].amount_in,
                     zero_for_one = univ3_chain[1].zero_for_one,
                     recipient = shooter.encoder.FundsRecipient.MSG_SENDER,
                 ),
@@ -439,10 +454,10 @@ def construct(
                 # we're not taking profit, pay previous exchange directly
                 recipient = shooter.encoder.FundsRecipient.MSG_SENDER
             excs.append(shooter.encoder.UniswapV3Record(
-                exchange.address,
-                exchange.amount_out,
-                exchange.zero_for_one,
-                recipient
+                address = exchange.address,
+                amount_in = exchange.amount_in,
+                zero_for_one = exchange.zero_for_one,
+                recipient = recipient
             ))
 
     uv3_flash_loaner = next(filter(lambda x: x.address == excs[0].address, univ3_chain))
