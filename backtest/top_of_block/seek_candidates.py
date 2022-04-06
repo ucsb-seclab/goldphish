@@ -27,7 +27,7 @@ LOG_BATCH_SIZE = 200
 RESERVATION_SIZE = 1 * 24 * 60 * 60 // 13 # about 1 days' worth
 
 
-DEBUG = True
+DEBUG = False
 
 
 def seek_candidates(w3: web3.Web3, job_name: str, worker_name: str):
@@ -152,10 +152,6 @@ def setup_db(curr: psycopg2.extensions.cursor):
 
 
 def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_block: int) -> typing.Optional[typing.Tuple[int, int, int]]:
-    if DEBUG:
-        return (
-            -1, 13_395_340, 13_395_349
-        )
     curr.execute('BEGIN TRANSACTION')
     curr.execute('LOCK TABLE candidate_arbitrage_reservations') # for safety
     query_do_reservation = '''
