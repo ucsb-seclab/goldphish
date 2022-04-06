@@ -9,9 +9,10 @@ import typing
 import logging
 from eth_utils import event_abi_to_log_topic
 
-
 from .base import BaseExchangePricer
 from utils import get_abi
+
+l = logging.getLogger(__name__)
 
 generic_uv2 = web3.Web3().eth.contract(
     address = b'\x00' * 20,
@@ -40,8 +41,7 @@ class UniswapV2Pricer(BaseExchangePricer):
 
     def get_balances(self, block_identifier) -> typing.Tuple[int, int]:
         if self.known_token0_bal is None or self.known_token1_bal is None:
-            self.known_token0_bal = self.token0_contract.functions.balanceOf(self.address).call(block_identifier=block_identifier)
-            self.known_token1_bal = self.token1_contract.functions.balanceOf(self.address).call(block_identifier=block_identifier)
+            self.known_token0_bal, self.known_token1_bal, _ = self.contract.functions.getReserves().call(block_identifier=block_identifier)
         return (self.known_token0_bal, self.known_token1_bal)
 
     def quote_token0_to_token1(self, token0_amount, block_identifier: int) -> int:
