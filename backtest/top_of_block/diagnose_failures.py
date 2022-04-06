@@ -9,7 +9,7 @@ import web3._utils.filters
 import web3.types
 import web3.contract
 from backtest.top_of_block.verify import check_candidates
-from backtest.utils import parse_logs_for_net_profit
+from backtest.utils import ERC20_TRANSFER_TOPIC, parse_logs_for_net_profit
 
 import pricers
 import find_circuit
@@ -167,7 +167,7 @@ def get_failed_arbitrages(w3: web3.Web3, curr: psycopg2.extensions.cursor) -> ty
         yield block_number, id_, fa
 
 
-erc20 = web3.Web3().eth.contract(address = b'\x00' * 20, abi=get_abi('erc20.abi.json'))
+erc20: web3.contract.Contract = web3.Web3().eth.contract(address = b'\x00' * 20, abi=get_abi('erc20.abi.json'))
 ERC20_BALANCEOF_SELECTOR = erc20.functions.balanceOf(web3.Web3.toChecksumAddress(b'\x00' * 20)).selector[2:]
 ERC20_TRANSFER_SELECTOR = erc20.functions.transfer(web3.Web3.toChecksumAddress(b'\x00' * 20), 10).selector[2:]
 
@@ -335,9 +335,11 @@ def diagnose_output_mismatch(
     # check for balance mismatches
     for p in all_uniswap_v2s:
         last_sync = get_last_uniswap_v2_sync(w3, p.address, block_number)
-        l.debug(f'last sync from {p.address} was on {last_sync["blockNumber"]}')
-
         sync = p.contract.events.Sync().processLog(last_sync)
+
+        l.debug(f'last sync from {p.address} was on {last_sync["blockNumber"]}')
+        l.debug(f'last sync args: {sync["args"]}')
+
         # see if this matches what we think is the case on this block
         bal0_real = p.token0_contract.functions.balanceOf(p.address).call(block_identifier=block_number)
         bal1_real = p.token1_contract.functions.balanceOf(p.address).call(block_identifier=block_number)
@@ -350,10 +352,11 @@ def diagnose_output_mismatch(
             brokens.add(p.token1)
             l.warning(f'Balance mismatch: {p.address} token={p.token1} sync said {sync["args"]["reserve1"]} but balance said {bal1_real}')
 
-        last_syncs.append((p, sync, brokens))
+        last_syncs.append((p, sync, brokens, (bal0_real, bal1_real)))
+
 
     # go over each broken thing and see if a Transfer() happened after Sync()
-    for p, sync, broken_tokens in last_syncs:
+    for p, sync, broken_tokens, _ in last_syncs:
         if len(broken_tokens) == 0:
             # nothing here to diagnose
             continue
@@ -378,6 +381,40 @@ def diagnose_output_mismatch(
             
             # mysterious balance change
             return token_addr
+
+    # last resort -- see if the balanceOf changes at all?
+    for p, sync, _, (bal0, bal1) in last_syncs:
+        for i in itertools.count(1):
+            this_block = block_number - i
+            if this_block < sync['blockNumber']:
+                break
+            if i % 10 == 0:
+                l.debug(f'seeking balance change in block {this_block:,}')
+            new_bal0 = p.token0_contract.functions.balanceOf(p.address).call(block_identifier=this_block)
+            new_bal1 = p.token1_contract.functions.balanceOf(p.address).call(block_identifier=this_block)
+
+            brokens = set()
+            if new_bal0 != bal0:
+                l.critical(f'bal0 changed: {bal0} -> {new_bal0} block={this_block:,}')
+                brokens.add(p.token0)
+            if new_bal1 != bal1:
+                l.critical(f'bal1 changed: {bal1} -> {new_bal1} block={this_block:,}')
+                brokens.add(p.token1)
+
+            for token_addr in brokens:
+                f: web3._utils.filters.Filter = w3.eth.filter({
+                    'address': token_addr,
+                    'fromBlock': this_block + 1,
+                    'toBlock': this_block + 1,
+                })
+                for log in f.get_all_entries():
+                    if log['topics'][0] == ERC20_TRANSFER_TOPIC:
+                        txn = erc20.events.Transfer().processLog(log)
+                        assert txn['args']['to'] != p.address
+                        assert txn['args']['from'] != p.address
+                    else:
+                        raise Exception('dont understand this log')
+                raise Exception(f'seems like this token is broken but not sure')
 
     # at this point we have no clue about why/how the balance could have changed
     raise Exception('unknown mismatch cause')
