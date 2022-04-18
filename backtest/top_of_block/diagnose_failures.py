@@ -65,6 +65,13 @@ def do_diagnose(w3: web3.Web3):
             assert curr.rowcount == 1
             naughty_tokens.add(diagnosis.address)
             l.info(f'Found new naughty token: {diagnosis.address} | {diagnosis.root_cause}')
+        elif isinstance(diagnosis, DiagnosisUnknownRevert):
+            curr.execute(
+                """
+                UPDATE failed_arbitrages SET diagnosis = %s WHERE id = %s
+                """,
+                ('unknown revert', failed_arbitrage_id,)                
+            )
         else:
             assert isinstance(diagnosis, DiagnosisNotEncodable)
             curr.execute(
@@ -181,6 +188,9 @@ class DiagnosisNotEncodable(typing.NamedTuple):
     pass
 
 
+class DiagnosisUnknownRevert(typing.NamedTuple):
+    pass
+
 def diagnose_single(
         w3: web3.Web3,
         curr: psycopg2.extensions.cursor,
@@ -249,6 +259,13 @@ def diagnose_single(
         assert actual_profit == expected_profit, f'expected {actual_profit:,} == {expected_profit:,}'
         raise NotImplementedError('no failure here, unexpected!')
     else:
+        print(decoded)
+        # if the trace is just a revert in uniswap v3, then mark it as unknown cause and move on
+        if len(decoded['actions']) == 1 and decoded['actions'][0]['type'] == 'CALL' and decoded['actions'][0]['actions'][-1]['type'] == 'REVERT' and decoded['actions'][0]['actions'][-1]['message'] == b'':
+            # no-message revert, weird
+            l.warning(f'Unknown revert')
+            return DiagnosisUnknownRevert()
+
         # if we saw a revert() in the first call to a token's transfer() or any balanceOf(), it is bugged
         called_transfer = set()
         # known_balances already holds a dict (token, address) -> int as seen returned by balanceOf

@@ -10,7 +10,7 @@ import web3._utils.filters
 import psycopg2
 import psycopg2.extensions
 
-from backtest.top_of_block.common import connect_db
+from backtest.top_of_block.common import connect_db, load_pool
 from backtest.top_of_block.constants import FNAME_EXCHANGES_WITH_BALANCES, IMPORTANT_TOPICS_HEX, MIN_PROFIT_PREFILTER, THRESHOLDS, univ2_fname, univ3_fname
 from backtest.utils import CancellationToken
 import pricers
@@ -146,6 +146,16 @@ def setup_db(curr: psycopg2.extensions.cursor):
             claimed_on         TIMESTAMP WITHOUT TIME ZONE,
             completed_on       TIMESTAMP WITHOUT TIME ZONE 
         );
+
+        CREATE TABLE IF NOT EXISTS candidate_arbitrage_blocks_to_verify (
+            block_number INTEGER PRIMARY KEY NOT NULL,
+            max_profit_no_fee NUMERIC(78, 0) NOT NULL,
+            verify_started  TIMESTAMP WITHOUT TIME ZONE,
+            verify_finished TIMESTAMP WITHOUT TIME ZONE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_to_verify_block_number ON candidate_arbitrage_blocks_to_verify(block_number);
+        CREATE INDEX IF NOT EXISTS idx_candidate_arbitrage_blocks_to_verify_max_profit_no_fee ON candidate_arbitrage_blocks_to_verify (max_profit_no_fee);
         """
     )
     curr.connection.commit()
@@ -284,60 +294,6 @@ def load_exchange_balances(w3: web3.Web3):
     os.rename(FNAME_EXCHANGES_WITH_BALANCES + '.tmp', FNAME_EXCHANGES_WITH_BALANCES)
 
 
-def load_pool(w3: web3.Web3) -> pricers.PricerPool:
-    l.debug('starting load of exchange graph')
-    t_start = time.time()
-    univ2_fname = os.path.abspath(os.path.dirname(__file__) + '/../univ2_excs.csv.gz')
-    assert os.path.isfile(univ2_fname), f'should have file {univ2_fname}'
-    univ3_fname = os.path.abspath(os.path.dirname(__file__) + '/../univ3_excs.csv.gz')
-    assert os.path.isfile(univ3_fname)
-
-    ret = pricers.PricerPool(w3)
-
-    n_ignored = 0
-    with open(FNAME_EXCHANGES_WITH_BALANCES) as fin:
-        for line in fin:
-            if line.startswith('2'):
-                _, address, origin_block, token0, token1, bal0, bal1 = line.strip().split(',')
-
-                origin_block = int(origin_block)
-                bal0 = int(bal0)
-                bal1 = int(bal1)
-                if token0 in THRESHOLDS:
-                    if bal0 < THRESHOLDS[token0]:
-                        n_ignored += 1
-                        continue
-                if token1 in THRESHOLDS:
-                    if bal1 < THRESHOLDS[token1]:
-                        n_ignored += 1
-                        continue
-                ret.add_uniswap_v2(address, token0, token1, origin_block)
-            else:
-                assert line.startswith('3')
-
-                _, address, origin_block, token0, token1, fee, bal0, bal1 = line.strip().split(',')
-                fee = int(fee)
-
-                origin_block = int(origin_block)
-                bal0 = int(bal0)
-                bal1 = int(bal1)
-                if token0 in THRESHOLDS:
-                    if bal0 < THRESHOLDS[token0]:
-                        n_ignored += 1
-                        continue
-                if token1 in THRESHOLDS:
-                    if bal1 < THRESHOLDS[token1]:
-                        n_ignored += 1
-                        continue
-                ret.add_uniswap_v3(address, token0, token1, fee, origin_block)
-
-    l.debug(f'Kept {ret.exchange_count:,} and ignored {n_ignored:,} exchanges below threshold ({n_ignored / (n_ignored + ret.exchange_count) * 100:.2f}%)')
-
-    t_end = time.time()
-    l.debug(f'Took {t_end - t_start:.2f} seconds to load into pricing pool')
-    return ret
-
-
 def get_relevant_logs(w3: web3.Web3, start_block: int, end_block: int) -> typing.Iterator[typing.Tuple[int, typing.List[web3.types.LogReceipt]]]:
     assert start_block <= end_block
     f: web3._utils.filters.Filter = w3.eth.filter({
@@ -360,6 +316,7 @@ def process_candidates(w3: web3.Web3, pool: pricers.PricerPool, block_number: in
 
     n_ignored = 0
     n_found = 0
+    max_profit_no_fee = -1
     for p in find_circuit.profitable_circuits(updated_exchanges, pool, block_number, only_weth_pivot=True):
         if p.profit < MIN_PROFIT_PREFILTER:
             n_ignored += 1
@@ -426,6 +383,16 @@ def process_candidates(w3: web3.Web3, pool: pricers.PricerPool, block_number: in
         (inserted_id,) = curr.fetchone()
         # l.debug(f'inserted candidate id={inserted_id}')
         n_found += 1
+        
+        max_profit_no_fee = max(max_profit_no_fee, p.profit)
+
+    if max_profit_no_fee > 0:
+        curr.execute(
+            """
+            INSERT INTO candidate_arbitrage_blocks_to_verify (block_number, max_profit_no_fee) VALUES (%s, %s)
+            """,
+            (block_number, max_profit_no_fee)
+        )
 
     if n_ignored > 0:
         l.debug(f'Ignored {n_ignored} arbitrages due to not meeting profit threshold in block {block_number:,}')

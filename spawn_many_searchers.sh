@@ -7,7 +7,7 @@ for i in `seq $1 $2`; do
     docker run \
         --name "arbitrage-search$i" \
         --network ethereum-measurement-net \
-        -v/home/robert/Source/goldphish:/mnt/goldphish \
+        -v/data/robert/ethereum-arb/storage:/mnt/goldphish \
         -it \
         --init \
         --cpuset-cpus "$i" \

@@ -59,9 +59,9 @@ def setup_logging(job_name = None, suppress: typing.List[str] = [], worker_name:
     if worker_name is None:
         worker_name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=6))
     if job_name is None:
-        fname = '/mnt/goldphish/tmp/logs/log.txt'
+        fname = '/mnt/goldphish/logs/log.txt'
     else:
-        fname = f'/mnt/goldphish/tmp/logs/{job_name}_{sz_date}_{worker_name}.txt'
+        fname = f'/mnt/goldphish/logs/{job_name}_{sz_date}_{worker_name}.txt'
     root_logger = logging.getLogger()
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(ColoredFormatter())

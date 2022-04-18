@@ -5,6 +5,7 @@ import time
 import typing
 import psycopg2.extensions
 import tempfile
+import random
 import web3
 import web3.types
 import logging
@@ -51,11 +52,10 @@ def mine_block(w3: web3.Web3):
 
 _GANACHE_DIR = os.path.abspath(os.path.dirname(__file__) + '/../vend/ganache/dist')
 
-_next_ganache_port = 4444
+_ganache_port = (os.getpid() % (65535 - 1200)) + 1200
 class GanacheContextManager:
 
     def __init__(self, w3: web3.Web3, target_block: int, unlock: typing.Optional[typing.List[str]] = None) -> None:
-        global _next_ganache_port
         self.tmpdir = tempfile.TemporaryDirectory()
         old_block = w3.eth.get_block(target_block)
         old_ts = old_block['timestamp']
@@ -68,14 +68,16 @@ class GanacheContextManager:
         if unlock is not None:
             extra_args = ['--wallet.unlockedAccounts', ','.join(unlock)]
 
+        fork_url = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
+
         self.p = subprocess.Popen(
             [
                 'node',
                 'cli.js',
                 '--database.dbPath', self.tmpdir.name,
-                '--fork.url', 'ws://172.17.0.1:8546',
+                '--fork.url', fork_url,
                 '--server.ws',
-                '--server.port', str(_next_ganache_port),
+                '--server.port', str(_ganache_port),
                 '--fork.blockNumber', str(target_block),
                 '--wallet.accounts', f'{funded_deployer().key.hex()},{web3.Web3.toWei(100, "ether")}',
                 '--chain.chainId', '1',
@@ -91,7 +93,7 @@ class GanacheContextManager:
         )
 
         provider = web3.WebsocketProvider(
-            f'ws://127.0.0.1:{_next_ganache_port}',
+            f'ws://127.0.0.1:{_ganache_port}',
             websocket_timeout=60 * 5,
             websocket_kwargs={
                 'max_size': 10 * 1024 * 1024 * 1024, # 10 Gb max payload
@@ -102,9 +104,6 @@ class GanacheContextManager:
         w3 = web3.Web3(
             provider
         )
-
-        _next_ganache_port = ((_next_ganache_port - 4444 + 1) % 1024) + 4444
-        assert _next_ganache_port < 9000
 
         while not w3.isConnected():
             time.sleep(0.1)
@@ -139,6 +138,7 @@ class GanacheContextManager:
         self.p.kill()
         self.p.wait()
         self.tmpdir.cleanup()
+        l.debug(f'Ganache killed')
 
 
 class CancellationToken:

@@ -1,3 +1,4 @@
+import os
 import random
 import psycopg2
 import psycopg2.extensions
@@ -10,13 +11,14 @@ import web3
 import web3.contract
 import web3.exceptions
 import web3.types
+import backoff
 import find_circuit
 import shooter
 import pricers
 
 from utils import get_abi
-from ..utils import GanacheContextManager, funded_deployer, mine_block
-from .constants import univ2_fname, univ3_fname
+from ..utils import CancellationToken, GanacheContextManager, funded_deployer, mine_block
+from .constants import FNAME_EXCHANGES_WITH_BALANCES, THRESHOLDS, univ2_fname, univ3_fname
 
 
 l = logging.getLogger(__name__)
@@ -29,9 +31,11 @@ class TraceMode(enum.Enum):
 
 
 def connect_db() -> psycopg2.extensions.connection:
+    pg_host = os.getenv('PSQL_HOST', 'ethereum-measurement-pg')
+    pg_port = int(os.getenv('PSQL_PORT', '5432'))
     db = psycopg2.connect(
-        host = 'ethereum-measurement-pg',
-        port = 5432,
+        host = pg_host,
+        port = pg_port,
         user = 'measure',
         password = 'password',
         database = 'eth_measure_db',
@@ -102,125 +106,144 @@ class ShootResult(typing.NamedTuple):
         return self.maybe_trace
 
 
-def shoot(w3: web3.Web3, fas: typing.List[find_circuit.FoundArbitrage], block_number: int, do_trace: TraceMode = TraceMode.NEVER, gaslimit: typing.Optional[int] = None) -> typing.Tuple[str, typing.List[ShootResult]]:
+def ganache_deploy_shooter(w3: web3.Web3, destination: str):
+    """
+    Deploy the shooter on ganache by manually setting the code.
+    Assumes the shooter is stateless.
+    """
+    assert web3.Web3.isChecksumAddress(destination)
+
+    artifact = shooter.deploy.retrieve_shooter()
+    assert 'deployedBytecode' in artifact
+
+    bytecode = artifact['deployedBytecode']
+
+    l.debug(f'deploying shooter to {destination}')
+
+    result = w3.provider.make_request('evm_setAccountCode', [destination, bytecode])
+    assert result['result'] == True, f'expected to see result=True in {result}'
+
+    return
+
+
+@backoff.on_exception(
+        backoff.expo,
+        web3.exceptions.TransactionNotFound,
+        max_tries=4,
+    )
+def get_txn_with_backoff(w3: web3.Web3, txn_hash: bytes) -> web3.types.TxReceipt:
+    return w3.eth.get_transaction_receipt(txn_hash)
+
+def shoot(
+        w3: web3.Web3,
+        fas: typing.List[find_circuit.FoundArbitrage],
+        block_number: int,
+        do_trace: TraceMode = TraceMode.NEVER,
+        gaslimit: typing.Optional[int] = None,
+        cancellation_token: typing.Optional[CancellationToken] = None
+    ) -> typing.Tuple[str, typing.List[ShootResult]]:
     assert len(fas) > 0
-    tries_remaining = 4
-    shot_arbitrages = set()
     ret = []
-    while True:
-        try:
-            account = funded_deployer()
-            with GanacheContextManager(w3, block_number) as ganache:
+    account = funded_deployer()
+    with GanacheContextManager(w3, block_number) as ganache:
 
-                # deploy shooter
-                shooter_address = shooter.deploy.deploy_shooter(ganache, account, max_priority = 2, max_fee_total = w3.toWei(1, 'ether'))
+        # deploy shooter
+        shooter_address = '0x0044a204aaE0000091D100002cBC095180000F90' # we own the key to this address
+        ganache_deploy_shooter(ganache, shooter_address)
 
-                # wrap some ether
-                weth: web3.contract.Contract = ganache.eth.contract(
-                    address='0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-                    abi=get_abi('weth9/WETH9.json')['abi'],
-                )
-                wrap = weth.functions.deposit().buildTransaction({'value': 100, 'from': account.address})
-                wrap_hash = ganache.eth.send_transaction(wrap)
-                wrap_receipt = ganache.eth.wait_for_transaction_receipt(wrap_hash)
-                assert wrap_receipt['status'] == 1
+        # wrap some ether
+        weth: web3.contract.Contract = ganache.eth.contract(
+            address='0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+            abi=get_abi('weth9/WETH9.json')['abi'],
+        )
+        wrap = weth.functions.deposit().buildTransaction({'value': 100, 'from': account.address})
+        wrap_hash = ganache.eth.send_transaction(wrap)
+        wrap_receipt = ganache.eth.wait_for_transaction_receipt(wrap_hash)
+        assert wrap_receipt['status'] == 1
 
-                # transfer to shooter
-                xfer = weth.functions.transfer(shooter_address, 100).buildTransaction({'from': account.address})
-                xfer_hash = ganache.eth.send_transaction(xfer)
-                xfer_receipt = ganache.eth.wait_for_transaction_receipt(xfer_hash)
-                assert xfer_receipt['status'] == 1
+        # transfer to shooter
+        xfer = weth.functions.transfer(shooter_address, 100).buildTransaction({'from': account.address})
+        xfer_hash = ganache.eth.send_transaction(xfer)
+        xfer_receipt = ganache.eth.wait_for_transaction_receipt(xfer_hash)
+        assert xfer_receipt['status'] == 1
 
-                for fa in fas:
-                    if fa in shot_arbitrages:
-                        continue
+        for fa in fas:
+            if cancellation_token is not None and cancellation_token.cancel_requested():
+                return
 
-                    for pricer in fa.circuit:
-                        pricer.set_web3(ganache)
+            for pricer in fa.circuit:
+                pricer.set_web3(ganache)
 
-                    # checkpoint ganache
-                    result = ganache.provider.make_request('evm_snapshot', [])
-                    snapshot_id = int(result['result'][2:], base=16)
+            # checkpoint ganache
+            result = ganache.provider.make_request('evm_snapshot', [])
+            snapshot_id = int(result['result'][2:], base=16)
 
-                    try:
-                        shot = shooter.composer.construct_from_found_arbitrage(fa, 0, ganache.eth.get_block('latest')['number'] + 1)
+            try:
+                shot = shooter.composer.construct_from_found_arbitrage(fa, 0, ganache.eth.get_block('latest')['number'] + 1)
 
-                        l.debug(f'About to shoot {shot.hex()}')
+                l.debug(f'About to shoot {shot.hex()}')
 
-                        if gaslimit is None:
-                            gaslimit = 10_000_000
+                if gaslimit is None:
+                    gaslimit = 10_000_000
 
-                        txn: web3.types.TxParams = {
-                            'chainId': ganache.eth.chain_id,
-                            'from': account.address,
-                            'to': shooter_address,
-                            'value': 0,
-                            'nonce': ganache.eth.get_transaction_count(account.address),
-                            'data': shot,
-                            'gas': gaslimit,
-                            'maxPriorityFeePerGas': 2,
-                            'maxFeePerGas': 1000 * (10 ** 9),
-                        }
-                        signed_txn = ganache.eth.account.sign_transaction(txn, account.key)
-                        txn_hash = ganache.eth.send_raw_transaction(signed_txn.rawTransaction)
+                txn: web3.types.TxParams = {
+                    'chainId': ganache.eth.chain_id,
+                    'from': account.address,
+                    'to': shooter_address,
+                    'value': 0,
+                    'nonce': ganache.eth.get_transaction_count(account.address),
+                    'data': shot,
+                    'gas': gaslimit,
+                    'maxPriorityFeePerGas': 2,
+                    'maxFeePerGas': 5000 * (10 ** 9),
+                }
+                signed_txn = ganache.eth.account.sign_transaction(txn, account.key)
+                txn_hash = ganache.eth.send_raw_transaction(signed_txn.rawTransaction)
 
-                        mine_block(ganache)
+                mine_block(ganache)
+                receipt = get_txn_with_backoff(ganache, txn_hash)
 
-                        receipt = ganache.eth.get_transaction_receipt(txn_hash)
+                should_trace = (do_trace == TraceMode.ALWAYS) or (receipt['status'] != 1 and do_trace == TraceMode.ON_FAIL)
 
-                        should_trace = (do_trace == TraceMode.ALWAYS) or (receipt['status'] != 1 and do_trace == TraceMode.ON_FAIL)
-
-                        if should_trace:
-                            start = time.time()
-                            trace = ganache.provider.make_request('debug_traceTransaction', [receipt['transactionHash'].hex()])
-                            l.info(f'Spent {time.time() - start:f} seconds tracing')
-                            if 'result' not in trace:
-                                l.critical(f'Why does this not have result? {trace}')
-                            maybe_trace = trace['result']['structLogs']
-                        else:
-                            maybe_trace = None
-
-                        ret.append(ShootResult(
-                            arbitrage = fa,
-                            maybe_receipt = receipt,
-                            maybe_tx_params = txn,
-                            maybe_trace = maybe_trace,
-                            encodable = True
-                        ))
-
-                        shot_arbitrages.add(fa)
-                    except shooter.composer.ConstructionException:
-                        l.exception('encoding params didnt make sense')
-                        ret.append(ShootResult(
-                            arbitrage = fa,
-                            maybe_receipt = None,
-                            maybe_tx_params = None,
-                            maybe_trace = None,
-                            encodable = False
-                        ))
-                    except shooter.encoder.ExceedsEncodableParamsException:
-                        l.warning('exceeds encodable params')
-                        ret.append(ShootResult(
-                            arbitrage = fa,
-                            maybe_receipt = None,
-                            maybe_tx_params = None,
-                            maybe_trace = None,
-                            encodable = False
-                        ))
-                
-                    # reset snapshot
-                    result = ganache.provider.make_request('evm_revert', [snapshot_id])
-                    assert result['result'] == True
+                if should_trace:
+                    start = time.time()
+                    trace = ganache.provider.make_request('debug_traceTransaction', [receipt['transactionHash'].hex()])
+                    l.info(f'Spent {time.time() - start:f} seconds tracing')
+                    if 'result' not in trace:
+                        l.critical(f'Why does this not have result? {trace}')
+                    maybe_trace = trace['result']['structLogs']
                 else:
-                    # done
-                    break
-        except web3.exceptions.TransactionNotFound:
-            tries_remaining -= 1
-            if tries_remaining <= 0:
-                raise
-            ts_to_sleep = 60 + random.randint(0, 120)
-            l.exception(f'transaction was not found; retrying. sleeping for {ts_to_sleep}sec, tries remaining = {tries_remaining}')
-            time.sleep(ts_to_sleep)
+                    maybe_trace = None
+
+                ret.append(ShootResult(
+                    arbitrage = fa,
+                    maybe_receipt = receipt,
+                    maybe_tx_params = txn,
+                    maybe_trace = maybe_trace,
+                    encodable = True
+                ))
+            except shooter.composer.ConstructionException:
+                l.exception('encoding params didnt make sense')
+                ret.append(ShootResult(
+                    arbitrage = fa,
+                    maybe_receipt = None,
+                    maybe_tx_params = None,
+                    maybe_trace = None,
+                    encodable = False
+                ))
+            except shooter.encoder.ExceedsEncodableParamsException:
+                l.warning('exceeds encodable params')
+                ret.append(ShootResult(
+                    arbitrage = fa,
+                    maybe_receipt = None,
+                    maybe_tx_params = None,
+                    maybe_trace = None,
+                    encodable = False
+                ))
+
+            # reset snapshot
+            result = ganache.provider.make_request('evm_revert', [snapshot_id])
+            assert result['result'] == True, 'snapshot revert should be success'
     return shooter_address, ret
 
 
@@ -258,3 +281,56 @@ class WrappedFoundArbitrage:
     def tokens(self) -> typing.Set[str]:
         return self.fa.tokens
 
+
+def load_pool(w3: web3.Web3) -> pricers.PricerPool:
+    l.debug('starting load of exchange graph')
+    t_start = time.time()
+    univ2_fname = os.path.abspath(os.path.dirname(__file__) + '/../univ2_excs.csv.gz')
+    assert os.path.isfile(univ2_fname), f'should have file {univ2_fname}'
+    univ3_fname = os.path.abspath(os.path.dirname(__file__) + '/../univ3_excs.csv.gz')
+    assert os.path.isfile(univ3_fname)
+
+    ret = pricers.PricerPool(w3)
+
+    n_ignored = 0
+    with open(FNAME_EXCHANGES_WITH_BALANCES) as fin:
+        for line in fin:
+            if line.startswith('2'):
+                _, address, origin_block, token0, token1, bal0, bal1 = line.strip().split(',')
+
+                origin_block = int(origin_block)
+                bal0 = int(bal0)
+                bal1 = int(bal1)
+                if token0 in THRESHOLDS:
+                    if bal0 < THRESHOLDS[token0]:
+                        n_ignored += 1
+                        continue
+                if token1 in THRESHOLDS:
+                    if bal1 < THRESHOLDS[token1]:
+                        n_ignored += 1
+                        continue
+                ret.add_uniswap_v2(address, token0, token1, origin_block)
+            else:
+                assert line.startswith('3')
+
+                _, address, origin_block, token0, token1, fee, bal0, bal1 = line.strip().split(',')
+                fee = int(fee)
+
+                origin_block = int(origin_block)
+                bal0 = int(bal0)
+                bal1 = int(bal1)
+                if token0 in THRESHOLDS:
+                    if bal0 < THRESHOLDS[token0]:
+                        n_ignored += 1
+                        continue
+                if token1 in THRESHOLDS:
+                    if bal1 < THRESHOLDS[token1]:
+                        n_ignored += 1
+                        continue
+                ret.add_uniswap_v3(address, token0, token1, fee, origin_block)
+
+    l.debug(f'Kept {ret.exchange_count:,} and ignored {n_ignored:,} exchanges below threshold ({n_ignored / (n_ignored + ret.exchange_count) * 100:.2f}%)')
+
+    t_end = time.time()
+    l.debug(f'Took {t_end - t_start:.2f} seconds to load into pricing pool')
+    return ret
