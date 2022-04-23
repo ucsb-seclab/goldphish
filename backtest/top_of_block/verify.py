@@ -9,9 +9,9 @@ import logging
 import time
 import typing
 import web3
-from backtest.top_of_block.common import TraceMode, WrappedFoundArbitrage, connect_db, load_exchanges, shoot
+from backtest.top_of_block.common import TraceMode, WrappedFoundArbitrage, load_exchanges, shoot
 
-from backtest.utils import CancellationToken, parse_logs_for_net_profit
+from backtest.utils import CancellationToken, parse_logs_for_net_profit, connect_db
 import find_circuit
 import pricers
 from utils import WETH_ADDRESS

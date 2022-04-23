@@ -10,9 +10,9 @@ import web3._utils.filters
 import psycopg2
 import psycopg2.extensions
 
-from backtest.top_of_block.common import connect_db, load_pool
+from backtest.top_of_block.common import load_pool
 from backtest.top_of_block.constants import FNAME_EXCHANGES_WITH_BALANCES, IMPORTANT_TOPICS_HEX, MIN_PROFIT_PREFILTER, THRESHOLDS, univ2_fname, univ3_fname
-from backtest.utils import CancellationToken
+from backtest.utils import CancellationToken, connect_db
 import pricers
 import find_circuit
 from pricers.uniswap_v2 import UniswapV2Pricer

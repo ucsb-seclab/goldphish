@@ -9,11 +9,11 @@ import web3._utils.filters
 import web3.types
 import web3.contract
 from backtest.top_of_block.verify import check_candidates
-from backtest.utils import ERC20_TRANSFER_TOPIC, parse_logs_for_net_profit
+from backtest.utils import ERC20_TRANSFER_TOPIC, parse_logs_for_net_profit, connect_db
 
 import pricers
 import find_circuit
-from backtest.top_of_block.common import TraceMode, WrappedFoundArbitrage, connect_db, load_exchanges, load_naughty_tokens, shoot
+from backtest.top_of_block.common import TraceMode, WrappedFoundArbitrage, load_exchanges, load_naughty_tokens, shoot
 from backtest.top_of_block.constants import UNISWAP_V2_SYNC_TOPIC, univ2
 
 from utils import WETH_ADDRESS, decode_trace_calls, get_abi, pretty_print_trace

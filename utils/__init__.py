@@ -15,6 +15,7 @@ import web3.contract
 import random
 
 
+from .throttler import BlockThrottle
 from .profiling import get_measurement, reset_measurement, profile
 
 l = logging.getLogger(__name__)
@@ -53,15 +54,22 @@ class ColoredFormatter(logging.Formatter):
         return formatter.format(record)
 
 
-def setup_logging(job_name = None, suppress: typing.List[str] = [], worker_name: typing.Optional[str] = None):
+def setup_logging(job_name = None, suppress: typing.List[str] = [], worker_name: typing.Optional[str] = None, root_dir = None):
+    if root_dir is None:
+        root_dir = '/mnt/goldphish'
+    
+    logdir = os.path.join(root_dir, 'logs')
+    if not os.path.isdir(logdir):
+        os.mkdir(logdir)
+
     sz_date = datetime.datetime.utcnow().isoformat(sep='T')
 
     if worker_name is None:
         worker_name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=6))
     if job_name is None:
-        fname = '/mnt/goldphish/logs/log.txt'
+        fname = os.path.join(logdir, 'log.txt')
     else:
-        fname = f'/mnt/goldphish/logs/{job_name}_{sz_date}_{worker_name}.txt'
+        fname = os.path.join(logdir, f'{job_name}_{sz_date}_{worker_name}.txt')
     root_logger = logging.getLogger()
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(ColoredFormatter())

@@ -30,21 +30,6 @@ class TraceMode(enum.Enum):
     ON_FAIL = 2
 
 
-def connect_db() -> psycopg2.extensions.connection:
-    pg_host = os.getenv('PSQL_HOST', 'ethereum-measurement-pg')
-    pg_port = int(os.getenv('PSQL_PORT', '5432'))
-    db = psycopg2.connect(
-        host = pg_host,
-        port = pg_port,
-        user = 'measure',
-        password = 'password',
-        database = 'eth_measure_db',
-    )
-    db.autocommit = False
-    l.debug(f'connected to postgresql')
-    return db
-
-
 def load_naughty_tokens(curr: psycopg2.extensions.cursor) -> typing.Set[str]:
     curr.execute('SELECT address FROM naughty_tokens')
     return set(web3.Web3.toChecksumAddress(a.tobytes()) for (a,) in curr)

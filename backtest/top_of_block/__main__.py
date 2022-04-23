@@ -26,7 +26,6 @@ def main():
     parser.add_argument('--mode', type=str, choices=['verify', 'diagnose', 'connect', 'cleanup', 'trace'], help='verification mode', default=None)
     parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
     parser.add_argument('--id', type=int, default=None, help='id to trace')
-    parser.add_argument('--verify', action='store_true', help='verification mode', default=False)
 
     args = parser.parse_args()
 

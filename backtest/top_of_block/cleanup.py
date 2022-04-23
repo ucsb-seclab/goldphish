@@ -3,7 +3,7 @@ Some various database cleanup tasks and consistency-checking.
 """
 import logging
 
-from backtest.top_of_block.common import connect_db
+from backtest.utils import connect_db
 
 
 l = logging.getLogger(__name__)

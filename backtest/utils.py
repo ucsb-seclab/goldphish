@@ -18,6 +18,7 @@ l = logging.getLogger(__name__)
 from utils import erc20
 
 ERC20_TRANSFER_TOPIC = event_abi_to_log_topic(erc20.events.Transfer().abi)
+ERC20_TRANSFER_TOPIC_HEX = '0x' + ERC20_TRANSFER_TOPIC.hex()
 
 def parse_logs_for_net_profit(logs: typing.List[web3.types.LogReceipt]) -> typing.Dict[str, typing.Dict[str, int]]:
     """
@@ -36,6 +37,21 @@ def parse_logs_for_net_profit(logs: typing.List[web3.types.LogReceipt]) -> typin
 def funded_deployer() -> LocalAccount:
     ret: LocalAccount = Account.from_key(bytes.fromhex('0xab1179084d3336336d60b2ed654d99a21c2644cadd89fd3034ee592e931e4a77'[2:]))
     return ret
+
+
+def connect_db() -> psycopg2.extensions.connection:
+    pg_host = os.getenv('PSQL_HOST', 'ethereum-measurement-pg')
+    pg_port = int(os.getenv('PSQL_PORT', '5432'))
+    db = psycopg2.connect(
+        host = pg_host,
+        port = pg_port,
+        user = 'measure',
+        password = 'password',
+        database = 'eth_measure_db',
+    )
+    db.autocommit = False
+    l.debug(f'connected to postgresql')
+    return db
 
 
 def mine_block(w3: web3.Web3):
