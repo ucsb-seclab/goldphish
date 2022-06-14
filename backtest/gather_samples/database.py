@@ -48,7 +48,8 @@ def setup_db(curr: psycopg2.extensions.cursor):
             gas_used      NUMERIC(78, 0) NOT NULL,
             gas_price     NUMERIC(78, 0) NOT NULL,
             shooter       BYTEA DEFAULT NULL,
-            coinbase_xfer NUMERIC(78, 0) DEFAULT NULL
+            coinbase_xfer NUMERIC(78, 0) DEFAULT NULL,
+            miner         BYTEA DEFAULT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_sample_arbitrages_block_number ON sample_arbitrages (block_number);
@@ -167,7 +168,12 @@ def insert_arbs(w3: web3.Web3, curr: psycopg2.extensions.cursor, arbs: typing.Li
     exchange_to_ids = {k: v for k, v in zip(all_exchanges, exchange_ids)}
     assert len(exchange_to_ids) == len(all_exchanges)
 
+    already_inserted = set()
     for arb in arbs:
+        # sanity check
+        assert arb.txn_hash not in already_inserted
+        already_inserted.add(arb.txn_hash)
+
         _insert_arb(w3, curr, arb, exchange_to_ids)
 
     l.debug(f'inserted arbitrages')
@@ -184,7 +190,14 @@ def _insert_arb(w3: web3.Web3, curr: psycopg2.extensions.cursor, arb: Arbitrage,
         ) VALUES (%s, %s, %s, %s, %s, %s)
         RETURNING id
         ''',
-        (arb.txn_hash, arb.block_number, arb.n_cycles, arb.gas_used, arb.gas_price, bytes.fromhex(arb.shooter[2:])),
+        (
+            arb.txn_hash,
+            arb.block_number,
+            arb.n_cycles,
+            arb.gas_used,
+            arb.gas_price,
+            bytes.fromhex(arb.shooter[2:]) if arb.shooter is not None else None,
+        ),
     )
     assert curr.rowcount == 1
     (arbitrage_id,) = curr.fetchone()

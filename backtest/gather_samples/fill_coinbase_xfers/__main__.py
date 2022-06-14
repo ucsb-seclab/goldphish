@@ -21,7 +21,7 @@ def main():
     args = parser.parse_args()
     if args.worker_name is None:
         args.worker_name = socket.gethostname()
-    job_name = 'gather_samples'
+    job_name = 'fill_coinbase_xfers'
 
 
     setup_logging(job_name, worker_name = args.worker_name, root_dir='/data/robert/ethereum-arb/storage')
@@ -59,24 +59,7 @@ def main():
     db.autocommit = False
     l.debug(f'connected to postgresql (mainnet)')
 
-    setup_db(curr)
     fill_txn_coinbase_transfers(w3, db, db_mainnet)
-
-
-def setup_db(curr: psycopg2.extensions.cursor):
-    curr.execute(
-        '''
-        CREATE TABLE IF NOT EXISTS sample_arbitrage_coinbase_transfers (
-            id                  SERIAL PRIMARY KEY NOT NULL,
-            sample_arbitrage_id INTEGER NOT NULL UNIQUE REFERENCES sample_arbitrages (id) ON DELETE CASCADE,
-            value_transferred   NUMERIC(78, 0) NOT NULL,
-            recipient           BYTEA NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_sample_arbitrage_coinbase_transfers_arb_id ON sample_arbitrage_coinbase_transfers (sample_arbitrage_id);
-        '''
-    )
-    curr.connection.commit()
 
 
 def fill_txn_coinbase_transfers(w3: web3.Web3, db_mine: psycopg2.extensions.connection, db_mainnet: psycopg2.extensions.connection):
@@ -87,8 +70,7 @@ def fill_txn_coinbase_transfers(w3: web3.Web3, db_mine: psycopg2.extensions.conn
         '''
         SELECT distinct block_number
         FROM sample_arbitrages sa
-        JOIN sample_arbitrage_cycles sac ON sac.sample_arbitrage_id = sa.id
-        WHERE NOT EXISTS(SELECT 1 FROM sample_arbitrage_coinbase_transfers sact WHERE sact.sample_arbitrage_id = sa.id)
+        WHERE coinbase_xfer IS NULL
         '''
     )
     n_blocks_to_process = curr_mine.rowcount
@@ -98,7 +80,12 @@ def fill_txn_coinbase_transfers(w3: web3.Web3, db_mine: psycopg2.extensions.conn
 
     for block_number in blocks_to_process:
         curr_mainnet.execute('SELECT miner FROM blocks WHERE block_number = %s', (block_number,))
-        (miner,) = curr_mainnet.fetchone()
+        if curr_mainnet.rowcount == 1:
+            assert curr_mainnet.rowcount == 1, f'expected to find one miner for block_number = {block_number}'
+            (miner,) = curr_mainnet.fetchone()
+        else:
+            block = w3.eth.get_block(block_number)
+            miner = w3.toChecksumAddress(block['miner'])
         assert w3.isChecksumAddress(miner)
         bminer = bytes.fromhex(miner[2:])
         l.debug(f'block {block_number} was mined by {miner}')
@@ -108,9 +95,7 @@ def fill_txn_coinbase_transfers(w3: web3.Web3, db_mine: psycopg2.extensions.conn
             '''
             SELECT sa.id, txn_hash
             FROM sample_arbitrages sa
-            JOIN sample_arbitrage_cycles sac ON sac.sample_arbitrage_id = sa.id
-            WHERE NOT EXISTS(SELECT 1 FROM sample_arbitrage_coinbase_transfers sact WHERE sact.sample_arbitrage_id = sa.id)
-                AND sa.block_number = %s
+            WHERE coinbase_xfer IS NULL AND block_number = %s
             ''',
             (block_number,)
         )
@@ -119,35 +104,43 @@ def fill_txn_coinbase_transfers(w3: web3.Web3, db_mine: psycopg2.extensions.conn
 
         arbs = [(aid, '0x' + txn_hash.tobytes().hex()) for aid, txn_hash in curr_mine]
         for arbitrage_id, txn_hash in arbs:
-            
-            curr_mainnet.execute('SELECT EXISTS(SELECT 1 FROM traces WHERE transaction_hash = %s)', (txn_hash,))
+
+            # use block_number so it can make use of the index ?          
+            curr_mainnet.execute('SELECT EXISTS(SELECT 1 FROM traces WHERE block_number = %s AND transaction_hash = %s)', (block_number, txn_hash,))
             (has_txn,) = curr_mainnet.fetchone()
-            assert has_txn == True
+            if has_txn == True:
+                curr_mainnet.execute(
+                    '''
+                    SELECT value
+                    FROM traces
+                    WHERE block_number = %s AND transaction_hash = %s AND receiver = %s
+                    ''',
+                    (block_number, txn_hash, miner),
+                )
 
-            curr_mainnet.execute(
-                '''
-                SELECT value
-                FROM traces
-                WHERE transaction_hash = %s AND receiver = %s
-                ''',
-                (txn_hash, miner),
-            )
+                xfer_amt = 0
+                for (v,) in curr_mainnet:
+                    xfer_amt += v
+            else:
+                assert has_txn == False
+                l.warning(f'Using backup call dumper')
+                resp = w3.provider.make_request('debug_traceTransaction', [txn_hash, {'tracer': 'callTracer'}])
 
-            xfer_amt = 0
-            for (v,) in curr_mainnet:
-                xfer_amt += v
+                xfer_amt = 0
+                queue = [resp['result']]
+                while len(queue) > 0:
+                    item = queue.pop()
+                    if w3.toChecksumAddress(item['to']) == miner:
+                        xfer_amt += int(item['value'][2:], base=16)
+                    queue += item.get('calls', [])
 
             curr_mine.execute(
                 '''
-                INSERT INTO sample_arbitrage_coinbase_transfers (
-                    sample_arbitrage_id,
-                    value_transferred,
-                    recipient
-                )
-                VALUES (%s, %s, %s)
+                UPDATE sample_arbitrages SET coinbase_xfer = %s, miner = %s WHERE id = %s
                 ''',
-                (arbitrage_id, xfer_amt, bminer)
+                (xfer_amt, bminer, arbitrage_id)
             )
+
         curr_mine.connection.commit()
 
 

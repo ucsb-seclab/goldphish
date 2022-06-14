@@ -13,7 +13,7 @@ import psycopg2.extensions
 from backtest.gather_samples.analyses import get_arbitrage_if_exists
 from backtest.gather_samples.database import insert_arbs, setup_db
 
-from backtest.utils import ERC20_TRANSFER_TOPIC_HEX, CancellationToken, connect_db
+from backtest.utils import ERC20_TRANSFER_TOPIC_HEX, ERC20_TRANSFER_TOPIC, CancellationToken, connect_db
 from utils import setup_logging, erc20
 from utils.throttler import BlockThrottle
 
@@ -36,6 +36,7 @@ def main():
 
         db = connect_db()
         curr = db.cursor()
+
         setup_db(curr)
         start_block = 12_369_621
         end_block = 14_324_572
@@ -54,6 +55,26 @@ def main():
         if not w3.isConnected():
             l.error(f'Could not connect to web3')
             exit(1)
+
+        # # debug a transaction
+        # txn_hash = '0x4c4fd405de8f88d33570b2a27013e95f8ab8a5394cfe4a5fd9efea0120434f6f'
+        # btxn_hash = bytes.fromhex(txn_hash[2:])
+        # receipt = w3.eth.get_transaction_receipt(txn_hash)
+        # txns = []
+        # for r in receipt['logs']:
+        #     print(r)
+        #     if r['topics'][0] == ERC20_TRANSFER_TOPIC:
+        #         txns.append(erc20.events.Transfer().processLog(r))
+
+        # print(txns)
+        # get_arbitrage_if_exists(
+        #     w3,
+        #     bytes.fromhex('4c4fd405de8f88d33570b2a27013e95f8ab8a5394cfe4a5fd9efea0120434f6f'),
+        #     txns,
+        # )
+
+        # return
+
 
         l.debug(f'Connected to web3, chainId={w3.eth.chain_id}')
 
@@ -251,7 +272,7 @@ def process_reservation(
         process_batch(w3, curr, logs)
         curr.connection.commit()
 
-        this_block_start = this_end_block_inclusive
+        this_block_start = this_end_block_inclusive + 1
 
 
 def process_batch(
@@ -292,7 +313,10 @@ def process_batch(
 
     # Process each transaction
     arbs = []
+    processed_already = set()
     for tx_hash, txns in tx_to_parsed_txns.items():
+        assert tx_hash not in processed_already
+        processed_already.add(tx_hash)
         if len(txns) >= 3:
             arb = get_arbitrage_if_exists(
                 w3, tx_hash, txns

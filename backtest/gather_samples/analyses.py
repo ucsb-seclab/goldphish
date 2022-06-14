@@ -253,7 +253,7 @@ def get_arbitrage_if_exists(
 
                 amount_sent = 0
                 for sender in senders:
-                    amount_sent += token_movement_sums[sender][tok]
+                    amount_sent += -(token_movement_sums[sender][tok]) # negative bc it's net sent
                 amount_received = 0
                 for receiver in receivers:
                     amount_received += token_movement_sums[receiver][tok]
