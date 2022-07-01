@@ -1,6 +1,6 @@
 import collections
 import web3
-import psycopg2.extensions
+import web3.types
 import typing
 import networkx as nx
 import logging
@@ -15,7 +15,14 @@ def get_arbitrage_if_exists(
         tx_hash: bytes,
         txns: typing.List,
     ):
+    full_txn = w3.eth.get_transaction_receipt('0x' + tx_hash.hex())
+    return get_arbitrage_from_receipt_if_exists(full_txn, txns)
 
+
+def get_arbitrage_from_receipt_if_exists(
+        full_txn: web3.types.TxReceipt,
+        txns: typing.List,
+    ):
     addr_to_movements = collections.defaultdict(lambda: {'in': [], 'out': []})
     for txn in txns:
         to_addr = txn['args']['to']
@@ -24,7 +31,6 @@ def get_arbitrage_if_exists(
         addr_to_movements[from_addr]['out'].append(txn)
 
     potential_exchanges = set()
-    full_txn = w3.eth.get_transaction_receipt('0x' + tx_hash.hex())
     for addr in addr_to_movements:
         ins  = addr_to_movements[addr]['in']
         outs = addr_to_movements[addr]['out']
@@ -46,7 +52,7 @@ def get_arbitrage_if_exists(
         # not enough exchanges to make a cycle
         return None
 
-    l.debug(f'possible arbitrage 0x{tx_hash.hex()}')
+    l.debug(f'possible arbitrage 0x{full_txn["transactionHash"].hex()}')
 
     # Build the digraph of this exchange
     g = nx.DiGraph()
@@ -248,8 +254,6 @@ def get_arbitrage_if_exists(
             for tok in type_b_tokens:
                 senders = token_addr_to_only_sent_addresses[tok]
                 receivers = token_addr_to_only_received_addresses[tok]
-
-                print(f'token={tok} had senders={senders} receivers={receivers}')
 
                 amount_sent = 0
                 for sender in senders:

@@ -26,8 +26,6 @@ def main():
 
     setup_logging(job_name, worker_name = args.worker_name, root_dir='/data/robert/ethereum-arb/storage')
 
-    l.info('booting up sample arbitrage scraper')
-
     db = connect_db()
     curr = db.cursor()
 

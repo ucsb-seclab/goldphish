@@ -6,25 +6,24 @@ and checking against our model for the same or different profit before fees.
 """
 
 import argparse
-import itertools
 import os
-import random
+import subprocess
+import sys
+import time
 import typing
 import psycopg2
 import psycopg2.extensions
-import pricers
 import web3
 import web3.contract
 import web3.types
-from web3.logs import DISCARD
 import web3._utils.filters
 import logging
-import find_circuit
-import networkx as nx
+import numpy as np
 
-from backtest.utils import connect_db
+import backtest.gather_samples.analyses
+from backtest.utils import ERC20_TRANSFER_TOPIC, connect_db
 from utils import get_abi, setup_logging
-from utils import uv2, uv3
+from utils import erc20
 
 l = logging.getLogger(__name__)
 
@@ -33,6 +32,7 @@ uv3_factory: web3.contract.Contract = web3.Web3().eth.contract(address=b'\x00'*2
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--fill', action='store_true', help='fill the work queue', dest='fill')
     parser.add_argument('-v', '--verbose', action='store_true', dest='verbose')
     parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
     args = parser.parse_args()
@@ -41,7 +41,6 @@ def main():
 
     db = connect_db()
     curr = db.cursor()
-
 
     web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
     w3 = web3.Web3(web3.WebsocketProvider(
@@ -58,344 +57,389 @@ def main():
 
     l.debug(f'Connected to web3, chainId={w3.eth.chain_id}')
 
+    ganache_proc, ganache_w3 = open_ganache()
+    exit(1)
+
+    ganache_proc = None
     try:
         setup_db(curr)
-        compute_only_uniswap_queue(curr)
-        do_reorder(w3, curr)
+        if args.fill:
+            fill_queue(curr)
+        else:
+            ganache_proc, ganache_w3 = open_ganache()
+            for res in get_reservations(curr):
+                do_reorder(w3, ganache_w3, curr, res)
     except:
         l.exception('top-level exception')
         raise
+    finally:
+        if ganache_proc is not None:
+            ganache_proc.kill()
 
 
 def setup_db(curr: psycopg2.extensions.cursor):
     curr.execute(
         '''
-        CREATE TABLE IF NOT EXISTS sample_arbitrages_backrun_detection (
-            sample_arbitrage_id INTEGER NOT NULL PRIMARY KEY,
-            backran_creation BOOLEAN DEFAULT FALSE,
-            rerun_optimal_profit NUMERIC(78, 0),
-            reorder_optimal_profit NUMERIC(78, 0),
-            any_exchanges_touched BOOLEAN CHECK(any_exchanges_touched is not null OR backran_creation = true)
+        CREATE TABLE IF NOT EXISTS sample_arbitrage_backrun_detections (
+            sample_arbitrage_id INTEGER NOT NULL PRIMARY KEY REFERENCES sample_arbitrages (id) ON DELETE CASCADE,
+            rerun_exactly BOOLEAN,
+            rerun_reverted BOOLEAN,
+            rerun_no_arbitrage BOOLEAN,
+            rerun_not_comparable BOOLEAN,
+            rerun_profit_token_changed BOOLEAN,
+            rerun_profit NUMERIC(78, 0)
         );
         '''
-            # reorder_rerun_difference NUMERIC(78, 0) NOT NULL,
-            # reorder_difference NUMERIC(78, 0),
-            # rerun_difference NUMERIC(78, 0),
     )
-
-def compute_only_uniswap_queue(curr: psycopg2.extensions.cursor):
-    """
-    Finds arbitrages that only use uniswap exchanges and puts them in
-    the temporary table tmp_samples_only_uniswap
-    """
-    curr.connection.commit()
-
+    
+    # create queue
     curr.execute(
         '''
-        LOCK TABLE sample_arbitrages; -- to avoid multiple clients doing this computation
-
-        SELECT NOT EXISTS (
-            SELECT FROM 
-                pg_tables
-            WHERE 
-                schemaname = 'public' AND 
-                tablename  = 'fill_backrunners_queue'
+        CREATE TABLE IF NOT EXISTS backrun_detection_reservations (
+            id SERIAL PRIMARY KEY NOT NULL,
+            start_block         INTEGER NOT NULL,
+            end_block_exclusive  INTEGER NOT NULL,
+            started_on          TIMESTAMP WITHOUT TIME ZONE,
+            finished_on         TIMESTAMP WITHOUT TIME ZONE
         );
         '''
     )
-    (needs_fill,) = curr.fetchone()
-    
-    if needs_fill:
-        l.info(f'Loading uniswap-only arbitrages')
+    curr.connection.commit()
+
+    # see if we need to fill queue    
+    curr.execute('SELECT count(*) FROM backrun_detection_reservations')
+
+
+    (n_rows,) = curr.fetchone()
+    if n_rows == 0:
+        l.warning('Queue not created. Please run the fill procedure.')
+
+
+def fill_queue(curr: psycopg2.extensions.cursor):
+    # see if we need to fill queue    
+    curr.execute('SELECT count(*) FROM backrun_detection_reservations')
+
+
+    (n_rows,) = curr.fetchone()
+    if n_rows > 0:
+        l.error('Queue already created.')
+        exit(1)
+
+
+    l.debug(f'filling queue...')
+
+    # find lowest / highest blocks where we have sample arbitrage transactions
+    curr.execute(
+        '''
+        SELECT min(block_number), max(block_number)
+        FROM sample_arbitrages
+        '''
+    )
+    min_block, max_block = curr.fetchone()
+    assert min_block < max_block
+    assert (max_block - min_block) > 1000
+
+    # break into 10,000 reservations
+    lower_bounds, step = np.linspace(min_block, max_block, 10_000, dtype=int, retstep=True)
+    l.debug(f'reservation step size = {int(step):,} blocks')
+
+    for res_lower, res_upper_excl in zip(lower_bounds, list(lower_bounds[1:]) + [max_block + 1]):
+        assert res_lower < res_upper_excl
+
         curr.execute(
             '''
-            CREATE TEMP TABLE tmp_uniswap_exchange_ids AS
-            SELECT id
-            FROM sample_arbitrage_exchanges sae
-            WHERE EXISTS(SELECT 1 FROM uniswap_v1_exchanges uv1 WHERE uv1.address = sae.address) OR
-                EXISTS(SELECT 1 FROM uniswap_v2_exchanges uv2 WHERE uv2.address = sae.address) OR
-                EXISTS(SELECT 1 FROM uniswap_v3_exchanges uv3 WHERE uv3.address = sae.address);
-
-            CREATE TEMP TABLE tmp_sample_arbitrages_only_uniswap AS
-            SELECT sample_arbitrage_id, bool_and(EXISTS(SELECT 1 FROM tmp_uniswap_exchange_ids ues WHERE ues.id = sacei.exchange_id)) is_all_uniswap
-            FROM sample_arbitrage_cycles sac
-            JOIN sample_arbitrage_cycle_exchanges sace ON sace.cycle_id = sac.id
-            JOIN sample_arbitrage_cycle_exchange_items sacei ON sacei.cycle_exchange_id = sace.id
-            GROUP BY sample_arbitrage_id;
-
-            CREATE TABLE fill_backrunners_queue AS
-            SELECT sample_arbitrage_id, false as backrun_detect_started, null as backrun_detect_finished
-            FROM tmp_sample_arbitrages_only_uniswap
-            WHERE is_all_uniswap = true;
-            '''
+            INSERT INTO backrun_detection_reservations (start_block, end_block_exclusive)
+            VALUES (%s, %s)
+            ''',
+            (int(res_lower), int(res_upper_excl))
         )
-        l.info(f'done fill')
-        curr.connection.commit()
-    else:
-        l.debug(f'no fill needed')
-        curr.connection.commit()
+
+    curr.connection.commit()
+    l.debug(f'Inserted {len(lower_bounds)} reservations')
 
 
-def do_reorder(w3: web3.Web3, curr: psycopg2.extensions.cursor):
-    for i in itertools.count():
-        if i % 50 == 0 and random.randint(0, 6) == 0:
-            # count + report progress
-            curr.execute('SELECT COUNT(*) FROM fill_backrunners_queue')
-            (queue_size,) = curr.fetchone()
-            curr.execute('SELECT COUNT(*) FROM fill_backrunners_queue WHERE backrun_detect_started = true')
-            (n_remaining,) = curr.fetchone()
-            l.info(f'Progress: {n_remaining}/{queue_size} ({n_remaining / queue_size * 100:.2f}%)')
-
+def get_reservations(curr: psycopg2.extensions.cursor) -> typing.Iterator[typing.Tuple[int, int, int]]:
+    """
+    Gets reorder reservations
+    Returns (reservation_id, start, end_exclusive)
+    """
+    while True:
+        # get a fresh transaction
         curr.connection.commit()
         curr.execute(
             '''
-            SELECT sample_arbitrage_id
-            FROM fill_backrunners_queue
-            WHERE sample_arbitrage_id = 25756297 -- backrun_detect_started = false
+            SELECT id, start_block, end_block_exclusive
+            FROM backrun_detection_reservations
+            WHERE started_on is null
             LIMIT 1
             FOR UPDATE SKIP LOCKED
             '''
         )
-        assert curr.rowcount <= 1
-        if curr.rowcount == 0:
-            curr.connection.rollback()
-            l.info('Done processing')
-            break
-        
-        (id_,) = curr.fetchone()
-        assert isinstance(id_, int)
-        l.debug(f'processing id={id_}')
-        curr.execute(
-            '''
-            UPDATE fill_backrunners_queue
-            SET backrun_detect_started = true
-            WHERE sample_arbitrage_id = %s
-            ''',
-            (id_,)
-        )
+
+        if curr.rowcount != 1:
+            assert curr.rowcount <= 0
+            l.info('Out of work')
+            return
+
+        (reservation_id, start_block, end_block_exclusive) = curr.fetchone()
+
+        curr.execute('UPDATE backrun_detection_reservations SET started_on = now()::timestamp WHERE id = %s', (reservation_id,))
+        assert curr.rowcount == 1
         curr.connection.commit()
+        yield (reservation_id, start_block, end_block_exclusive)
 
-        try:
-            test_a_reorder(w3, curr, id_)
-            raise Exception('himom; done')
-        except:
-            l.critical(f'Failed while processing id={id_}')
-            raise
 
+def open_ganache() -> typing.Tuple[subprocess.Popen, web3.Web3]:
+    bin_loc = '/opt/ganache-fork/src/packages/ganache/dist/node/cli.js'
+    cwd_loc = '/opt/ganache-fork/'
+
+    my_pid = os.getpid()
+    ganache_port = 34451 + (my_pid % 10_000)
+
+    web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
+    p = subprocess.Popen(
+        [
+            'node',
+            bin_loc,
+            '--fork.url', web3_host,
+            '--server.port', str(ganache_port),
+            '--chain.chainId', '1',
+            '--chain.hardfork', 'arrowGlacier',
+        ],
+        stdout=subprocess.DEVNULL,
+        cwd=cwd_loc,
+    )
+
+    l.debug(f'spawned ganache on PID={p.pid} port={ganache_port}')
+
+    w3 = web3.Web3(web3.WebsocketProvider(f'ws://localhost:{ganache_port}'))
+
+    while not w3.isConnected():
+        time.sleep(0.1)
+
+    return p, w3
+
+
+def do_reorder(w3_mainnet: web3.Web3, w3_ganache: web3.Web3, curr: psycopg2.extensions.cursor, reservation):
+    reservation_id, reservation_start, reservation_end_exclusive = reservation
+
+    curr.execute(
+        '''
+        SELECT id, txn_hash
+        FROM sample_arbitrages
+        WHERE %s <= block_number AND block_number < %s
+        ''',
+        (reservation_start, reservation_end_exclusive),
+    )
+    l.debug(f'have {curr.rowcount:,} items to process in this reservation (id={reservation_id:,})')
+    queue: typing.List[typing.Tuple[int, bytes]] = [(i, txn.tobytes()) for i, txn in curr]
+
+    for id_, txn_hash in queue:
+        result = test_a_reorder(curr, w3_mainnet, w3_ganache, id_, txn_hash)
+        insert_reorder_result(curr, id_, txn_hash, result)
+        if id_ & 0x7 == 0:
+            curr.connection.commit()
+
+    l.info(f'finished with reservation id={reservation_id:,}')
+    curr.execute(
+        'UPDATE backrun_detection_reservations SET started_on = now()::timestamp WHERE id = %s',
+        (reservation_id,)
+    )
+    curr.connection.commit()
+
+
+class ReshootResult:
+    pass
+
+class ReshootReverted(ReshootResult):
+    pass
+
+class ReshootIdentical(ReshootResult):
+    """
+    The reshoot was a success, the transaction logs are identical
+    """
+    pass
+
+class ReshootNoArbitrage(ReshootResult):
+    pass
+
+class NotOneCycle(ReshootResult):
+    pass
+
+class ProfitTokenChanged(ReshootResult):
+    pass
+
+class ProfitChanged(ReshootResult):
+    new_profit: int
+
+    def __init__(self, new_profit: int) -> None:
+        self.new_profit = new_profit
+
+def test_a_reorder(
+        curr: psycopg2.extensions.cursor,
+        w3_mainnet: web3.Web3,
+        w3_ganache: web3.Web3,
+        sample_id: int,
+        txn_hash: bytes
+    ) -> ReshootResult:
+    l.debug(f'reordering 0x{txn_hash.hex()} (id={sample_id:,})')
+
+    original_receipt = w3_mainnet.eth.get_transaction_receipt('0x' + txn_hash.hex())
+
+    resp = w3_ganache.provider.make_request('eth_callAtFront', ['0x' + txn_hash.hex()])
+
+    if 'result' not in resp:
+        print(resp)
+
+    # if the reorder shot reverted then we can quickly discard it anyway
+    if resp['result']['exception'] != None:
+        assert resp['result']['exception'] in ['revert', 'out of gas', 'invalid opcode'], f"unexpected exception value {resp['result']['exception']}"
+        return ReshootReverted()
+
+    # gather relevant logs for both (into tuples)
+    logs_reshoot  = []
+    logs_original = []
+
+    for log in resp['result']['logs']:
+        topics = tuple(bytes.fromhex(topic) for topic in log['indexes'])
+        if topics[0] != ERC20_TRANSFER_TOPIC:
+            continue
+        address = w3_mainnet.toChecksumAddress(log['address'])
+        payload = log['payload']
+        logs_reshoot.append((address, topics, payload))
+
+    for log in original_receipt['logs']:
+        if log['topics'][0] != ERC20_TRANSFER_TOPIC:
+            continue
+        logs_original.append((
+            log['address'],
+            tuple(log['topics']),
+            log['data'][2:]
+        ))
+
+    assert len(logs_original) >= 3, 'need 3 transfers to make an arbitrage'
+
+    if set(logs_reshoot) == set(logs_original):
+        return ReshootIdentical()
+
+    # logs are not identical -- re-run analysis and see what's up
+
+    # parse everything to erc20 transfer events
+    erc20_xfers_reshoot = []
+    for i, (address, topics, payload) in enumerate(logs_reshoot):
+        lr = web3.types.LogReceipt(
+            address = address,
+            topic = topics[0],
+            topics = topics,
+            data = payload,
+            logIndex = i,
+            transactionIndex = i,
+            blockNumber = 0,
+            blockHash = None,
+            transactionHash = txn_hash,
+        )
+        erc20_xfers_reshoot.append(erc20.events.Transfer().processLog(lr))
+
+    analysis = backtest.gather_samples.analyses.get_arbitrage_from_receipt_if_exists(original_receipt, erc20_xfers_reshoot)
+
+    if analysis is None:
+        return ReshootNoArbitrage()
+
+    #
+    # is this too advanced to diagnose what happened
+    #
+    if analysis.n_cycles > 1:
+        return NotOneCycle()
+
+    curr.execute('SELECT n_cycles FROM sample_arbitrages WHERE id = %s', (sample_id,))
+    assert curr.rowcount == 1
+    (original_n_cycles,) = curr.fetchone()
+
+    if original_n_cycles > 1:
+        return NotOneCycle()
+
+    #
+    # is profit still in the same token? if so we can do apples-to-apples comparison
+    #
+    curr.execute(
+        '''
+        SELECT t1.address
+        FROM sample_arbitrage_cycles sac
+        JOIN tokens t1 ON sac.profit_token = t1.id
+        WHERE sac.sample_arbitrage_id = %s
+        ''',
+        (sample_id,)
+    )
+    assert curr.rowcount == 1
+    (original_profit_token,) = curr.fetchone()
+    original_profit_token = w3_mainnet.toChecksumAddress(original_profit_token.tobytes())
+
+    if original_profit_token != analysis.only_cycle.profit_token:
+        return ProfitTokenChanged()
+
+    return ProfitChanged(analysis.only_cycle.profit_amount)
+
+
+def insert_reorder_result(curr: psycopg2.extensions.cursor, id_: int, txn_hash: bytes, result: ReshootResult):
+    l.debug(f'reshoot result 0x{txn_hash.hex()} -> {type(result).__name__}')
+
+    if isinstance(result, ReshootIdentical):
         curr.execute(
             '''
-            UPDATE fill_backrunners_queue
-            SET backrun_detect_finished = true
-            WHERE sample_arbitrage_id = %s
+            INSERT INTO sample_arbitrage_backrun_detections
+            (sample_arbitrage_id, rerun_exactly)
+            VALUES (%s, true)
             ''',
             (id_,)
         )
-
-
-
-def test_a_reorder(w3: web3.Web3, curr: psycopg2.extensions.cursor, id_: int):
-    curr.execute('SELECT txn_hash FROM sample_arbitrages WHERE id = %s', (id_,))
-    assert curr.rowcount == 1
-    (txn_hash,) = curr.fetchone()
-    txn_hash = txn_hash.tobytes()
-
-    curr.execute(
-        '''
-        SELECT t.address, sac.profit_amount
-        FROM sample_arbitrage_cycles sac
-        JOIN tokens t ON sac.profit_token = t.id
-        WHERE sac.sample_arbitrage_id = %s
-        ''',
-        (id_,)
-    )
-    assert curr.rowcount == 1
-    profit_token_addr, profit_amount = curr.fetchone()
-    profit_token_addr = w3.toChecksumAddress(profit_token_addr.tobytes())
-    profit_amount = int(profit_amount)
-
-    l.debug(f'Processing transaction id={id_} - 0x{txn_hash.hex()} (profit token {profit_token_addr}, profit amount {profit_amount})')
-    receipt = w3.eth.get_transaction_receipt(txn_hash)
-    swaps_uv2 = uv2.events.Swap().processReceipt(receipt, errors=DISCARD)
-    swaps_uv3 = uv3.events.Swap().processReceipt(receipt, errors=DISCARD)
-    all_swaps = [(True, x) for x in swaps_uv2] + [(False, x) for x in swaps_uv3]
-    all_swaps = sorted(all_swaps, key = lambda x: x[1]['logIndex'])
-
-    # get inferred exchanges
-    curr.execute(
-        '''
-        SELECT sae.address, token_in.address, token_out.address
-        FROM sample_arbitrage_cycles sac
-        JOIN sample_arbitrage_cycle_exchanges sace ON sace.cycle_id = sac.id
-        JOIN tokens token_in ON sace.token_in = token_in.id
-        JOIN tokens token_out ON sace.token_out = token_out.id
-        JOIN sample_arbitrage_cycle_exchange_items sacei ON sacei.cycle_exchange_id = sace.id
-        JOIN sample_arbitrage_exchanges sae ON sae.id = sacei.exchange_id
-        WHERE sac.sample_arbitrage_id = %s
-        ''',
-        (id_,)
-    )
-    assert 2 <= curr.rowcount <= 50
-
-    exchanges_to_inferred_token_movements = {
-        web3.Web3.toChecksumAddress(x.tobytes()): (
-            web3.Web3.toChecksumAddress(ti.tobytes()),
-            web3.Web3.toChecksumAddress(to.tobytes())
-        )
-        for (x, ti, to)
-        in curr
-    }
-
-    l.debug(f'expecting {len(exchanges_to_inferred_token_movements)} exchanges')
-
-    #
-    # collect logs in the block
-    #
-    block = w3.eth.get_block(receipt['blockHash'])
-    logs = []
-    creates_uv2 = []
-    creates_uv3 = []
-    for txn_hash in block['transactions']:
-        if txn_hash == receipt['transactionHash']:
-            # reached the end
-            break
-        this_receipt = w3.eth.get_transaction_receipt(txn_hash)
-        logs += this_receipt['logs']
-        creates_uv2 += uv2_factory.events.PairCreated().processReceipt(this_receipt, errors=DISCARD)
-        creates_uv3 += uv3_factory.events.PoolCreated().processReceipt(this_receipt, errors=DISCARD)
-    else:
-        raise Exception('failed to re-find transaction')
-
-
-    #
-    # see if we're backrunning the creation of an exchange
-    #
-    backrunning_creation = False
-    for c in creates_uv2:
-        if c['args']['pair'] in exchanges_to_inferred_token_movements and c['transactionIndex'] < receipt['transactionIndex']:
-            backrunning_creation = True
-    for c in creates_uv3:
-        if c['args']['pool'] in exchanges_to_inferred_token_movements and c['transactionIndex'] < receipt['transactionIndex']:
-            backrunning_creation = True
-
-    if backrunning_creation:
-        # early-exit
-        l.debug(f'Transaction {receipt["transactionHash"].hex()} was backrunning the creation of an exchange')
+    elif isinstance(result, ReshootReverted):
         curr.execute(
             '''
-            INSERT INTO sample_arbitrages_backrun_detection (sample_arbitrage_id, backran_creation)
+            INSERT INTO sample_arbitrage_backrun_detections
+            (sample_arbitrage_id, rerun_reverted)
+            VALUES (%s, true)
+            ''',
+            (id_,)
+        )
+    elif isinstance(result, ReshootNoArbitrage):
+        curr.execute(
+            '''
+            INSERT INTO sample_arbitrage_backrun_detections
+            (sample_arbitrage_id, rerun_no_arbitrage)
+            VALUES (%s, true)
+            ''',
+            (id_,)
+        )
+    elif isinstance(result, NotOneCycle):
+        curr.execute(
+            '''
+            INSERT INTO sample_arbitrage_backrun_detections
+            (sample_arbitrage_id, rerun_not_comparable)
+            VALUES (%s, true)
+            ''',
+            (id_,)
+        )
+    elif isinstance(result, ProfitTokenChanged):
+        curr.execute(
+            '''
+            INSERT INTO sample_arbitrage_backrun_detections
+            (sample_arbitrage_id, rerun_profit_token_changed)
+            VALUES (%s, true)
+            ''',
+            (id_,)
+        )
+    elif isinstance(result, ProfitChanged):
+        assert isinstance(result.new_profit, int)
+        curr.execute(
+            '''
+            INSERT INTO sample_arbitrage_backrun_detections
+            (sample_arbitrage_id, rerun_profit)
             VALUES (%s, %s)
             ''',
-            (id_, True),
+            (id_, result.new_profit)
         )
-        return
-
-
-    #
-    # reconstruct cycle graph
-    #
-    exchange_to_details: typing.Dict[str, typing.Tuple[pricers.BaseExchangePricer, web3.types.LogReceipt]] = {k: None for k in exchanges_to_inferred_token_movements.keys()}
-
-    g = nx.DiGraph()
-    for is_v2, swap in all_swaps:
-        address = swap['address']
-        if address in exchanges_to_inferred_token_movements:
-            if exchange_to_details[address] is not None:
-                l.debug(f'address already present: {address}')
-                # we must already have a cycle .. this is probably converting profit to desired token
-                nx.find_cycle(g, source = profit_token_addr) # throws when no cycle is found
-
-            # silly trick, both v2/v3 have same token0 / token1 abi
-            tmp_contract = w3.eth.contract(address=address, abi=uv2.abi)
-            token0 = tmp_contract.functions.token0().call()
-            token1 = tmp_contract.functions.token1().call()
-            del tmp_contract
-
-            assert set([token0, token1]) == set(exchanges_to_inferred_token_movements[address])
-
-            if is_v2:
-                pricer = pricers.UniswapV2Pricer(w3, address, token0, token1)
-            else:
-                tmp_contract = w3.eth.contract(address=address, abi=uv3.abi)
-                fee = tmp_contract.functions.fee().call()
-                pricer = pricers.UniswapV3Pricer(w3, address, token0, token1, fee)
-
-            exchange_to_details[address] = (pricer, swap)
-            token_in, token_out = exchanges_to_inferred_token_movements[address]
-            g.add_edge(token_in, token_out, pricer = pricer)
-
-
-    assert all(v is not None for v in exchange_to_details.values()), 'expected to find all swap logs'
-
-    # sanity check -- verify cycle exists
-    cycle = nx.find_cycle(g, source = profit_token_addr)
-
-    # construct the circuit pricer
-    directions = []
-    circuit = []
-    for token_in, token_out in cycle:
-        assert token_in != token_out
-        # zero for one happens when token_in is lower than token_out
-        zero_for_one = bytes.fromhex(token_in[2:]) < bytes.fromhex(token_out[2:])
-        pricer = g[token_in][token_out]['pricer']
-
-        directions.append(zero_for_one)
-        circuit.append(pricer)
-
-    # discover how much was put in
-    first_exchange_addr = g[cycle[0][0]][cycle[0][1]]['pricer'].address
-    pricer, log = exchange_to_details[first_exchange_addr]
-    if isinstance(pricer, pricers.UniswapV2Pricer):
-        if directions[0] == True:
-            # zero for one
-            amount_in = log['args']['amount0In']
-        else:
-            amount_in = log['args']['amount1In']
     else:
-        assert isinstance(pricer, pricers.UniswapV3Pricer)
-        if directions[0] == True:
-            amount_in = log['args']['amount0']
-        else:
-            amount_in = log['args']['amount1']
-    assert amount_in > 0, f'expected amount_in to be positive but got {amount_in}'
-
-    #
-    # price the top-of-block shot
-    #
-    pc = find_circuit.PricingCircuit(circuit, directions)
-    amount_in, amount_out = pc.optimize(receipt['blockNumber'] - 1, lower_bound=1, upper_bound=((1 << 256) - 1))
-    reorder_profit = amount_out - amount_in
-
-    #
-    # price the in-place shot
-    #
-
-    # expose all pricers to logs that occurred before the arbitrage
-    any_touched = False
-    for pricer in pc.circuit:
-        my_logs = [x for x in logs if x['address'] == pricer.address]
-        if len(my_logs) > 0:
-            pricer.observe_block(my_logs)
-            any_touched = True
-
-    l.debug(f'Was any exchange touched in an earlier transaction? ({any_touched})')
-
-    pc = find_circuit.PricingCircuit(circuit, directions)
-    amount_in, amount_out = pc.optimize(receipt['blockNumber'] - 1, lower_bound=1, upper_bound=((1 << 256) - 1))
-    rerun_profit = amount_out - amount_in
-    l.debug(f'rerun profit: {rerun_profit}')
-
-    # sanity
-    if any_touched == False:
-        assert reorder_profit == rerun_profit
-
-    # record in database
-    curr.execute(
-        '''
-        INSERT INTO sample_arbitrages_backrun_detection (sample_arbitrage_id, rerun_optimal_profit, reorder_optimal_profit, any_exchanges_touched)
-        VALUES (%s, %s, %s, %s)
-        ''',
-        (id_, reorder_profit, rerun_profit, any_touched)
-    )
+        raise NotImplementedError('unreachable')
 
 
 if __name__ == '__main__':
