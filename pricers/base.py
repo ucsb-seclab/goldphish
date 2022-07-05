@@ -39,7 +39,14 @@ class BaseExchangePricer:
         Convert exact token1 to exact token0. SLOW.
         """
         raise NotImplementedError()
-    
+
+    def token1_out_to_exact_token0_in(self, token1_amount_out, block_identifier: int) -> int:
+        raise NotImplementedError()
+
+    def token0_out_to_exact_token1_in(self, token0_amount_out, block_identifier: int) -> int:
+        raise NotImplementedError()
+
+
     def observe_block(self, logs: typing.List[web3.types.LogReceipt]):
         pass
 

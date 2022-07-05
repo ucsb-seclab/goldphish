@@ -86,7 +86,6 @@ class UniswapV3Pricer(BaseExchangePricer):
         self.set_web3(w3)
 
     def get_slot0(self, block_identifier, use_cache = True) -> typing.Tuple[int, int]:
-        assert self.last_block_observed is None or self.last_block_observed <= block_identifier
         if use_cache == False or self.slot0_cache is None:
             with profile('uniswap_v3_fetch'):
                 (sqrt_ratio_x96, tick, _, _, _, _, _) = self.contract.functions.slot0().call(block_identifier=block_identifier)
@@ -96,7 +95,6 @@ class UniswapV3Pricer(BaseExchangePricer):
         return self.slot0_cache
 
     def get_liquidity(self, block_identifier, use_cache = True) -> int:
-        assert self.last_block_observed is None or self.last_block_observed <= block_identifier
         if use_cache == False or self.liquidity_cache is None:
             with profile('uniswap_v3_fetch'):
                 got = self.contract.functions.liquidity().call(block_identifier=block_identifier)
@@ -121,19 +119,34 @@ class UniswapV3Pricer(BaseExchangePricer):
         return (1 << 192) * (amount1) // ratiox192 * ((10 ** 6) - self.fee) // (10 ** 6)
 
     def exact_token0_to_token1(self, token0_in: int, block_identifier) -> int:
+        assert token0_in >= 0
         (_, ret) = self.swap(zero_for_one=True, amount_specified=token0_in, sqrt_price_limitX96=None, block_identifier=block_identifier)
         return -ret
 
     def exact_token1_to_token0(self, token1_in: int, block_identifier) -> int:
+        assert token1_in >= 0
         (ret, _) = self.swap(zero_for_one=False, amount_specified=token1_in, sqrt_price_limitX96=None, block_identifier=block_identifier)
         return -ret
+
+    def token1_out_to_exact_token0_in(self, token1_amount_out, block_identifier: int) -> int:
+        assert token1_amount_out >= 0
+        (ret, _) = self.swap(zero_for_one=True, amount_specified=-token1_amount_out, sqrt_price_limitX96=None, block_identifier=block_identifier)
+        return ret
+
+    def token0_out_to_exact_token1_in(self, token0_amount_out, block_identifier: int) -> int:
+        assert token0_amount_out >= 0
+        (_, ret) = self.swap(zero_for_one=False, amount_specified=-token0_amount_out, sqrt_price_limitX96=None, block_identifier=block_identifier)
+        return ret
+
 
     def swap(self, zero_for_one: bool, amount_specified: int, sqrt_price_limitX96: typing.Optional[int], block_identifier) -> typing.Tuple[int, int]:
         """
         returns: (amount0, amount1)
         """
-        assert amount_specified >= 0
         assert isinstance(zero_for_one, bool)
+
+        if amount_specified == 0:
+            return (0,0)
 
         (sqrt_price_x96, tick) = self.get_slot0(block_identifier)
         if sqrt_price_x96 == 0:
@@ -151,6 +164,8 @@ class UniswapV3Pricer(BaseExchangePricer):
                 sqrt_price_limitX96 = UniswapV3Pricer.MAX_SQRT_RATIO - 1
             assert sqrt_price_limitX96 >= sqrt_price_x96, f'expected {sqrt_price_limitX96} <= {sqrt_price_x96}'
             assert sqrt_price_limitX96 < UniswapV3Pricer.MAX_SQRT_RATIO
+
+        exact_input = amount_specified > 0
 
         amount_specified_remaining = amount_specified
         amount_calculated = 0
@@ -180,6 +195,7 @@ class UniswapV3Pricer(BaseExchangePricer):
                 limit_to_use = sqrt_price_limitX96
             else:
                 limit_to_use = sqrt_price_next_X96
+            
             sqrt_price_x96, amount_in, amount_out, fee_amount = UniswapV3Pricer.compute_swap_step(
                 sqrt_price_x96,
                 limit_to_use,
@@ -188,10 +204,13 @@ class UniswapV3Pricer(BaseExchangePricer):
                 self.fee
             )
 
-            # assume exact_input = true
-            amount_specified_remaining -= (amount_in + fee_amount)
-            assert amount_specified_remaining >= 0
-            amount_calculated = amount_calculated - amount_out
+            if exact_input:
+                amount_specified_remaining -= (amount_in + fee_amount)
+                assert amount_specified_remaining >= 0
+                amount_calculated = amount_calculated - amount_out
+            else:
+                amount_specified_remaining += amount_out
+                amount_calculated = amount_calculated + (amount_in + fee_amount)
 
             if sqrt_price_next_X96 == sqrt_price_next_X96:
                 if initialized:
@@ -206,12 +225,19 @@ class UniswapV3Pricer(BaseExchangePricer):
                 raise NotImplementedError('never got around to this')
                 # tick = UniswapV3Pricer.get_tick_at_sqrt_ratio(sqrt_price_x96)
 
-        if zero_for_one:
+        if zero_for_one == exact_input:
             amount0 = amount_specified - amount_specified_remaining
             amount1 = amount_calculated
         else:
             amount0 = amount_calculated
             amount1 = amount_specified - amount_specified_remaining
+        
+        if zero_for_one:
+            assert amount0 >= 0
+            assert amount1 <= 0
+        else:
+            assert amount0 <= 0
+            assert amount1 >= 0
 
         if amount_specified_remaining != 0:
             raise NotEnoughLiqudityException(amount0, amount1, amount_specified_remaining, 'ran out of liquidity')
@@ -227,41 +253,56 @@ class UniswapV3Pricer(BaseExchangePricer):
             amount_remaining,
             fee_pips
         ) -> typing.Tuple[int, int, int, int]:
-        # note: assume exactIn = true
-        assert amount_remaining >= 0
         assert liquidity >= 0
+
         zero_for_one = sqrt_ratio_currentx96 >= sqrt_ratio_targetx96
-        amount_remaining_less_fee = amount_remaining * ((10 ** 6) - fee_pips) // (10 ** 6)
+        exact_in = amount_remaining >= 0
 
-        if zero_for_one:
-            amount_in = UniswapV3Pricer.get_amount0_delta(
-                sqrt_ratio_targetx96, sqrt_ratio_currentx96, liquidity, True
-            )
-        else:
-            amount_in = UniswapV3Pricer.get_amount1_delta(
-                sqrt_ratio_currentx96, sqrt_ratio_targetx96, liquidity, True
-            )
+        if exact_in:
+            amount_remaining_less_fee = amount_remaining * ((10 ** 6) - fee_pips) // (10 ** 6)
 
-        if amount_remaining_less_fee >= amount_in:
-            sqrt_ratio_nextX96 = sqrt_ratio_targetx96
+            if zero_for_one:
+                amount_in = UniswapV3Pricer.get_amount0_delta(
+                    sqrt_ratio_targetx96, sqrt_ratio_currentx96, liquidity, True
+                )
+            else:
+                amount_in = UniswapV3Pricer.get_amount1_delta(
+                    sqrt_ratio_currentx96, sqrt_ratio_targetx96, liquidity, True
+                )
+
+            if amount_remaining_less_fee >= amount_in:
+                sqrt_ratio_nextX96 = sqrt_ratio_targetx96
+            else:
+                sqrt_ratio_nextX96 = UniswapV3Pricer.get_next_sqrt_price_from_input(
+                    sqrt_ratio_currentx96,
+                    liquidity,
+                    amount_remaining_less_fee,
+                    zero_for_one
+                )
         else:
-            sqrt_ratio_nextX96 = UniswapV3Pricer.get_next_sqrt_price_from_input(
-                sqrt_ratio_currentx96,
-                liquidity,
-                amount_remaining_less_fee,
-                zero_for_one
-            )
+            if zero_for_one:
+                amount_out = UniswapV3Pricer.get_amount1_delta(sqrt_ratio_targetx96, sqrt_ratio_currentx96, liquidity, False)
+            else:
+                amount_out = UniswapV3Pricer.get_amount0_delta(sqrt_ratio_currentx96, sqrt_ratio_targetx96, liquidity, False)
+            
+            if -amount_remaining >= amount_out:
+                sqrt_ratio_nextX96 = sqrt_ratio_targetx96
+            else:
+                sqrt_ratio_nextX96 = UniswapV3Pricer.get_next_sqrt_price_from_output(sqrt_ratio_currentx96, liquidity, -amount_remaining, zero_for_one)
 
         max_: bool = sqrt_ratio_targetx96 == sqrt_ratio_nextX96
 
         if zero_for_one:
-            amount_in = amount_in if max_ else UniswapV3Pricer.get_amount0_delta(sqrt_ratio_nextX96, sqrt_ratio_currentx96, liquidity, True)
-            amount_out = UniswapV3Pricer.get_amount1_delta(sqrt_ratio_nextX96, sqrt_ratio_currentx96, liquidity, False)
+            amount_in  = amount_in  if max_ and exact_in else UniswapV3Pricer.get_amount0_delta(sqrt_ratio_nextX96, sqrt_ratio_currentx96, liquidity, True)
+            amount_out = amount_out if max_ and not exact_in else UniswapV3Pricer.get_amount1_delta(sqrt_ratio_nextX96, sqrt_ratio_currentx96, liquidity, False)
         else:
-            amount_in = amount_in if max_ else UniswapV3Pricer.get_amount1_delta(sqrt_ratio_currentx96, sqrt_ratio_nextX96, liquidity, True)
-            amount_out = UniswapV3Pricer.get_amount0_delta(sqrt_ratio_currentx96, sqrt_ratio_nextX96, liquidity, False)
+            amount_in  = amount_in  if max_ and exact_in else UniswapV3Pricer.get_amount1_delta(sqrt_ratio_currentx96, sqrt_ratio_nextX96, liquidity, True)
+            amount_out = amount_out if max_ and not exact_in else UniswapV3Pricer.get_amount0_delta(sqrt_ratio_currentx96, sqrt_ratio_nextX96, liquidity, False)
 
-        if sqrt_ratio_nextX96 != sqrt_ratio_targetx96:
+        if not exact_in and amount_out > -amount_remaining:
+            amount_out = -amount_remaining
+
+        if exact_in and sqrt_ratio_nextX96 != sqrt_ratio_targetx96:
             fee_amount = amount_remaining - amount_in
         else:
             fee_amount = UniswapV3Pricer.mul_div_rounding_up(
@@ -295,6 +336,28 @@ class UniswapV3Pricer(BaseExchangePricer):
             # add = true
             quotient = (amount_in << 96) // liquidity
             return sqrt_pX96 + quotient
+
+    @staticmethod
+    def get_next_sqrt_price_from_output(sqrt_pX96: int, liquidity: int, amount_out: int, zero_for_one: bool) -> int:
+        assert sqrt_pX96 > 0
+        assert liquidity > 0
+        assert amount_out >= 0
+
+        if zero_for_one:
+            # getNextSqrtPriceFromAmount1RoundingDown
+            # add = false
+            quotient = UniswapV3Pricer.div_rounding_up(amount_out << 96, liquidity)
+            return sqrt_pX96 - quotient
+        else:
+            # getNextSqrtPriceFromAmount0RoundingUp
+            # add = false
+            if amount_out == 0:
+                return sqrt_pX96
+            numerator1 = liquidity << 96
+            product = amount_out * sqrt_pX96
+            denominator = numerator1 - product
+            return UniswapV3Pricer.mul_div_rounding_up(numerator1, sqrt_pX96, denominator)
+
 
     @staticmethod
     def get_amount0_delta(sqrt_ratio_aX96: int, sqrt_ratio_bX96: int, liquidity: int, roundUp: bool = None) -> int:
@@ -413,17 +476,17 @@ class UniswapV3Pricer(BaseExchangePricer):
         return ret, initialized
 
 
-    def get_tick_bitmap_word(self, word_idx, block_identifier) -> int:
-        if word_idx not in self.tick_bitmap_cache:
+    def get_tick_bitmap_word(self, word_idx, block_identifier, use_cache = True) -> int:
+        if not use_cache or word_idx not in self.tick_bitmap_cache:
             with profile('uniswap_v3_fetch'):
                 self.tick_bitmap_cache[word_idx] = \
                     self.contract.functions.tickBitmap(word_idx).call(block_identifier=block_identifier)
         return self.tick_bitmap_cache[word_idx]
 
-    def tick_at(self, tick: int, block_identifier) -> Tick:
+    def tick_at(self, tick: int, block_identifier, use_cache = True) -> Tick:
         assert UniswapV3Pricer.MIN_TICK <= tick
         assert tick <= UniswapV3Pricer.MAX_TICK
-        if tick not in self.tick_cache:
+        if not use_cache or tick not in self.tick_cache:
             with profile('uniswap_v3_fetch'):
                 self.tick_cache[tick] = Tick(
                     tick,
@@ -559,15 +622,17 @@ class UniswapV3Pricer(BaseExchangePricer):
 
         return (ratio >> 32) + to_add
 
-    def observe_block(self, receipts: typing.List[web3.types.LogReceipt]):
+    def observe_block(self, receipts: typing.List[web3.types.LogReceipt], force_load = False):
         """
         Observe the logs emitted in a block and update internal state appropriately.
         NOTE: receipts _must_ be in sorted order of increasing log index
-        """
-        assert self.address == receipts[0]['address']
 
+        When force_load is set to True, forces load of unknown storage regions
+        """
         if len(receipts) == 0:
             return
+
+        assert self.address == receipts[0]['address']
 
         block_num = receipts[0]['blockNumber']
         assert self.last_block_observed is None or self.last_block_observed < block_num
@@ -575,6 +640,7 @@ class UniswapV3Pricer(BaseExchangePricer):
 
         # if any of the logs are a burn or mint, dump the liquidity cache
         for log in receipts:
+
             if len(log['topics']) > 0 and log['topics'][0] == UNIV3_SWAP_EVENT_TOPIC:
                 swap = self.contract.events.Swap().processLog(log)
                 sqrt_price_x96 = swap['args']['sqrtPriceX96']
@@ -587,19 +653,85 @@ class UniswapV3Pricer(BaseExchangePricer):
             elif len(log['topics']) > 0 and log['topics'][0] in [UNIV3_BURN_EVENT_TOPIC, UNIV3_MINT_EVENT_TOPIC]:
                 if log['topics'][0] == UNIV3_BURN_EVENT_TOPIC:
                     event = self.contract.events.Burn().processLog(log)
+                    amount = -event['args']['amount']
                 else:
                     event = self.contract.events.Mint().processLog(log)
-                tick_lower = event['args']['tickLower']
-                tick_upper = event['args']['tickUpper']
-                word_lower = (tick_lower // self.tick_spacing) >> 8
-                word_upper = (tick_upper // self.tick_spacing) >> 8
-                self.tick_bitmap_cache.pop(word_lower, None)
-                self.tick_bitmap_cache.pop(word_upper, None)
-                self.tick_cache.pop(tick_lower, None)
-                self.tick_cache.pop(tick_upper, None)
+                    amount = event['args']['amount']
+
+
+                tick_num_lower = event['args']['tickLower']
+                tick_num_upper = event['args']['tickUpper']
+                word_lower = (tick_num_lower // self.tick_spacing) >> 8
+                word_upper = (tick_num_upper // self.tick_spacing) >> 8
+
+
+                if force_load:
+                    # force cache load of relevant parts
+                    tick_lower = self.tick_at(tick_num_lower, block_identifier=block_num - 1)
+                    tick_upper = self.tick_at(tick_num_upper, block_identifier=block_num - 1)
+                    self.get_tick_bitmap_word(word_lower, block_identifier = block_num - 1)
+                    self.get_tick_bitmap_word(word_upper, block_identifier = block_num - 1)
+                    self.get_liquidity(block_identifier = block_num - 1)
+                    self.get_slot0(block_identifier = block_num - 1)
+                else:
+                    # lazy-load using only info that is cached
+                    tick_lower = self.tick_cache.get(tick_num_lower, None)
+                    tick_upper = self.tick_cache.get(tick_num_upper, None)
+
+                # update tick state (if prior known)
+                if tick_lower is not None:
+                    liquidity_gross_before = tick_lower.liquidity_gross
+                    liquidity_gross_after = liquidity_gross_before + amount
+                    flipped = (liquidity_gross_after == 0) != (liquidity_gross_before == 0)
+                    liquidity_net = tick_lower.liquidity_net + amount
+
+                    tick_lower = tick_lower._replace(liquidity_gross = liquidity_gross_after)
+                    tick_lower = tick_lower._replace(liquidity_net = liquidity_net)
+                    tick_lower = tick_lower._replace(initialized = True)
+                    if amount < 0 and flipped:
+                        # tick un-initialized
+                        tick_lower = tick_lower._replace(initialized = False)
+                    self.tick_cache[tick_num_lower] = tick_lower
+
+                    # flip bitmap (if prior known)
+                    if flipped and word_lower in self.tick_bitmap_cache:
+                        old_bitmap = self.tick_bitmap_cache[word_lower]
+                        bit_pos = (tick_num_lower // self.tick_spacing) % 256
+                        new_bitmap = old_bitmap ^ (1 << bit_pos)
+                        self.tick_bitmap_cache[word_lower] = new_bitmap
+                else:
+                    # we have no clue what is going on, clear bitmap cache
+                    self.tick_bitmap_cache.pop(word_lower, None)
+
+
+                # update tick state (if prior known)
+                if tick_upper is not None:
+                    liquidity_gross_before = tick_upper.liquidity_gross
+                    liquidity_gross_after = liquidity_gross_before + amount
+                    flipped = (liquidity_gross_after == 0) != (liquidity_gross_before == 0)
+                    liquidity_net = tick_upper.liquidity_net - amount
+
+                    tick_upper = tick_upper._replace(liquidity_gross = liquidity_gross_after)
+                    tick_upper = tick_upper._replace(liquidity_net = liquidity_net)
+                    tick_upper = tick_upper._replace(initialized = True)
+                    if amount < 0 and flipped:
+                        # tick un-initialized
+                        tick_upper = tick_upper._replace(initialized = False)
+                    self.tick_cache[tick_num_upper] = tick_upper
+
+                    # flip bitmap (if prior known)
+                    if flipped and word_upper in self.tick_bitmap_cache:
+                        old_bitmap = self.tick_bitmap_cache[word_upper]
+                        bit_pos = (tick_num_upper // self.tick_spacing) % 256
+                        new_bitmap = old_bitmap ^ (1 << bit_pos)
+                        self.tick_bitmap_cache[word_upper] = new_bitmap
+                else:
+                    # we have no clue what is going on, clear bitmap cache
+                    self.tick_bitmap_cache.pop(word_upper, None)
+
                 if self.liquidity_cache is not None and event['args']['amount'] != 0:
                     if self.slot0_cache is not None:
-                        if tick_lower <= self.slot0_cache[1] < tick_upper:
+                        if tick_num_lower <= self.slot0_cache[1] < tick_num_upper:
                             if event['event'] == 'Burn':
                                 self.liquidity_cache -= event['args']['amount']
                             else:
@@ -609,6 +741,7 @@ class UniswapV3Pricer(BaseExchangePricer):
                     else:
                         # not sure what to do here bc we dont know the current tick so we don't know if we're in
                         # or out of range
+                        assert not force_load
                         self.liquidity_cache = None
 
 

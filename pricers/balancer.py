@@ -12,7 +12,7 @@ import web3.contract
 from eth_utils import event_abi_to_log_topic
 from utils import get_abi
 
-_base_balancer = web3.Web3().eth.contract(address=b'\x00'*20, abi=get_abi('balancer_v1/bpool.abi.json'))
+_base_balancer: web3.contract.Contract = web3.Web3().eth.contract(address=b'\x00'*20, abi=get_abi('balancer_v1/bpool.abi.json'))
 
 # logs that modify balance
 BIND_SELECTOR         = bytes.fromhex(_base_balancer.functions.bind(web3.Web3.toChecksumAddress(b'\x00' * 20), 0, 0).selector[2:])
@@ -88,7 +88,7 @@ class BalancerPricer(BaseExchangePricer):
     def get_balance(self, address: str, block_identifier: int) -> int:
         assert address in self.tokens
         if address not in self._balance_cache:
-            self._balance_cache = self.contract.functions.getBalance(address).call(block_identifier=block_identifier)
+            self._balance_cache[address] = self.contract.functions.getBalance(address).call(block_identifier=block_identifier)
         return self._balance_cache[address]
 
     def get_public_swap(self, block_identifier: int) -> bool:
@@ -115,8 +115,10 @@ class BalancerPricer(BaseExchangePricer):
     def swap_exact_amount_in(self, token_in: str, token_amount_in: int, token_out: str, block_identifier: int):
         # modeled based off swapExactAmountIn
         # neglects minAmountOut and maxPrice
-        assert token_in in self.tokens
-        assert token_out in self.tokens
+        _tokens = self.get_tokens(block_identifier)
+
+        assert token_in in _tokens
+        assert token_out in _tokens
 
         assert self.get_public_swap(block_identifier), 'must be publicSwap'
 
@@ -133,7 +135,6 @@ class BalancerPricer(BaseExchangePricer):
             token_weight_in,
             token_balance_out,
             token_weight_out,
-            token_amount_in,
             swap_fee,
         )
 
@@ -158,7 +159,6 @@ class BalancerPricer(BaseExchangePricer):
             token_weight_in,
             new_balance_out,
             token_weight_out,
-            token_amount_in,
             swap_fee,
         )
 
@@ -221,8 +221,8 @@ class BalancerPricer(BaseExchangePricer):
                     payload = bytes.fromhex(log['data'][136+2:])
 
                     token_address = web3.Web3.toChecksumAddress(payload[12:32])
-                    balance = int.from_bytes(payload[33:64], byteorder='big', signed=False)
-                    denorm = int.from_bytes(payload[65:96], byteorder='big', signed=False)
+                    balance = int.from_bytes(payload[32:64], byteorder='big', signed=False)
+                    denorm = int.from_bytes(payload[64:96], byteorder='big', signed=False)
 
                     self.token_denorms[token_address] = denorm
                     self._balance_cache[token_address] = balance
@@ -232,8 +232,8 @@ class BalancerPricer(BaseExchangePricer):
                     payload = bytes.fromhex(log['data'][136+2:])
 
                     token_address = web3.Web3.toChecksumAddress(payload[12:32])
-                    balance = int.from_bytes(payload[33:64], byteorder='big', signed=False)
-                    denorm = int.from_bytes(payload[65:96], byteorder='big', signed=False)
+                    balance = int.from_bytes(payload[32:64], byteorder='big', signed=False)
+                    denorm = int.from_bytes(payload[64:96], byteorder='big', signed=False)
 
                     self.token_denorms[token_address] = denorm
                     self._balance_cache[token_address] = balance
@@ -261,9 +261,6 @@ class BalancerPricer(BaseExchangePricer):
 
                     swap_fee = int.from_bytes(payload[0:32], byteorder='big', signed=False)
                     self.swap_fee = swap_fee
-
-                else:
-                    print('not sure about this log', log['topics'][0].hex())
 
 
     def set_web3(self, w3: web3.Web3):
