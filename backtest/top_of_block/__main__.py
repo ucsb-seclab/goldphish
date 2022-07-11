@@ -2,6 +2,7 @@ import argparse
 import os
 import socket
 import time
+import typing
 import web3
 import web3.types
 import web3.exceptions
@@ -17,25 +18,36 @@ from backtest.top_of_block.one_off_trace import print_trace
 from backtest.top_of_block.diagnose_failures import do_diagnose
 from backtest.top_of_block.seek_candidates import seek_candidates
 from backtest.top_of_block.verify import do_verify
+
+import backtest.top_of_block.measure_tvl
+import backtest.top_of_block.seek_candidates
+
 from utils import setup_logging
 
 l = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, choices=['verify', 'diagnose', 'connect', 'cleanup', 'trace'], help='verification mode', default=None)
+#    parser.add_argument('--mode', type=str, choices=['measure-tvl', 'verify', 'diagnose', 'connect', 'cleanup', 'trace'], help='verification mode', default=None)
     parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
     parser.add_argument('--id', type=int, default=None, help='id to trace')
+
+    subparser = parser.add_subparsers(help='subcommand', dest='subcommand')
+    
+    handlers: typing.Dict[str, typing.Callable[[web3.Web3, argparse.Namespace], None]] = {}
+
+    cmd, handler = backtest.top_of_block.seek_candidates.add_args(subparser)
+    handlers[cmd] = handler
+
+    cmd, handler = backtest.top_of_block.measure_tvl.add_args(subparser)
+    handlers[cmd] = handler
 
     args = parser.parse_args()
 
     if args.worker_name is None:
         args.worker_name = socket.gethostname()
 
-    if args.mode is not None:
-        job_name = 'top_block_' + args.mode
-    else:
-        job_name = 'top_block_candidates'
+    job_name = 'top_block_' + args.subcommand
     setup_logging(job_name, suppress=['shooter.deploy'], worker_name = args.worker_name)
 
     l.info('Booting up...')
@@ -60,6 +72,8 @@ def main():
 
     l.debug(f'Connected to web3, chainId={w3.eth.chain_id}')
 
+    handlers[args.subcommand](w3, args)
+    exit(1)
 
     try:
         if args.mode == 'verify':
@@ -75,6 +89,8 @@ def main():
             do_find_arb_termination(w3)
         elif args.mode == 'cleanup':
             do_cleanup()
+        elif args.mode == 'measure-tvl':
+            pass
         else:
             assert args.mode is None
             seek_candidates(w3, job_name, args.worker_name)

@@ -6,7 +6,7 @@ import time
 import typing
 import logging
 
-ENABLED = False
+ENABLED = True
 PRINT_INTERVAL_SECONDS = 2 * 60
 
 _global_profile: typing.Dict[str, float] = {}
@@ -24,15 +24,23 @@ def maybe_log():
     if not ENABLED:
         return
 
-    if time.time() < _last_log + PRINT_INTERVAL_SECONDS:
+    now = time.time()
+
+    if now < _last_log + PRINT_INTERVAL_SECONDS:
         # too soon
         return
     
     for k in sorted(_global_profile.keys()):
-        l.debug(f'profile name="{k}" seconds={_global_profile[k]}')
+        if _last_log > 0:
+            # we can compute percentage of time elapsed
+            elapsed = now - _last_log
+            percentage = _global_profile[k] / elapsed * 100
+            l.debug(f'profile name="{k}" seconds={_global_profile[k]} percent={percentage:.2f}%')
+        else:
+            l.debug(f'profile name="{k}" seconds={_global_profile[k]}')
         _global_profile[k] = 0
 
-    _last_log = time.time()
+    _last_log = now
 
 
 def get_measurement(name: str) -> typing.Optional[float]:

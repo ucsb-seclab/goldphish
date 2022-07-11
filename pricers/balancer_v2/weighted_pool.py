@@ -1,14 +1,16 @@
+import decimal
 import web3
 import web3.types
 import web3.contract
 import typing
 import logging
 from eth_utils import event_abi_to_log_topic
+from pricers.block_observation_result import BlockObservationResult
 
 from utils import get_abi
 
 from pricers.base import BaseExchangePricer
-from pricers.balancer_v2.common import POOL_BALANCE_CHANGED_TOPIC, POOL_REGISTERED_TOPIC, SWAP_TOPIC, TOKENS_DEREGISTERED_TOPIC, TOKENS_REGISTERED_TOPIC, PoolSpecialization, _vault, complement, div_down, div_up, downscale_down, get_pool_specialization, mul_down, mul_up, pow_up, pow_up_legacy, upscale
+from pricers.balancer_v2.common import ONE, POOL_BALANCE_CHANGED_TOPIC, POOL_REGISTERED_TOPIC, SWAP_TOPIC, TOKENS_DEREGISTERED_TOPIC, TOKENS_REGISTERED_TOPIC, _vault, complement, div_down, div_up, downscale_down, mul_down, mul_up, pow_up, pow_up_legacy, upscale
 
 
 l = logging.getLogger(__name__)
@@ -29,15 +31,18 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
     tokens: typing.Optional[typing.Set[str]]
     token_weights: typing.Dict[str, int]
 
-    def __init__(self, w3: web3.Web3, vault: web3.contract.Contract, address: str) -> None:
+    def __init__(self, w3: web3.Web3, vault: web3.contract.Contract, address: str, pool_id: typing.Optional[bytes] = None) -> None:
         self.address = address
         self.vault = vault
         self.w3 = w3
         self.contract: web3.contract.Contract = w3.eth.contract(
             address = address,
-            abi = get_abi('balancer_v2/WeightedPool.json'),
+            abi = get_abi('balancer_v2/LiquidityBootstrappingPool.json'),
         )
-        self.pool_id = self.contract.functions.getPoolId().call()
+        if pool_id is None:
+            self.pool_id = self.contract.functions.getPoolId().call()
+        else:
+            self.pool_id = pool_id
 
         self._balance_cache = {}
 
@@ -51,6 +56,9 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
             self.token_weights[w3.toChecksumAddress(t)] = w
 
         self.swap_fee = None
+
+    def get_tokens(self, _) -> typing.Set[str]:
+        return self.tokens
 
     def get_swap_fee(self, block_identifier: int) -> int:
         if self.swap_fee is None:
@@ -67,19 +75,15 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
                 assert isinstance(b, int)
                 self._balance_cache[t] = b
 
-        return self._balance_cache[address]
-
+        return self._balance_cache[address]            
 
     MAX_IN_RATIO = 3 * 10 ** 17 # 0.3e18
 
-    def swap_exact_amount_in(self, token_in: str, token_amount_in: int, token_out: str, block_identifier: int):
+    def swap_exact_amount_in(self, token_in: str, token_amount_in: int, token_out: str, block_identifier: int, **_):
         assert token_in in self.tokens
         assert token_out in self.tokens
 
         swap_fee = self.get_swap_fee(block_identifier)
-        assert swap_fee == self.contract.functions.getSwapFeePercentage().call(block_identifier=block_identifier)
-        # assert swap_fee == self.contract.functions.getSwapFeePercentage().call(block_identifier=block_identifier + 1)
-        # assert swap_fee == self.contract.functions.getSwapFeePercentage().call(block_identifier=block_identifier - 1)
 
         print('token_in before fee', token_amount_in)
         print('swap_fee', swap_fee)
@@ -122,12 +126,31 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
         
         return downscale_down(self.w3, token_out, ret)
 
-    def observe_block(self, logs: typing.List[web3.types.LogReceipt]):
+    def get_value_locked(self, token_address: str, block_identifier: int) -> int:
+        assert token_address in self.get_tokens(block_identifier)
+
+        return self.get_balance(token_address, block_identifier)
+
+    def get_token_weight(self, token_address: str, _: int) -> decimal.Decimal:
+        norm = self.token_weights[token_address]
+
+        return decimal.Decimal(norm) / decimal.Decimal(ONE)
+
+    def observe_block(self, logs: typing.List[web3.types.LogReceipt]) -> BlockObservationResult:
+        tokens_modified = set()
+
         for log in logs:
 
-            if log['address'] == self.address and log['topics'][0] == SWAP_FEE_CHANGED_TOPIC:
-                parsed = self.contract.events.SwapFeePercentageChanged().processLog(log)
-                self.swap_fee = parsed['args']['swapFeePercentage']
+            if log['address'] == self.address:
+                if log['topics'][0] == SWAP_FEE_CHANGED_TOPIC:
+                    parsed = self.contract.events.SwapFeePercentageChanged().processLog(log)
+                    self.swap_fee = parsed['args']['swapFeePercentage']
+
+                    # all exchange rates just updated
+                    # tokens are immutable past initialization (WeightedPool + LiquditiyBootstrappingPool)
+                    # so we can mark them all as updated
+                    tokens = self.get_tokens(log['blockNumber'])
+                    tokens_modified.update(tokens)
 
             if log['address'] == self.vault.address:
                 if log['topics'][0] == SWAP_TOPIC and log['topics'][1] == self.pool_id:
@@ -145,6 +168,9 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
                         assert amount_out <= old_bal
                         self._balance_cache[token_out] = old_bal - amount_out
 
+                    tokens_modified.add(token_in)
+                    tokens_modified.add(token_out)
+
                 elif log['topics'][0] == POOL_REGISTERED_TOPIC and log['topics'][1] == self.pool_id:
                     parsed = _vault.events.PoolRegistered().processLog(log)
                     assert parsed['args']['poolAddress'] == self.address
@@ -161,14 +187,7 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
                         self._balance_cache[t] = 0
 
                 elif log['topics'][0] == TOKENS_DEREGISTERED_TOPIC and log['topics'][1] == self.pool_id:
-                    raise NotImplementedError('deregister')
-                    parsed = _vault.events.TokensDeregistered().processLog(log)
-                    
-                    if self.tokens is not None:
-                        self.tokens.difference_update(parsed['args']['tokens'])
-
-                    for t in parsed['args']['tokens']:
-                        self._balance_cache.pop(t, None)
+                    raise NotImplementedError('deregister is disallowed, afaik')
 
                 elif log['topics'][0] == POOL_BALANCE_CHANGED_TOPIC and log['topics'][1] == self.pool_id:
                     parsed = _vault.events.PoolBalanceChanged().processLog(log)
@@ -179,3 +198,20 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
 
                         if t in self._balance_cache:
                             self._balance_cache[t] += b_delta
+
+                    tokens_modified.update(parsed['args']['tokens'])
+
+        updated_pairs = []
+        if len(tokens_modified) > 0:
+            block_number = logs[0]['blockNumber']
+            tokens = self.get_tokens(block_number)
+            for t1 in tokens_modified:
+                for t2 in tokens:
+                    if bytes.fromhex(t1[2:]) < bytes.fromhex(t2[2:]):
+                        updated_pairs.append((t1, t2))
+
+        return BlockObservationResult(
+            pair_prices_updated = updated_pairs,
+            swap_enabled = None,
+            gradual_weight_adjusting_scheduled = None,
+        )

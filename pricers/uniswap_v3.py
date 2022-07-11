@@ -1,8 +1,10 @@
+import decimal
 import typing
 import web3
 import web3.contract
 import web3.types
 from eth_utils import event_abi_to_log_topic
+from pricers.block_observation_result import BlockObservationResult
 from utils import get_abi, profile
 import logging
 
@@ -50,6 +52,8 @@ class NotEnoughLiqudityException(Exception):
 
 
 class UniswapV3Pricer(BaseExchangePricer):
+    RELEVANT_LOGS = [UNIV3_SWAP_EVENT_TOPIC, UNIV3_BURN_EVENT_TOPIC, UNIV3_MINT_EVENT_TOPIC]
+
     MIN_TICK = -887272
     MAX_TICK = 887272
     MIN_SQRT_RATIO = 4295128739
@@ -85,6 +89,9 @@ class UniswapV3Pricer(BaseExchangePricer):
         }[fee]
         self.set_web3(w3)
 
+    def get_tokens(self, _) -> typing.Set[str]:
+        return set([self.token0, self.token1])
+
     def get_slot0(self, block_identifier, use_cache = True) -> typing.Tuple[int, int]:
         if use_cache == False or self.slot0_cache is None:
             with profile('uniswap_v3_fetch'):
@@ -104,19 +111,12 @@ class UniswapV3Pricer(BaseExchangePricer):
             self.liquidity_cache = got
         return self.liquidity_cache
 
-    def quote_token0_to_token1(self, amount0, block_identifier) -> int:
-        sqrtPricex96, _ = self.get_slot0(block_identifier)
-        assert isinstance(sqrtPricex96, int)
-        assert isinstance(amount0, int)
-        ratiox192 = sqrtPricex96 ** 2
-        return ((ratiox192 * amount0 // (1 << 192)) * ((10 ** 6) - self.fee)) // (10 ** 6)
-
-    def quote_token1_to_token0(self, amount1, block_identifier) -> int:
-        sqrtPricex96, _ = self.get_slot0(block_identifier)
-        assert isinstance(sqrtPricex96, int)
-        assert isinstance(amount1, int)
-        ratiox192 = sqrtPricex96 ** 2
-        return (1 << 192) * (amount1) // ratiox192 * ((10 ** 6) - self.fee) // (10 ** 6)
+    def token_out_for_exact_in(self, token_in: str, token_out: str, amount_in: int, block_identifier: int) -> int:
+        if token_in == self.token0 and token_out == self.token1:
+            return self.exact_token0_to_token1(amount_in, block_identifier)
+        elif token_in == self.token1 and token_out == self.token0:
+            return self.exact_token1_to_token0(amount_in, block_identifier)
+        raise NotImplementedError()
 
     def exact_token0_to_token1(self, token0_in: int, block_identifier) -> int:
         assert token0_in >= 0
@@ -622,6 +622,20 @@ class UniswapV3Pricer(BaseExchangePricer):
 
         return (ratio >> 32) + to_add
 
+    def get_value_locked(self, token_address: str, block_identifier: int) -> int:
+        assert token_address in self.get_tokens(block_identifier)
+
+        # TVL isn't kept natively, need to query out for it
+        erc20: web3.contract.Contract = self.w3.eth.contract(
+            address = token_address,
+            abi = get_abi('erc20.abi.json'),
+        )
+        bal = erc20.functions.balanceOf(self.address).call(block_identifier=block_identifier)
+        return bal
+
+    def get_token_weight(self, token_address: str, block_identifier: int) -> decimal.Decimal:
+        return decimal.Decimal('0.5')
+
     def observe_block(self, receipts: typing.List[web3.types.LogReceipt], force_load = False):
         """
         Observe the logs emitted in a block and update internal state appropriately.
@@ -632,14 +646,19 @@ class UniswapV3Pricer(BaseExchangePricer):
         if len(receipts) == 0:
             return
 
-        assert self.address == receipts[0]['address']
 
         block_num = receipts[0]['blockNumber']
         assert self.last_block_observed is None or self.last_block_observed < block_num
         self.last_block_observed = block_num
 
-        # if any of the logs are a burn or mint, dump the liquidity cache
+        received_log = False
+
+        # if any of the logs are a burn or mint, rebuild the liquidity cache
         for log in receipts:
+            if log['address'] != self.address:
+                continue
+
+            received_log = True
 
             if len(log['topics']) > 0 and log['topics'][0] == UNIV3_SWAP_EVENT_TOPIC:
                 swap = self.contract.events.Swap().processLog(log)
@@ -743,6 +762,12 @@ class UniswapV3Pricer(BaseExchangePricer):
                         # or out of range
                         assert not force_load
                         self.liquidity_cache = None
+
+        return BlockObservationResult(
+            pair_prices_updated = [] if not received_log else [(self.token0, self.token1)],
+            swap_enabled = None,
+            gradual_weight_adjusting_scheduled = None,
+        )
 
 
     def set_web3(self, w3: web3.Web3):

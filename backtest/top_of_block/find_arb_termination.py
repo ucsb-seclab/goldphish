@@ -3,7 +3,8 @@ find_arb_termination.py
 
 Finds out when each arbitrage opportunity closed, and why.
 """
-from backtest.top_of_block.common import connect_db, load_pool
+from backtest.utils import connect_db
+from backtest.top_of_block.common import load_pool
 from backtest.top_of_block.seek_candidates import get_relevant_logs
 import psycopg2.extensions
 import typing

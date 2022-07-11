@@ -1,3 +1,5 @@
+import datetime
+import itertools
 import os
 import random
 import psycopg2
@@ -13,6 +15,7 @@ import web3.exceptions
 import web3.types
 import backoff
 import find_circuit
+from pricers.pricer_pool import PricerPool
 import shooter
 import pricers
 
@@ -267,55 +270,121 @@ class WrappedFoundArbitrage:
         return self.fa.tokens
 
 
-def load_pool(w3: web3.Web3) -> pricers.PricerPool:
-    l.debug('starting load of exchange graph')
+def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor) -> PricerPool:
+    #
+    # load known pricer pool
+    #
+    pool = PricerPool(w3)
+
+    # count total number of exchanges we need to load
+    curr.execute(
+        '''
+        SELECT
+            (SELECT COUNT(*) FROM uniswap_v2_exchanges) + 
+            (SELECT COUNT(*) FROM uniswap_v3_exchanges) + 
+            (SELECT COUNT(*) FROM sushiv2_swap_exchanges) + 
+            (SELECT COUNT(*) FROM balancer_exchanges) + 
+            (SELECT COUNT(*) FROM balancer_v2_exchanges)
+        '''
+    )
+    (n_exchanges,) = curr.fetchone()
+
+    l.debug(f'Loading a total of {n_exchanges:,} exchanges into pricer pool')
+
+    # a quick-and-dirty progress reporter
     t_start = time.time()
-    univ2_fname = os.path.abspath(os.path.dirname(__file__) + '/../univ2_excs.csv.gz')
-    assert os.path.isfile(univ2_fname), f'should have file {univ2_fname}'
-    univ3_fname = os.path.abspath(os.path.dirname(__file__) + '/../univ3_excs.csv.gz')
-    assert os.path.isfile(univ3_fname)
+    last_report = t_start
+    n_loaded = 0
+    def report_progress():
+        nonlocal last_report
+        if n_loaded % 4 != 0:
+            return
+        now = time.time()
+        if now - last_report >= 10:
+            last_report = now
+            elapsed = now - t_start
+            nps = n_loaded / elapsed
+            remain = n_exchanges - n_loaded
+            eta_sec = remain / nps
+            eta = datetime.timedelta(seconds=eta_sec)
+            l.info(f'Loaded {n_loaded:,} of {n_exchanges:,} ({n_loaded / n_exchanges * 100:.2f}%) ETA {eta}')
 
-    ret = pricers.PricerPool(w3)
+    l.debug('Loading uniswap v2 ...')
 
-    n_ignored = 0
-    with open(FNAME_EXCHANGES_WITH_BALANCES) as fin:
-        for line in fin:
-            if line.startswith('2'):
-                _, address, origin_block, token0, token1, bal0, bal1 = line.strip().split(',')
+    curr.execute(
+        '''
+        SELECT uv2.address, uv2.origin_block, t0.address, t1.address
+        FROM uniswap_v2_exchanges uv2
+        JOIN tokens t0 ON uv2.token0_id = t0.id
+        JOIN tokens t1 ON uv2.token1_id = t1.id
+        '''
+    )
+    for n_loaded, (address, origin_block, token0, token1) in zip(itertools.count(n_loaded), curr):
+        address = w3.toChecksumAddress(address.tobytes())
+        token0 = w3.toChecksumAddress(token0.tobytes())
+        token1 = w3.toChecksumAddress(token1.tobytes())
+        pool.add_uniswap_v2(address, token0, token1, origin_block)
+        report_progress()
 
-                origin_block = int(origin_block)
-                bal0 = int(bal0)
-                bal1 = int(bal1)
-                if token0 in THRESHOLDS:
-                    if bal0 < THRESHOLDS[token0]:
-                        n_ignored += 1
-                        continue
-                if token1 in THRESHOLDS:
-                    if bal1 < THRESHOLDS[token1]:
-                        n_ignored += 1
-                        continue
-                ret.add_uniswap_v2(address, token0, token1, origin_block)
-            else:
-                assert line.startswith('3')
+    l.debug(f'Loading uniswap v3 ...')
 
-                _, address, origin_block, token0, token1, fee, bal0, bal1 = line.strip().split(',')
-                fee = int(fee)
+    curr.execute(
+        '''
+        SELECT uv3.address, uv3.origin_block, uv3.originalfee, t0.address, t1.address
+        FROM uniswap_v3_exchanges uv3
+        JOIN tokens t0 ON uv3.token0_id = t0.id
+        JOIN tokens t1 ON uv3.token1_id = t1.id
+        '''
+    )
+    for n_loaded, (address, origin_block, fee, token0, token1) in zip(itertools.count(n_loaded), curr):
+        address = w3.toChecksumAddress(address.tobytes())
+        token0 = w3.toChecksumAddress(token0.tobytes())
+        token1 = w3.toChecksumAddress(token1.tobytes())
+        pool.add_uniswap_v3(address, token0, token1, fee, origin_block)
+        report_progress()
 
-                origin_block = int(origin_block)
-                bal0 = int(bal0)
-                bal1 = int(bal1)
-                if token0 in THRESHOLDS:
-                    if bal0 < THRESHOLDS[token0]:
-                        n_ignored += 1
-                        continue
-                if token1 in THRESHOLDS:
-                    if bal1 < THRESHOLDS[token1]:
-                        n_ignored += 1
-                        continue
-                ret.add_uniswap_v3(address, token0, token1, fee, origin_block)
+    l.debug('Loading sushiswap v2 ...')
 
-    l.debug(f'Kept {ret.exchange_count:,} and ignored {n_ignored:,} exchanges below threshold ({n_ignored / (n_ignored + ret.exchange_count) * 100:.2f}%)')
+    curr.execute(
+        '''
+        SELECT sv2.address, sv2.origin_block, t0.address, t1.address
+        FROM sushiv2_swap_exchanges sv2
+        JOIN tokens t0 ON sv2.token0_id = t0.id
+        JOIN tokens t1 ON sv2.token1_id = t1.id
+        '''
+    )
+    for n_loaded, (address, origin_block, token0, token1) in zip(itertools.count(n_loaded), curr):
+        address = w3.toChecksumAddress(address.tobytes())
+        token0 = w3.toChecksumAddress(token0.tobytes())
+        token1 = w3.toChecksumAddress(token1.tobytes())
+        pool.add_sushiswap_v2(address, token0, token1, origin_block)
+        report_progress()
 
-    t_end = time.time()
-    l.debug(f'Took {t_end - t_start:.2f} seconds to load into pricing pool')
-    return ret
+    curr.execute(
+        '''
+        SELECT address, origin_block
+        FROM balancer_exchanges
+        '''
+    )
+    for n_loaded, (address, origin_block) in zip(itertools.count(n_loaded), curr):
+        address = w3.toChecksumAddress(address.tobytes())
+        pool.add_balancer_v1(address, origin_block)
+
+    curr.execute(
+        '''
+        SELECT address, pool_id, pool_type, origin_block
+        FROM balancer_v2_exchanges
+        WHERE pool_type = 'WeightedPool2Tokens' OR
+              pool_type = 'WeightedPool' OR
+              pool_type = 'LiquidityBootstrappingPool' OR
+              pool_type = 'NoProtocolFeeLiquidityBootstrappingPool'
+        '''
+    )
+    for n_loaded, (address, pool_id, pool_type, origin_block) in zip(itertools.count(n_loaded), curr):
+        address = w3.toChecksumAddress(address.tobytes())
+        pool_id = pool_id.tobytes()
+        pool.add_balancer_v2(address, pool_id, pool_type, origin_block)
+
+    l.debug('pool loaded')
+
+    return pool

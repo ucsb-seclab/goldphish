@@ -12,7 +12,6 @@ def out_from_transfer(address: str, amount: int) -> int:
     Get the amount actually sent to the recipient if transfer(.., amount) is called.
     """
     if address in [SAITAMA_TOKEN, SANSHU_INU_TOKEN]:
-        print('adjusting....')
         t_fee = amount // 100 * 2
         return amount - t_fee
     return amount

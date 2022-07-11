@@ -1,7 +1,8 @@
 import typing
 import psycopg2
 import psycopg2.extensions
-from backtest.top_of_block.common import TraceMode, connect_db, load_exchanges, shoot
+from backtest.utils import connect_db
+from backtest.top_of_block.common import TraceMode, load_exchanges, shoot
 import find_circuit
 import pricers
 import web3

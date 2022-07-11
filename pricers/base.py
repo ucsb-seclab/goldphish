@@ -1,53 +1,33 @@
 """
 Interface for exchange pricers.
 """
+import decimal
 import web3
 import web3.types
 import typing
 
+from pricers.block_observation_result import BlockObservationResult
+
 class BaseExchangePricer:
     w3: web3.Web3
-    token0: str
-    token1: str
     address: str
 
     def __init__(self, w3: web3.Web3) -> None:
         self.w3 = w3
 
-    def quote_token0_to_token1(self, token0_amount, block_identifier: int) -> int:
-        """
-        Quickly use spot price to quote token transfer amount.
-        Returned value is an over-estimate.
-        """
-        raise NotImplementedError()
-    
-    def quote_token1_to_token0(self, token1_amount, block_identifier: int) -> int:
-        """
-        Quickly use spot price to quote token transfer amount.
-        Returned value is an over-estimate.
-        """
+    def get_tokens(self, block_identifier: int) -> typing.Set[str]:
         raise NotImplementedError()
 
-    def exact_token0_to_token1(self, token0_amount, block_identifier: int) -> int:
-        """
-        Convert exact token0 to exact token1. SLOW.
-        """
-        raise NotImplementedError()
-    
-    def exact_token1_to_token0(self, token1_amount, block_identifier: int) -> int:
-        """
-        Convert exact token1 to exact token0. SLOW.
-        """
+    def get_value_locked(self, token_address: str, block_identifier: int) -> int:
         raise NotImplementedError()
 
-    def token1_out_to_exact_token0_in(self, token1_amount_out, block_identifier: int) -> int:
+    def get_token_weight(self, token_address: str, block_identifier: int) -> decimal.Decimal:
         raise NotImplementedError()
 
-    def token0_out_to_exact_token1_in(self, token0_amount_out, block_identifier: int) -> int:
+    def token_out_for_exact_in(self, token_in: str, token_out: str, amount_in: int, block_identifier: int) -> int:
         raise NotImplementedError()
 
-
-    def observe_block(self, logs: typing.List[web3.types.LogReceipt]):
+    def observe_block(self, logs: typing.List[web3.types.LogReceipt]) -> BlockObservationResult:
         pass
 
     def set_web3(self, w3: web3.Web3):

@@ -4,13 +4,20 @@ Pricer based on original Balancer
 SEE: https://github.com/balancer-labs/balancer-core/blob/master/contracts/BPool.sol
 """
 
+import decimal
 import typing
+
+from pricers.block_observation_result import BlockObservationResult
+from pricers.uniswap_v3 import NotEnoughLiqudityException
 from .base import BaseExchangePricer
 import web3
 import web3.types
 import web3.contract
 from eth_utils import event_abi_to_log_topic
 from utils import get_abi
+import logging
+
+l = logging.getLogger(__name__)
 
 _base_balancer: web3.contract.Contract = web3.Web3().eth.contract(address=b'\x00'*20, abi=get_abi('balancer_v1/bpool.abi.json'))
 
@@ -36,14 +43,25 @@ LOG_JOIN_TOPIC = event_abi_to_log_topic(_base_balancer.events.LOG_JOIN().abi)
 LOG_EXIT_TOPIC = event_abi_to_log_topic(_base_balancer.events.LOG_EXIT().abi)
 LOG_SWAP_TOPIC = event_abi_to_log_topic(_base_balancer.events.LOG_SWAP().abi)
 
-
 class NotFinalizedException(Exception):
 
     def __init__(self, *args: object) -> None:
         super().__init__(*args)
 
 
+class TooLittleInput(Exception):
+
+    def __init__(self, *args) -> None:
+        super().__init__(*args)
+
+
 class BalancerPricer(BaseExchangePricer):
+    RELEVANT_LOGS = [
+                        BIND_TOPIC, UNBIND_TOPIC, REBIND_TOPIC, \
+                        GULP_TOPIC, FINALIZE_TOPIC, PUBLIC_SWAP_TOPIC, SET_SWAP_FEE_TOPIC, \
+                        LOG_JOIN_TOPIC, LOG_EXIT_TOPIC, LOG_SWAP_TOPIC, \
+                    ]
+
     w3: web3.Web3
     finalized: typing.Optional[bool]
     tokens: typing.Optional[typing.Set[str]]
@@ -70,7 +88,6 @@ class BalancerPricer(BaseExchangePricer):
         self.token_denorms = {}
         self._balance_cache = {}
         self._public_swap = None
-
 
     def get_tokens(self, block_identifier: int) -> typing.Set[str]:
         if self.tokens is None:
@@ -112,7 +129,10 @@ class BalancerPricer(BaseExchangePricer):
             self.token_denorms[address] = denorm
         return self.token_denorms[address]
 
-    def swap_exact_amount_in(self, token_in: str, token_amount_in: int, token_out: str, block_identifier: int):
+    def token_out_for_exact_in(self, token_in: str, token_out: str, token_amount_in: int, block_identifier: int):
+        if self.address == '0x69d460e01070A7BA1bc363885bC8F4F0daa19Bf5':
+            l.debug(f'{self.address}: testing {token_in} -> {token_out} for {token_amount_in}')
+
         # modeled based off swapExactAmountIn
         # neglects minAmountOut and maxPrice
         _tokens = self.get_tokens(block_identifier)
@@ -127,6 +147,10 @@ class BalancerPricer(BaseExchangePricer):
 
         token_balance_in  = self.get_balance(token_in, block_identifier)
         token_balance_out = self.get_balance(token_out, block_identifier)
+
+        max_in = BalancerPricer.bmul(token_balance_in, MAX_IN_RATIO)
+        if token_amount_in > max_in:
+            raise NotEnoughLiqudityException(None, None, remaining=token_amount_in - max_in)
 
         swap_fee = self.get_swap_fee(block_identifier)
 
@@ -143,11 +167,15 @@ class BalancerPricer(BaseExchangePricer):
         weight_ratio = BalancerPricer.bdiv(token_weight_in, token_weight_out)
         adjusted_in = BalancerPricer.bsub(BalancerPricer.BONE, swap_fee)
         adjusted_in = BalancerPricer.bmul(token_amount_in, adjusted_in)
+        assert adjusted_in < token_amount_in
         y = BalancerPricer.bdiv(token_balance_in, BalancerPricer.badd(token_balance_in, adjusted_in))
         foo = BalancerPricer.bpow(y, weight_ratio) # their var name, not mine
         bar = BalancerPricer.bsub(BalancerPricer.BONE, foo)
 
+        print('bar', bar, bar / (BalancerPricer.BONE))
+
         token_amount_out = BalancerPricer.bmul(token_balance_out, bar)
+        print('token_amount_out', token_amount_out)
 
         new_balance_in  = token_balance_in + token_amount_in
         new_balance_out = token_balance_out - token_amount_out
@@ -163,11 +191,33 @@ class BalancerPricer(BaseExchangePricer):
         )
 
         assert spot_price_after >= spot_price_before
-        assert spot_price_before <= BalancerPricer.bdiv(token_amount_in, token_amount_out) # I guess just a double-check that we didn't fuck up rounding?
+
+        # if token_amount_out > 100:
+        #     # I guess just a double-check that we didn't fuck up rounding?
+        #     divd = BalancerPricer.bdiv(token_amount_in, token_amount_out)
+        #     print('spot_price_before', spot_price_before)
+        #     print('divd             ', divd)
+        #     if spot_price_before > divd:
+        #         raise TooLittleInput(self.address, block_identifier, f'BalancerV1 {self.address} ({token_in} -> {token_out}) @ {block_identifier} needs more input than {token_amount_in}')
 
         return token_amount_out
 
-    def observe_block(self, logs: typing.List[web3.types.LogReceipt]):
+    def get_value_locked(self, token_address: str, block_identifier: int) -> int:
+        assert token_address in self.get_tokens(block_identifier)
+
+        return self.get_balance(token_address, block_identifier)
+
+    def get_token_weight(self, token_address: str, block_identifier: int) -> decimal.Decimal:
+        _tot_weight = 0
+        for t in self.get_tokens(block_identifier):
+            _tot_weight += self.get_denorm_weight(t, block_identifier)
+
+        return decimal.Decimal(self.get_denorm_weight(token_address, block_identifier)) / decimal.Decimal(_tot_weight)
+
+    def observe_block(self, logs: typing.List[web3.types.LogReceipt]) -> BlockObservationResult:
+        just_finalized = False
+        tokens_modified = set()
+
         # LOG_JOIN, LOG_EXIT, LOG_SWAP
         for log in logs:
             if log['address'] == self.address and len(log['topics']) > 0:
@@ -180,6 +230,8 @@ class BalancerPricer(BaseExchangePricer):
 
                     if token in self._balance_cache:
                         self._balance_cache[token] += amount
+                    
+                    tokens_modified.add(token)
 
                 # remove liquidity
                 elif log['topics'][0] == LOG_EXIT_TOPIC:
@@ -191,6 +243,8 @@ class BalancerPricer(BaseExchangePricer):
                         old_bal = self._balance_cache[token]
                         assert old_bal >= amount, 'exiting more token than available'
                         self._balance_cache[token] = old_bal - amount
+
+                    tokens_modified.add(token)
 
                 # perform a swap
                 elif log['topics'][0] == LOG_SWAP_TOPIC:
@@ -208,14 +262,19 @@ class BalancerPricer(BaseExchangePricer):
                         assert old_bal >= amount_out, 'swapping out more token than available'
                         self._balance_cache[token_out] = old_bal - amount_out
 
+                    tokens_modified.add(token_in)
+                    tokens_modified.add(token_out)
+
                 elif log['topics'][0] == GULP_TOPIC:
                     payload = bytes.fromhex(log['data'][136+2:])
                     token_address = web3.Web3.toChecksumAddress(payload[12:32])
 
                     if token_address in self._balance_cache:
-                        # this cache is invalidated, unfortunately we don't know what balance is now active
+                        # this cache is invalidated, unfortunately we don't know what balance is now
                         # because it isnt logged
                         del self._balance_cache[token_address]
+
+                    tokens_modified.add(token_address)
 
                 elif log['topics'][0] == REBIND_TOPIC:
                     payload = bytes.fromhex(log['data'][136+2:])
@@ -227,6 +286,8 @@ class BalancerPricer(BaseExchangePricer):
                     self.token_denorms[token_address] = denorm
                     self._balance_cache[token_address] = balance
 
+                    self.tokens = None
+
                 elif log['topics'][0] == BIND_TOPIC:
                     # a token-bind event
                     payload = bytes.fromhex(log['data'][136+2:])
@@ -237,6 +298,8 @@ class BalancerPricer(BaseExchangePricer):
 
                     self.token_denorms[token_address] = denorm
                     self._balance_cache[token_address] = balance
+
+                    self.tokens = None
 
                 elif log['topics'] == PUBLIC_SWAP_TOPIC:
                     raise NotImplementedError('hmmm public swap....')
@@ -256,11 +319,44 @@ class BalancerPricer(BaseExchangePricer):
                     self.finalized = True
                     self._public_swap = True
 
+                    just_finalized = True
+
                 elif log['topics'][0] == SET_SWAP_FEE_TOPIC:
+                    assert self.finalized != True, 'Cannot update swap fee after finalization'
                     payload = bytes.fromhex(log['data'][136+2:])
 
                     swap_fee = int.from_bytes(payload[0:32], byteorder='big', signed=False)
                     self.swap_fee = swap_fee
+
+        if just_finalized:
+            block_number = logs[0]['blockNumber']
+            tokens = self.get_tokens(block_number)
+            all_pairs = []
+            for t1 in tokens:
+                for t2 in tokens:
+                    if bytes.fromhex(t1[2:]) < bytes.fromhex(t2[2:]):
+                        all_pairs.append((t1, t2))
+            assert len(all_pairs) >= 1
+            return BlockObservationResult(
+                pair_prices_updated = all_pairs,
+                swap_enabled = True,
+                gradual_weight_adjusting_scheduled = None,
+            )
+        
+        updated_pairs = []
+        if len(tokens_modified) > 0:
+            block_number = logs[0]['blockNumber']
+            tokens = self.get_tokens(block_number)
+            for t1 in tokens_modified:
+                for t2 in tokens:
+                    if bytes.fromhex(t1[2:]) < bytes.fromhex(t2[2:]):
+                        updated_pairs.append((t1, t2))
+        
+        return BlockObservationResult(
+            pair_prices_updated = updated_pairs,
+            swap_enabled = None,
+            gradual_weight_adjusting_scheduled = None,
+        )
 
 
     def set_web3(self, w3: web3.Web3):
@@ -436,3 +532,4 @@ class BalancerPricer(BaseExchangePricer):
 
         return sum_
 
+MAX_IN_RATIO = BalancerPricer.BONE // 2

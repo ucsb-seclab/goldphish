@@ -13,4 +13,4 @@ then
     PREFIX="$PREFIX-";
 fi;
 
-seq $1 $2 | parallel -j $N_VERIFIERS --ungroup taskset -c '{}' python3 -m backtest.top_of_block --mode verify --worker-name "$PREFIXverify{}"
+seq $1 $2 | parallel -j $N_VERIFIERS --ungroup python3 -m backtest.top_of_block --mode verify --worker-name "$PREFIXverify{}" > /dev/null

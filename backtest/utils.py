@@ -7,6 +7,7 @@ import psycopg2.extensions
 import tempfile
 import random
 import web3
+import pika
 import web3.types
 import logging
 from eth_utils import event_abi_to_log_topic
@@ -38,6 +39,25 @@ def funded_deployer() -> LocalAccount:
     ret: LocalAccount = Account.from_key(bytes.fromhex('0xab1179084d3336336d60b2ed654d99a21c2644cadd89fd3034ee592e931e4a77'[2:]))
     return ret
 
+
+def connect_rabbit() -> pika.BlockingConnection:
+    rabbit_host = os.getenv('RABBITMQ_HOST', 'ethereum-measurement-rabbitmq')
+    rabbit_port = int(os.getenv('RABBITMQ_PORT', '5672'))
+
+    cxn = pika.BlockingConnection(pika.ConnectionParameters(
+        host=rabbit_host,
+        port=rabbit_port,
+        credentials=pika.PlainCredentials(
+            username='guest',
+            password='guest',
+        )
+    ))
+
+    assert cxn.is_open
+
+    l.debug('connected to rabbitmq')
+
+    return cxn
 
 def connect_db() -> psycopg2.extensions.connection:
     pg_host = os.getenv('PSQL_HOST', 'ethereum-measurement-pg')

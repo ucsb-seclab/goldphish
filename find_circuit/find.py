@@ -9,19 +9,21 @@ import typing
 
 import logging
 import scipy.optimize
+from pricers.balancer import TooLittleInput
 import pricers.token_transfer
 from pricers.uniswap_v3 import NotEnoughLiqudityException
 
 import pricers.base
 from utils import WETH_ADDRESS
-from utils.profiling import profile, inc_measurement
+from utils import profiling
+from utils.profiling import profile
 
 l = logging.getLogger(__name__)
 
 class FoundArbitrage(typing.NamedTuple):
     amount_in: int
     circuit: typing.List[pricers.base.BaseExchangePricer]
-    directions: typing.List[bool]
+    directions: typing.List[typing.Tuple[str, str]]
     pivot_token: str
     profit: int
 
@@ -38,47 +40,16 @@ class FoundArbitrage(typing.NamedTuple):
 
 class PricingCircuit:
     _circuit: typing.List[pricers.base.BaseExchangePricer]
-    _directions: typing.List[bool]
+    _directions: typing.List[typing.Tuple[str, str]]
 
-    def __init__(self, _circuit: typing.List[pricers.base.BaseExchangePricer], _directions: typing.Optional[typing.List[bool]] = None) -> None:
+    def __init__(self, _circuit: typing.List[pricers.base.BaseExchangePricer], _directions: typing.List[typing.Tuple[str, str]]) -> None:
+        assert len(_circuit) == len(_directions)
         self._circuit = _circuit
-        _circuit_pairs = list(zip(_circuit, _circuit[1:] + [_circuit[0]]))
-
-        if _directions is None:
-            # assume we start zeroForOne, if that doesn't hold
-            # (this is only possible when circuit is len 3), then assume not zeroForOne
-            _directions = [True]
-            if _circuit_pairs[0][0].token1 not in [_circuit_pairs[0][1].token0, _circuit_pairs[0][1].token1]:
-                assert _circuit_pairs[0][0].token0 in [_circuit_pairs[0][1].token0, _circuit_pairs[0][1].token1]
-                _directions = [False]
-            
-            for i, (p1, p2) in list(enumerate(_circuit_pairs))[1:]:
-                prev_exc = _circuit_pairs[i - 1][0]
-                if _directions[i - 1] == True:
-                    # previous direction was zeroForOne
-                    prev_token = prev_exc.token1
-                else:
-                    prev_token = prev_exc.token0
-
-                if prev_token == p1.token0:
-                    next_token = p1.token1
-                    _directions.append(True)
-                else:
-                    next_token = p1.token0
-                    _directions.append(False)
-
-                assert next_token in [p2.token0, p2.token1]
-
         self._directions = _directions
-        assert len(self._circuit) == len(self._directions)
 
     @property
     def pivot_token(self) -> str:
-        if self._directions[0] == True:
-            # zeroForOne for first exchange; zero token is pivot
-            return self._circuit[0].token0
-        else:
-            return self._circuit[0].token1
+        return self._directions[0][0]
 
     @property
     def circuit(self) -> typing.List[pricers.base.BaseExchangePricer]:
@@ -94,19 +65,12 @@ class PricingCircuit:
         """
         last_token = self.pivot_token
         curr_amt = amount_in
-        for p, dxn in zip(self._circuit, self._directions):
-            if dxn == True:
-                # zeroForOne
-                assert last_token == p.token0
-                curr_amt = p.exact_token0_to_token1(curr_amt, block_identifier)
-                last_token = p.token1
-            else:
-                assert dxn == False
-                assert last_token == p.token1
-                curr_amt = p.exact_token1_to_token0(curr_amt, block_identifier)
-                last_token = p.token0
+        for p, (t_in, t_out) in zip(self._circuit, self._directions):
+            assert last_token == t_in
+            curr_amt = p.token_out_for_exact_in(t_in, t_out, curr_amt, block_identifier)
             curr_amt = pricers.token_transfer.out_from_transfer(last_token, curr_amt)
             assert curr_amt >= 0, 'negative token balance is not possible'
+            last_token = t_out
         assert last_token == self.pivot_token
         return curr_amt
 
@@ -123,27 +87,18 @@ class PricingCircuit:
         a -> b -> c  ==> c -> b -> a
         """
         self._circuit = list(reversed(self._circuit))
-        self._directions = list(not x for x in reversed(self._directions))
+        self._directions = list((t2, t1) for (t1, t2) in reversed(self._directions))
 
 
-def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], block_identifier: int, only_weth_pivot = False) -> typing.List[FoundArbitrage]:
-    assert len(exchanges) in [2, 3]
-
-    # for all exchange pairs, ensure they share either (1) token (if len 3) or (2) tokens (if len 2)
-    for a, b in zip(exchanges, exchanges[1:] + [exchanges[0]]):
-        excs_a = set([a.token0, a.token1])
-        excs_b = set([b.token0, b.token1])
-        if len(exchanges) == 2:
-            assert len(excs_a.intersection(excs_b)) == 2
-        else:
-            assert len(exchanges) == 3
-            assert len(excs_a.intersection(excs_b)) == 1
-
+def detect_arbitrages(
+        pc: PricingCircuit,
+        block_identifier: int,
+        only_weth_pivot = False
+    ) -> typing.List[FoundArbitrage]:
     ret = []
-    pc = PricingCircuit(exchanges)
 
     # for each rotation
-    for _ in range(len(exchanges)):
+    for _ in range(len(pc.circuit)):
         def run_exc(i):
             try:
                 return pc.sample(math.ceil(i), block_identifier) if i >= 0 else -(i + 1000) # encourage optimizer to explore toward +direction
@@ -159,7 +114,18 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
                 with profile('pricing_quick_check'):
                     quick_test_amount_in = 100
                     try:
-                        quick_test_amount_out1 = pc.sample(100, block_identifier)
+                        for quick_test_amount_in_zeros in range(2, 22):
+                            quick_test_amount_in = 10 ** quick_test_amount_in_zeros
+                            try:
+                                quick_test_amount_out1 = pc.sample(quick_test_amount_in, block_identifier)
+                                break
+                            except TooLittleInput:
+                                # try the next largest amount
+                                continue
+                        else:
+                            # exhausted quick_test_amount_in options -- probably there's no way to pump enough liquidity
+                            # to this exchange just yet
+                            continue
                     except NotEnoughLiqudityException:
                         # not profitable most likely
                         continue
@@ -170,8 +136,8 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
                         # this may be profitable
 
                         # search for crossing-point where liquidity does not run out
-                        lower_bound = 100
-                        upper_bound = (1_000 * (10 ** 18)) # a shit-ton
+                        lower_bound = quick_test_amount_in
+                        upper_bound = (100_000 * (10 ** 18)) # a shit-ton of ether
                         try:
                             pc.sample(upper_bound, block_identifier)
                         except NotEnoughLiqudityException:
@@ -189,14 +155,15 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
                             upper_bound = search_lower
 
 
-                        result = scipy.optimize.minimize_scalar(
-                            fun = lambda x: - (run_exc(x) - x),
-                            bounds = (
-                                lower_bound, # only a little
-                                upper_bound, # a shit-ton
-                            ),
-                            method='bounded'
-                        )
+                        with profiling.profile('minimize_scalar'):
+                            result = scipy.optimize.minimize_scalar(
+                                fun = lambda x: - (run_exc(x) - x),
+                                bounds = (
+                                    lower_bound, # only a little
+                                    upper_bound, # a shit-ton
+                                ),
+                                method='bounded',
+                            )
 
 
                         if result.fun < 0:
@@ -205,17 +172,11 @@ def detect_arbitrages(exchanges: typing.List[pricers.base.BaseExchangePricer], b
 
                             # if reducing input by 1 wei results in the same amount out, then use that value (rounding gets fucky)
                             for i in itertools.count(1):
-                                if pc.directions[0] == True:
-                                    assert pc.circuit[0].token0 == WETH_ADDRESS
-                                    out_normal = pc.circuit[0].exact_token0_to_token1(amount_in, block_identifier=block_identifier)
-                                    out_reduced_by_1 = pc.circuit[0].exact_token0_to_token1(amount_in - 1, block_identifier=block_identifier)
-                                else:
-                                    assert pc.circuit[0].token1 == WETH_ADDRESS
-                                    out_normal = pc.circuit[0].exact_token1_to_token0(amount_in, block_identifier=block_identifier)
-                                    out_reduced_by_1 = pc.circuit[0].exact_token1_to_token0(amount_in - 1, block_identifier=block_identifier)
-                                
+                                token_in, token_out = pc.directions[0]
+                                out_normal = pc.circuit[0].token_out_for_exact_in(token_in, token_out, amount_in, block_identifier=block_identifier)
+                                out_reduced_by_1 = pc.circuit[0].token_out_for_exact_in(token_in, token_out, amount_in - 1, block_identifier=block_identifier)
+
                                 if out_normal == out_reduced_by_1:
-                                    l.debug(f'Reducing input amount by {i} wei for rounding reasons')
                                     amount_in -= 1
                                     expected_profit += 1
                                 else:

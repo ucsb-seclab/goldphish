@@ -25,6 +25,8 @@ TETHER_ADDRESS = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
 USDC_ADDRESS = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
 UNI_ADDRESS = '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984'
 WBTC_ADDRESS = '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599'
+BALANCER_VAULT_ADDRESS = '0xBA12222222228d8Ba445958a75a0704d566BF2C8'
+
 
 _abi_cache = {}
 
@@ -54,10 +56,13 @@ class ColoredFormatter(logging.Formatter):
         return formatter.format(record)
 
 
-def setup_logging(job_name = None, suppress: typing.List[str] = [], worker_name: typing.Optional[str] = None, root_dir = None):
+def setup_logging(job_name = None, suppress: typing.List[str] = [], worker_name: typing.Optional[str] = None, root_dir = None, stdout_level = None):
     if root_dir is None:
         root_dir = '/mnt/goldphish'
-    
+
+    if stdout_level is None:
+        stdout_level = logging.DEBUG
+
     logdir = os.path.join(root_dir, 'logs')
     if not os.path.isdir(logdir):
         os.mkdir(logdir)
@@ -73,6 +78,7 @@ def setup_logging(job_name = None, suppress: typing.List[str] = [], worker_name:
     root_logger = logging.getLogger()
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(ColoredFormatter())
+    sh.setLevel(stdout_level)
     fh = logging.handlers.WatchedFileHandler(
         fname
     )
@@ -84,7 +90,7 @@ def setup_logging(job_name = None, suppress: typing.List[str] = [], worker_name:
 
     # silence some annoying logs from subsystems
     for lname in ['websockets.protocol', 'web3.providers.WebsocketProvider',
-                  'web3.RequestManager', 'websockets.server', 'asyncio'] + suppress:
+                  'web3.RequestManager', 'websockets.server', 'asyncio', 'pika'] + suppress:
         logging.getLogger(lname).setLevel(logging.WARNING)
 
 
@@ -297,8 +303,21 @@ def get_block_logs(w3: web3.Web3, block_identifier: int) -> typing.List[web3.typ
     logs = []
     for txn in block['transactions']:
         receipt = w3.eth.get_transaction_receipt(txn)
-        logs = logs + receipt['logs']
+        logs.extend(receipt['logs'])
     return logs
+
+
+_block_timestamp_cache: typing.Dict[int, int] = {}
+def get_block_timestamp(w3: web3.Web3, block_number: int) -> int:
+    got = _block_timestamp_cache.get(block_number, None)
+    
+    if got is not None:
+        return got
+    
+    # need to load
+    ts = w3.eth.get_block(block_number)['timestamp']
+    _block_timestamp_cache[block_number] = ts
+    return ts
 
 
 # taken from https://gist.github.com/thatalextaylor/7408395 on Jan 12th 2022

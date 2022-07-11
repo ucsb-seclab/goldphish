@@ -3,30 +3,28 @@ find_circuit/monitor.py
 
 Monitors arbitrage opportunities over time.
 """
-import collections
 import typing
 import pricers
 import logging
-import web3
-import time
-import web3.types
 
-from utils.profiling import inc_measurement
-from .find import detect_arbitrages, FoundArbitrage
+from .find import PricingCircuit, detect_arbitrages, FoundArbitrage
 
-from utils import WETH_ADDRESS, profile
+from utils import WETH_ADDRESS
 
 l = logging.getLogger(__name__)
 
 
-def profitable_circuits(modified_exchanges_last_block: typing.Set[str], pool: pricers.PricerPool, block_number: int, only_weth_pivot = False) -> typing.Iterator[FoundArbitrage]:
+def profitable_circuits(
+        modified_pairs_last_block: typing.Dict[typing.Tuple[str, str], typing.List[str]],
+        pool: pricers.PricerPool,
+        block_number: int,
+        only_weth_pivot = False,
+    ) -> typing.Iterator[FoundArbitrage]:
+
     found_circuits: typing.Dict[typing.Any, FoundArbitrage] = {}
-    for circuit in propose_circuits(modified_exchanges_last_block, pool, block_number):
-        if any(not pool.is_uniswap_v2(x) for x in circuit):
-            # l.debug(f'testing ' + str(circuit))
-            # there MUST be a uniswap v3 in here to consider it
-            circuit_pricers = [pool.get_pricer_for(a) for a in circuit]
-            for fa in detect_arbitrages(circuit_pricers, block_number, only_weth_pivot = only_weth_pivot):
+    for circuit in propose_circuits(modified_pairs_last_block, pool, block_number):
+            for fa in detect_arbitrages(circuit, block_number, only_weth_pivot = only_weth_pivot):
+                fa: FoundArbitrage
                 key = tuple(sorted(p.address for p in fa.circuit))
                 if key in found_circuits:
                     if found_circuits[key].profit < fa.profit:
@@ -36,35 +34,25 @@ def profitable_circuits(modified_exchanges_last_block: typing.Set[str], pool: pr
     yield from found_circuits.values()
 
 
-def propose_circuits(modified_exchanges_last_block: typing.Set[str], pool: pricers.PricerPool, block_number: int) -> typing.Iterator[typing.List[str]]:
+def propose_circuits(
+        modified_pairs_last_block: typing.Dict[typing.Tuple[str, str], typing.List[str]],
+        pool: pricers.PricerPool,
+        block_number: int
+    ) -> typing.Iterator[PricingCircuit]:
     """
     Proposes arbitrage circuits to test for profitability.
 
-    Uses DFS to find WETH-containing cycles.
     """
-    elapsed = 0.0
-    for m in modified_exchanges_last_block:
-        start = time.time()
-        it = _propose_circuits_exchange(m, pool, block_number)
-        elapsed += time.time() - start
-        while True:
-            start = time.time()
-            try:
-                n = next(it)
-                elapsed += time.time() - start
-                yield n
-            except StopIteration:
-                elapsed += time.time() - start
-                break
-    inc_measurement('propose_circuits', elapsed)
+    for pair, addresses in modified_pairs_last_block.items():
+        for address in addresses:
+            yield from _propose_circuits_pair(pair, address, pool, block_number)
 
 
-def _propose_circuits_exchange(address: str, pool: pricers.PricerPool, block_number: int) -> typing.Iterator[typing.List[str]]:
+def _propose_circuits_pair(pair: typing.Tuple[str, str], address: str, pool: pricers.PricerPool, block_number: int) -> typing.Iterator[PricingCircuit]:
     # There are several situations here.
 
     # First, we need to find out whether this exchange has WETH or not;
     # if it does, we can yield some length-2 circuits and use special logic to find 3-length circuits
-    pair = pool.get_pair_for(address)
     token0, token1 = pair
     if WETH_ADDRESS in pair:
         if token0 == WETH_ADDRESS:
@@ -80,30 +68,58 @@ def _propose_circuits_exchange(address: str, pool: pricers.PricerPool, block_num
             if other_exchange == address:
                 continue
 
-            pair2 = pool.get_pair_for(other_exchange)
-            if WETH_ADDRESS in pair2:
+            tokens = pool.get_tokens_for(other_exchange)
+            if WETH_ADDRESS in tokens:
                 # stop here, we made a 2-length circuit
-                yield [address, other_exchange]
+                yield PricingCircuit(
+                    [
+                        pool.get_pricer_for(address),
+                        pool.get_pricer_for(other_exchange),
+                    ],
+                    [
+                        (WETH_ADDRESS, other_token),
+                        (other_token, WETH_ADDRESS),
+                    ]
+                )
             else:
-                # 3-length circuit ... need to find other_token2
-                if pair2[0] == other_token:
-                    other_token2 = pair2[1]
-                else:
-                    other_token2 = pair2[0]
-                
-                if bytes.fromhex(other_token2[2:]) < bytes.fromhex(WETH_ADDRESS[2:]):
-                    last_pair = (other_token2, WETH_ADDRESS)
-                else:
-                    last_pair = (WETH_ADDRESS, other_token2)
+                for other_token2 in tokens.difference([WETH_ADDRESS, other_token]):
+                    # construct 3-length circuit
 
-                # find the remaining leg
-                for last_exchange in pool.get_exchanges_for_pair(last_pair[0], last_pair[1], block_number):
-                    assert len(set([address, other_exchange, last_exchange])) == 3, 'should not have duplicates'
-                    yield [address, other_exchange, last_exchange]
+                    # find the remaining leg
+                    for last_exchange in pool.get_exchanges_for_pair(WETH_ADDRESS, other_token2, block_number):
+                        if last_exchange in [address, other_exchange]:
+                            continue
+                        assert len(set([address, other_exchange, last_exchange])) == 3, 'should not have duplicates'
+                        yield PricingCircuit(
+                            [
+                                pool.get_pricer_for(address),
+                                pool.get_pricer_for(other_exchange),
+                                pool.get_pricer_for(last_exchange),
+                            ],
+                            [
+                                (WETH_ADDRESS, other_token),
+                                (other_token, other_token2),
+                                (other_token2, WETH_ADDRESS),
+                            ],
+                        )
     else:
         # WETH is not in this pair, so we can only have length-3 exchanges
         for exchange_1 in pool.get_exchanges_for_pair(WETH_ADDRESS, token0, block_number):
             for exchange_2 in pool.get_exchanges_for_pair(WETH_ADDRESS, token1, block_number):
-                assert exchange_1 != exchange_2
-                yield [exchange_1, address, exchange_2]
+                if address == exchange_1 or address == exchange_2 or exchange_1 == exchange_2:
+                    # no dupes allowed
+                    continue
+
+                yield PricingCircuit(
+                    [
+                        pool.get_pricer_for(exchange_1),
+                        pool.get_pricer_for(address),
+                        pool.get_pricer_for(exchange_2),
+                    ],
+                    [
+                        (WETH_ADDRESS, token0),
+                        (token0, token1),
+                        (token1, WETH_ADDRESS),
+                    ],
+                )
 

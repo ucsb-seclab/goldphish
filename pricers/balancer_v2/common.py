@@ -21,19 +21,6 @@ TOKENS_DEREGISTERED_TOPIC  = event_abi_to_log_topic(_vault.events.TokensDeregist
 POOL_REGISTERED_TOPIC      = event_abi_to_log_topic(_vault.events.PoolRegistered().abi)
 
 
-class PoolSpecialization(enum.IntEnum):
-    GENERAL = 0
-    MINIMAL_SWAP_INFO = 1
-    TWO_TOKEN = 2
-
-def get_pool_specialization(pool_id: bytes) -> PoolSpecialization:
-    i_pool_id = int.from_bytes(pool_id, byteorder='big', signed=False)
-
-    return PoolSpecialization(
-        (i_pool_id >> (10 * 8)) & (2 ** (2 * 8) - 1),
-    )
-
-
 ONE  = 1 * 10 ** 18
 TWO  = 1 * 10 ** 18
 FOUR = 4 * 10 ** 18
@@ -350,7 +337,7 @@ def _ln(a: int) -> int:
             # Since ln(a^k) = k * ln(a), we can compute ln(a) as ln(a) = ln((1/a)^(-1)) = - ln((1/a)). If a is less
             # than one, 1/a will be greater than one, and this if statement will not be entered in the recursive call.
             # Fixed point division requires multiplying by ONE_18.
-            return (-_ln((ONE * ONE) // a))
+            return -_ln(sol_signed_div((ONE * ONE), a))
 
         # First, we use the fact that ln^(a * b) = ln(a) + ln(b) to decompose ln(a) into a sum of powers of two, which
         # we call x_n, where x_n == 2^(7 - n), which are the natural logarithm of precomputed quantities a_n (that is,
@@ -370,11 +357,11 @@ def _ln(a: int) -> int:
         sum = 0
 
         if a >= a0 * ONE:
-            a //= a0 # Integer, not fixed point division
+            a = sol_signed_div(a, a0) # Integer, not fixed point division
             sum += x0
 
         if a >= a1 * ONE:
-            a //= a1 # Integer, not fixed point division
+            a = sol_signed_div(a, a1) # Integer, not fixed point division
             sum += x1
 
         # All other a_n and x_n are stored as 20 digit fixed point numbers, so we convert the sum and a to this format.
@@ -384,52 +371,52 @@ def _ln(a: int) -> int:
         # Because further a_n are  20 digit fixed point numbers, we multiply by ONE_20 when dividing by them.
 
         if a >= a2:
-            a = (a * ONE_20) // a2
+            a = sol_signed_div(a * ONE_20, a2)
             sum += x2
 
 
         if a >= a3:
-            a = (a * ONE_20) // a3
+            a = sol_signed_div(a * ONE_20, a3)
             sum += x3
 
 
         if a >= a4:
-            a = (a * ONE_20) // a4
+            a = sol_signed_div(a * ONE_20, a4)
             sum += x4
 
 
         if a >= a5:
-            a = (a * ONE_20) // a5
+            a = sol_signed_div(a * ONE_20, a5)
             sum += x5
 
 
         if a >= a6:
-            a = (a * ONE_20) // a6
+            a = sol_signed_div(a * ONE_20, a6)
             sum += x6
 
 
         if a >= a7:
-            a = (a * ONE_20) // a7
+            a = sol_signed_div(a * ONE_20, a7)
             sum += x7
 
 
         if a >= a8:
-            a = (a * ONE_20) // a8
+            a = sol_signed_div(a * ONE_20, a8)
             sum += x8
 
 
         if a >= a9:
-            a = (a * ONE_20) // a9
+            a = sol_signed_div(a * ONE_20, a9)
             sum += x9
 
 
         if a >= a10:
-            a = (a * ONE_20) // a10
+            a = sol_signed_div(a * ONE_20, a10)
             sum += x10
 
 
         if a >= a11:
-            a = (a * ONE_20) // a11
+            a = sol_signed_div(a * ONE_20, a11)
             sum += x11
 
 
@@ -440,8 +427,8 @@ def _ln(a: int) -> int:
 
         # Recall that 20 digit fixed point division requires multiplying by ONE_20, and multiplication requires
         # division by ONE_20.
-        z = ((a - ONE_20) * ONE_20) // (a + ONE_20)
-        z_squared = (z * z) // ONE_20
+        z = sol_signed_div((a - ONE_20) * ONE_20, a + ONE_20)
+        z_squared = sol_signed_div(z * z, ONE_20)
 
         # num is the numerator of the series: the z^(2 * n + 1) term
         num = z
@@ -450,20 +437,20 @@ def _ln(a: int) -> int:
         seriesSum = num
 
         # In each step, the numerator is multiplied by z^2
-        num = (num * z_squared) // ONE_20
-        seriesSum += num // 3
+        num = sol_signed_div(num * z_squared, ONE_20)
+        seriesSum += sol_signed_div(num, 3)
 
-        num = (num * z_squared) // ONE_20
-        seriesSum += num // 5
+        num = sol_signed_div(num * z_squared, ONE_20)
+        seriesSum += sol_signed_div(num, 5)
 
-        num = (num * z_squared) // ONE_20
-        seriesSum += num // 7
+        num = sol_signed_div(num * z_squared, ONE_20)
+        seriesSum += sol_signed_div(num, 7)
 
-        num = (num * z_squared) // ONE_20
-        seriesSum += num // 9
+        num = sol_signed_div(num * z_squared, ONE_20)
+        seriesSum += sol_signed_div(num, 9)
 
-        num = (num * z_squared) // ONE_20
-        seriesSum += num // 11
+        num = sol_signed_div(num * z_squared, ONE_20)
+        seriesSum += sol_signed_div(num, 11)
 
         # 6 Taylor terms are sufficient for 36 decimal precision.
 
@@ -474,7 +461,7 @@ def _ln(a: int) -> int:
         # with 20 decimals). All that remains is to sum these two, and then drop two digits to return a 18 decimal
         # value.
 
-        return (sum + seriesSum) // 100
+        return sol_signed_div(sum + seriesSum, 100)
 
 
 def _ln_36(x: int) -> int:
