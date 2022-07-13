@@ -7,7 +7,7 @@ import typing
 import pricers
 import logging
 
-from .find import PricingCircuit, detect_arbitrages, FoundArbitrage
+from .find import PricingCircuit, FoundArbitrage, detect_arbitrages_bisection
 
 from utils import WETH_ADDRESS
 
@@ -18,20 +18,12 @@ def profitable_circuits(
         modified_pairs_last_block: typing.Dict[typing.Tuple[str, str], typing.List[str]],
         pool: pricers.PricerPool,
         block_number: int,
+        timestamp: typing.Optional[int] = None,
         only_weth_pivot = False,
     ) -> typing.Iterator[FoundArbitrage]:
 
-    found_circuits: typing.Dict[typing.Any, FoundArbitrage] = {}
     for circuit in propose_circuits(modified_pairs_last_block, pool, block_number):
-            for fa in detect_arbitrages(circuit, block_number, only_weth_pivot = only_weth_pivot):
-                fa: FoundArbitrage
-                key = tuple(sorted(p.address for p in fa.circuit))
-                if key in found_circuits:
-                    if found_circuits[key].profit < fa.profit:
-                        found_circuits[key] = fa
-                else:
-                    found_circuits[key] = fa
-    yield from found_circuits.values()
+        yield from detect_arbitrages_bisection(circuit, block_number, timestamp = timestamp, only_weth_pivot = only_weth_pivot)
 
 
 def propose_circuits(

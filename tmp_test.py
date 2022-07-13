@@ -1,6 +1,10 @@
 import os
 import web3
+import web3.contract
+import web3._utils.filters
 from pricers.balancer import BalancerPricer
+from pricers.uniswap_v2 import UniswapV2Pricer
+from utils import get_abi
 
 web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
 
@@ -15,33 +19,35 @@ w3 = web3.Web3(web3.WebsocketProvider(
 if not w3.isConnected():
     exit(1)
 
-bp = BalancerPricer(w3, address='0x69d460e01070A7BA1bc363885bC8F4F0daa19Bf5')
 
-print(bp.get_tokens(13_005_166))
+f: web3._utils.filters.Filter = w3.eth.filter({
+    'address': '0x5Fa464CEfe8901d66C09b85d5Fcdc55b3738c688',
+    'fromBlock': 13_005_100,
+    'toBlock': 13_005_176
+})
 
-with open('tab.csv', mode='w') as fout:
-    for amt_in in range(11781, 28105, 100):
-        got_out = bp.token_out_for_exact_in(
-            '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
-            '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-            amt_in,
-            block_identifier=13_005_172,
-        )
-        fout.write(f'{amt_in},{got_out}\n')
-        
+logs = f.get_all_entries()
+print(f'got {len(logs)} logs')
+for log in logs:
+    print(log)
 
-bp.token_out_for_exact_in(
-    '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
-    '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-    11781,
-    block_identifier=13_005_172,
+c: web3.contract.Contract = w3.eth.contract(
+    address = '0x5Fa464CEfe8901d66C09b85d5Fcdc55b3738c688',
+    abi = get_abi('uniswap_v2/IUniswapV2Pair.json')['abi']
 )
 
-print('ok!!!!')
+for block_number in range(13_005_145, 13_005_176):
+    b0, b1, _ = c.functions.getReserves().call(block_identifier=block_number)
+    print(b0, b1)
 
-bp.token_out_for_exact_in(
-    '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
-    '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-    28005, # 28163,
-    block_identifier=13_005_172,
-)
+
+f: web3._utils.filters.Filter = w3.eth.filter({
+    'address': ['0x5Fa464CEfe8901d66C09b85d5Fcdc55b3738c688'],
+    'topics': [['0x' + x.hex() for x in UniswapV2Pricer.RELEVANT_LOGS]],
+    'fromBlock': 13_005_153,
+    'toBlock': 13_005_252,
+})
+
+logs = f.get_all_entries()
+for log in logs:
+    print(log)

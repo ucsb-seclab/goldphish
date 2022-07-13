@@ -20,7 +20,6 @@ def maybe_log():
     If enough time has passed since last log, emits a new log report and clears
     all profiling info.
     """
-    global _last_log
     if not ENABLED:
         return
 
@@ -29,7 +28,12 @@ def maybe_log():
     if now < _last_log + PRINT_INTERVAL_SECONDS:
         # too soon
         return
-    
+    log()
+
+
+def log():
+    global _last_log
+    now = time.time()
     for k in sorted(_global_profile.keys()):
         if _last_log > 0:
             # we can compute percentage of time elapsed
@@ -41,7 +45,6 @@ def maybe_log():
         _global_profile[k] = 0
 
     _last_log = now
-
 
 def get_measurement(name: str) -> typing.Optional[float]:
     """
@@ -58,6 +61,8 @@ def reset_measurement(name: str):
         return
     _global_profile[name] = 0
 
+def reset():
+    _global_profile.clear()
 
 def inc_measurement(name: str, elapsed: float):
     """

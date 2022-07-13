@@ -8,7 +8,7 @@ from pricers.block_observation_result import BlockObservationResult
 from utils import get_abi, profile
 import logging
 
-from pricers.base import BaseExchangePricer
+from pricers.base import BaseExchangePricer, NotEnoughLiquidityException
 
 l = logging.getLogger(__name__)
 
@@ -31,25 +31,6 @@ generic_uv3 = web3.Web3().eth.contract(
 UNIV3_SWAP_EVENT_TOPIC = event_abi_to_log_topic(generic_uv3.events.Swap().abi)
 UNIV3_BURN_EVENT_TOPIC = event_abi_to_log_topic(generic_uv3.events.Burn().abi)
 UNIV3_MINT_EVENT_TOPIC = event_abi_to_log_topic(generic_uv3.events.Mint().abi)
-
-
-class NotEnoughLiqudityException(Exception):
-    """
-    Thrown when there is not enough liquidity to complete the given swap.
-    Returns (amount0, amount1, remaining) where amount0 and amount1 are
-    the amounts of token0, token1 in (or out), and remaining is how much
-    input remained when liquidity ran out.
-    """
-    amount0: int
-    amount1: int
-    remaining: int
-
-    def __init__(self, amount0, amount1, remaining, *args: object) -> None:
-        super().__init__(*args)
-        self.amount0 = amount0
-        self.amount1 = amount1
-        self.remaining = remaining
-
 
 class UniswapV3Pricer(BaseExchangePricer):
     RELEVANT_LOGS = [UNIV3_SWAP_EVENT_TOPIC, UNIV3_BURN_EVENT_TOPIC, UNIV3_MINT_EVENT_TOPIC]
@@ -111,22 +92,22 @@ class UniswapV3Pricer(BaseExchangePricer):
             self.liquidity_cache = got
         return self.liquidity_cache
 
-    def token_out_for_exact_in(self, token_in: str, token_out: str, amount_in: int, block_identifier: int) -> int:
+    def token_out_for_exact_in(self, token_in: str, token_out: str, amount_in: int, block_identifier: int, **_) -> typing.Tuple[int, float]:
         if token_in == self.token0 and token_out == self.token1:
             return self.exact_token0_to_token1(amount_in, block_identifier)
         elif token_in == self.token1 and token_out == self.token0:
             return self.exact_token1_to_token0(amount_in, block_identifier)
         raise NotImplementedError()
 
-    def exact_token0_to_token1(self, token0_in: int, block_identifier) -> int:
+    def exact_token0_to_token1(self, token0_in: int, block_identifier) -> typing.Tuple[int, float]:
         assert token0_in >= 0
-        (_, ret) = self.swap(zero_for_one=True, amount_specified=token0_in, sqrt_price_limitX96=None, block_identifier=block_identifier)
-        return -ret
+        (_, ret, price) = self.swap(zero_for_one=True, amount_specified=token0_in, sqrt_price_limitX96=None, block_identifier=block_identifier)
+        return -ret, price
 
-    def exact_token1_to_token0(self, token1_in: int, block_identifier) -> int:
+    def exact_token1_to_token0(self, token1_in: int, block_identifier) -> typing.Tuple[int, float]:
         assert token1_in >= 0
-        (ret, _) = self.swap(zero_for_one=False, amount_specified=token1_in, sqrt_price_limitX96=None, block_identifier=block_identifier)
-        return -ret
+        (ret, _, price) = self.swap(zero_for_one=False, amount_specified=token1_in, sqrt_price_limitX96=None, block_identifier=block_identifier)
+        return -ret, price
 
     def token1_out_to_exact_token0_in(self, token1_amount_out, block_identifier: int) -> int:
         assert token1_amount_out >= 0
@@ -138,17 +119,21 @@ class UniswapV3Pricer(BaseExchangePricer):
         (_, ret) = self.swap(zero_for_one=False, amount_specified=-token0_amount_out, sqrt_price_limitX96=None, block_identifier=block_identifier)
         return ret
 
-
-    def swap(self, zero_for_one: bool, amount_specified: int, sqrt_price_limitX96: typing.Optional[int], block_identifier) -> typing.Tuple[int, int]:
+    def swap(self, zero_for_one: bool, amount_specified: int, sqrt_price_limitX96: typing.Optional[int], block_identifier) -> typing.Tuple[int, int, float]:
         """
         returns: (amount0, amount1)
         """
         assert isinstance(zero_for_one, bool)
+        (sqrt_price_x96, tick) = self.get_slot0(block_identifier)
 
         if amount_specified == 0:
-            return (0,0)
+            if zero_for_one:
+                price = sqrt_price_x96 * sqrt_price_x96 / (1 << 192)
+            else:
+                price = (1 << 192) / (sqrt_price_x96 * sqrt_price_x96)
 
-        (sqrt_price_x96, tick) = self.get_slot0(block_identifier)
+            return (0, 0, price)
+
         if sqrt_price_x96 == 0:
             # this is not initialized; you cannot get any token out
             return (0, 0)
@@ -212,7 +197,7 @@ class UniswapV3Pricer(BaseExchangePricer):
                 amount_specified_remaining += amount_out
                 amount_calculated = amount_calculated + (amount_in + fee_amount)
 
-            if sqrt_price_next_X96 == sqrt_price_next_X96:
+            if sqrt_price_next_X96 == sqrt_price_next_X96: # TODO this is broken is it of any consequence?
                 if initialized:
                     tick_obj = self.tick_at(next_tick_num, block_identifier)
                     if zero_for_one:
@@ -240,9 +225,16 @@ class UniswapV3Pricer(BaseExchangePricer):
             assert amount1 >= 0
 
         if amount_specified_remaining != 0:
-            raise NotEnoughLiqudityException(amount0, amount1, amount_specified_remaining, 'ran out of liquidity')
+            raise NotEnoughLiquidityException(amount_specified, amount_specified_remaining, 'ran out of liquidity')
 
-        return (amount0, amount1)
+        if zero_for_one:
+            price = sqrt_price_x96 * sqrt_price_x96 / (1 << 192)
+        else:
+            price = (1 << 192) / (sqrt_price_x96 * sqrt_price_x96)
+
+        price *= (10 ** 6 - self.fee) / (10 ** 6)
+
+        return (amount0, amount1, price)
 
 
     @staticmethod
@@ -783,4 +775,9 @@ class UniswapV3Pricer(BaseExchangePricer):
         self.slot0_cache = None
         self.liquidity_cache = None
         self.last_block_observed = None
+
+    def copy_without_cache(self) -> 'BaseExchangePricer':
+        return UniswapV3Pricer(
+            self.w3, self.address, self.token0, self.token1, self.fee
+        )
 

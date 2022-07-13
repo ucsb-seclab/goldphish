@@ -11,7 +11,7 @@ import logging
 import scipy.optimize
 from pricers.balancer import TooLittleInput
 import pricers.token_transfer
-from pricers.uniswap_v3 import NotEnoughLiqudityException
+from pricers.base import NotEnoughLiquidityException
 
 import pricers.base
 from utils import WETH_ADDRESS
@@ -56,10 +56,16 @@ class PricingCircuit:
         return list(self._circuit)
 
     @property
-    def directions(self) -> typing.List[bool]:
+    def directions(self) -> typing.List[typing.Tuple[str, str]]:
         return list(self._directions)
 
-    def sample(self, amount_in: int, block_identifier: int) -> int:
+    def copy(self) -> 'PricingCircuit':
+        return PricingCircuit(
+            self.circuit,
+            self.directions
+        )
+
+    def sample(self, amount_in: int, block_identifier: int, timestamp: typing.Optional[int] = None, debug = False) -> int:
         """
         Run the circuit with the given amount_in, returning the amount_out
         """
@@ -67,12 +73,51 @@ class PricingCircuit:
         curr_amt = amount_in
         for p, (t_in, t_out) in zip(self._circuit, self._directions):
             assert last_token == t_in
-            curr_amt = p.token_out_for_exact_in(t_in, t_out, curr_amt, block_identifier)
+            _last_amt = curr_amt
+            curr_amt, _ = p.token_out_for_exact_in(t_in, t_out, curr_amt, block_identifier, timestamp=timestamp)
+            last_token = t_out
             curr_amt = pricers.token_transfer.out_from_transfer(last_token, curr_amt)
             assert curr_amt >= 0, 'negative token balance is not possible'
-            last_token = t_out
+            if debug:
+                l.debug(f'{p.address} ({t_in} -> {t_out}) : {_last_amt} -> {curr_amt}')
         assert last_token == self.pivot_token
         return curr_amt
+
+    def sample_new_price_ratio(self, amount_in: int, block_identifier: int, timestamp: typing.Optional[int] = None, debug = False) -> float:
+        """
+        Run the circuit with the given amount_in, returning the new marginal price of this circuit
+        """
+        # some tokens charge a fee when you transfer -- attempt to account for this
+        # in a hacky way by sending in 10 ** 18 units, assume 1:1 conversion at
+        # each exchange point, and seeing how much you would get out the other end.
+
+        # NOTE this does not work if the fee is not a simple percentage
+
+        quantized_transfer_fee = 10 ** 18
+
+        last_token = self.pivot_token
+        curr_amt = amount_in
+        new_mp = 1.0
+
+        for p, (t_in, t_out) in zip(self._circuit, self._directions):
+            assert last_token == t_in
+            _last_amt = curr_amt
+            curr_amt, curr_mp = p.token_out_for_exact_in(t_in, t_out, curr_amt, block_identifier, timestamp=timestamp)
+
+            last_token = t_out
+            new_mp *= curr_mp
+            curr_amt = pricers.token_transfer.out_from_transfer(last_token, curr_amt)
+            quantized_transfer_fee = pricers.token_transfer.out_from_transfer(last_token, quantized_transfer_fee)
+
+            assert curr_amt >= 0, 'negative token balance is not possible'
+            if debug:
+                l.debug(f'{p.address} ({t_in} -> {t_out}) : {_last_amt} -> {curr_amt} @ {curr_mp}')
+
+        assert last_token == self.pivot_token
+
+        transfer_fee = quantized_transfer_fee / 10 ** 18
+
+        return new_mp * transfer_fee
 
     def rotate(self):
         """
@@ -93,16 +138,23 @@ class PricingCircuit:
 def detect_arbitrages(
         pc: PricingCircuit,
         block_identifier: int,
+        timestamp: typing.Optional[int] = None,
         only_weth_pivot = False
     ) -> typing.List[FoundArbitrage]:
+    """
+    KEPT FOR LEGACY REFERENCE -- use the variant _bisection below
+    """
+    l.error('USING legacy arbitrage detector!!!!')
+
+
     ret = []
 
     # for each rotation
-    for _ in range(len(pc.circuit)):
+    for _ in range(len(pc._circuit)):
         def run_exc(i):
             try:
-                return pc.sample(math.ceil(i), block_identifier) if i >= 0 else -(i + 1000) # encourage optimizer to explore toward +direction
-            except NotEnoughLiqudityException as e:
+                return pc.sample(math.ceil(i), block_identifier, timestamp=timestamp) if i >= 0 else -(i + 1000) # encourage optimizer to explore toward +direction
+            except NotEnoughLiquidityException as e:
                 # encourage going toward available liquidity
                 return -(1000 + e.remaining)
 
@@ -117,7 +169,7 @@ def detect_arbitrages(
                         for quick_test_amount_in_zeros in range(2, 22):
                             quick_test_amount_in = 10 ** quick_test_amount_in_zeros
                             try:
-                                quick_test_amount_out1 = pc.sample(quick_test_amount_in, block_identifier)
+                                quick_test_pr = pc.sample_new_price_ratio(quick_test_amount_in, block_identifier, timestamp=timestamp)
                                 break
                             except TooLittleInput:
                                 # try the next largest amount
@@ -126,33 +178,45 @@ def detect_arbitrages(
                             # exhausted quick_test_amount_in options -- probably there's no way to pump enough liquidity
                             # to this exchange just yet
                             continue
-                    except NotEnoughLiqudityException:
+                    except NotEnoughLiquidityException:
                         # not profitable most likely
                         continue
 
 
                 with profile('pricing_optimize'):
-                    if quick_test_amount_out1 > quick_test_amount_in:
+                    if quick_test_pr > 1:
                         # this may be profitable
 
-                        # search for crossing-point where liquidity does not run out
-                        lower_bound = quick_test_amount_in
-                        upper_bound = (100_000 * (10 ** 18)) # a shit-ton of ether
-                        try:
-                            pc.sample(upper_bound, block_identifier)
-                        except NotEnoughLiqudityException:
-                            # we need to adjust upper_bound down juuuust until it's in liquidity range
-                            # do this by binary-search
-                            search_lower = lower_bound
-                            search_upper = upper_bound
-                            while search_lower < search_upper - 1:
-                                midpoint = (search_lower + search_upper) // 2
-                                try:
-                                    pc.sample(midpoint, block_identifier)
-                                    search_lower = midpoint
-                                except NotEnoughLiqudityException:
-                                    search_upper = midpoint
-                            upper_bound = search_lower
+                        with profile('bounds_seek'):
+                            # search for crossing-point where liquidity does not run out
+                            lower_bound = quick_test_amount_in
+                            upper_bound = (100_000 * (10 ** 18)) # a shit-ton of ether
+                            try:
+                                pc.sample(upper_bound, block_identifier, timestamp=timestamp)
+                            except NotEnoughLiquidityException as e:                                
+                                # we need to adjust upper_bound down juuuust until it's in liquidity range
+                                # do this by binary-search
+                                search_lower = lower_bound
+                                search_upper = upper_bound
+                                while True:
+                                    # rapidly reduce upper bound by orders of 10
+                                    x = search_upper // 10
+                                    try:
+                                        pc.sample(x, block_identifier, timestamp=timestamp)
+                                        break
+                                    except NotEnoughLiquidityException:
+                                        search_upper = x
+
+                                while search_lower < search_upper - 1:
+                                    midpoint = search_lower + (search_upper - search_lower) * 3 // 10
+                                    midpoint = (search_lower + search_upper) // 2
+                                    try:
+                                        pc.sample(midpoint, block_identifier)
+                                        search_lower = midpoint
+                                    except NotEnoughLiquidityException as e:
+                                        search_upper = midpoint
+                                    
+                                upper_bound = search_lower
 
 
                         with profiling.profile('minimize_scalar'):
@@ -165,10 +229,9 @@ def detect_arbitrages(
                                 method='bounded',
                             )
 
-
                         if result.fun < 0:
                             amount_in = math.ceil(result.x)
-                            expected_profit = pc.sample(amount_in, block_identifier) - amount_in
+                            expected_profit = pc.sample(amount_in, block_identifier, timestamp=timestamp) - amount_in
 
                             # if reducing input by 1 wei results in the same amount out, then use that value (rounding gets fucky)
                             for i in itertools.count(1):
@@ -182,11 +245,12 @@ def detect_arbitrages(
                                 else:
                                     break
 
-                            for i in itertools.count(1):
-                                trying_amount_in = amount_in - i
-                                expected_profit_new = pc.sample(trying_amount_in, block_identifier) - amount_in
-                                if expected_profit_new < expected_profit:
-                                    break # profit going down, give up
+                            # for i in itertools.count(1):
+                            #     trying_amount_in = amount_in - i
+                            #     expected_profit_new = pc.sample(trying_amount_in, block_identifier, timestamp=timestamp) - amount_in
+                            #     if expected_profit_new < expected_profit:
+                            #         break # profit going down, give up
+
                             if expected_profit <= 0:
                                 l.warning('fun indicated profit but expected profit did not!')
                             else:
@@ -201,3 +265,150 @@ def detect_arbitrages(
             pc.flip()
         pc.rotate()
     return ret
+
+
+def detect_arbitrages_bisection(
+        pc: PricingCircuit,
+        block_identifier: int,
+        timestamp: typing.Optional[int] = None,
+        only_weth_pivot = False
+    ) -> typing.List[FoundArbitrage]:
+    ret = []
+
+    # for each rotation
+    for _ in range(len(pc._circuit)):
+        def run_exc(i):
+            amt_in = math.ceil(i)
+            price_ratio = pc.sample_new_price_ratio(amt_in, block_identifier, timestamp=timestamp)
+            return price_ratio - 1
+
+        # try each direction
+        for _ in range(2):
+
+            if not (only_weth_pivot and pc.pivot_token != WETH_ADDRESS):
+                # quickly try pushing 100 tokens -- if unprofitable, fail
+                with profile('pricing_quick_check'):
+                    quick_test_amount_in = 100
+                    try:
+                        for quick_test_amount_in_zeros in range(2, 22):
+                            quick_test_amount_in = 10 ** quick_test_amount_in_zeros
+                            try:
+                                quick_test_pr = pc.sample_new_price_ratio(quick_test_amount_in, block_identifier, timestamp=timestamp)
+                                break
+                            except TooLittleInput:
+                                # try the next largest amount
+                                continue
+                        else:
+                            # exhausted quick_test_amount_in options -- probably there's no way to pump enough liquidity
+                            # to this exchange just yet
+                            continue
+                    except NotEnoughLiquidityException:
+                        # not profitable most likely
+                        continue
+
+
+                with profile('pricing_optimize'):
+                    if quick_test_pr > 1:
+                        # this may be profitable
+
+                        # search for crossing-point where liquidity does not run out
+                        lower_bound = quick_test_amount_in
+                        upper_bound = (100_000 * (10 ** 18)) # a shit-ton of ether
+                        try:
+                            pc.sample(upper_bound, block_identifier, timestamp=timestamp)
+                        except NotEnoughLiquidityException:
+                            # we need to adjust upper_bound down juuuust until it's in liquidity range
+                            # do this by binary-search
+                            search_lower = lower_bound
+                            search_upper = upper_bound
+
+                            while True:
+                                # rapidly reduce upper bound by orders of 10
+                                x = search_upper // 10
+                                try:
+                                    pc.sample(x, block_identifier, timestamp=timestamp)
+                                    break
+                                except NotEnoughLiquidityException:
+                                    search_upper = x
+
+                            while search_lower < search_upper - 1:
+                                midpoint = (search_lower + search_upper) // 2
+                                try:
+                                    pc.sample(midpoint, block_identifier)
+                                    search_lower = midpoint
+                                except NotEnoughLiquidityException:
+                                    search_upper = midpoint
+                            upper_bound = search_lower
+
+                        mp_lower_bound = pc.sample_new_price_ratio(lower_bound, block_identifier, timestamp=timestamp)
+                        mp_upper_bound = pc.sample_new_price_ratio(upper_bound, block_identifier, timestamp=timestamp)
+
+                        assert mp_lower_bound > mp_upper_bound
+                        assert 1 < mp_lower_bound
+
+                        if 1 > mp_upper_bound:
+                            # the root (marginal price = 1) lies somewhere within the bounds
+                            with profiling.profile('root_find'):
+                                # guess is linear midpoint between the two
+                                # (y - y1) = m (x - x1) solve for x where y = 1
+                                # 1 - y1 = m (x - x1)
+                                # (1 - y1) / m = x - x1
+                                # (1 - y1) / m + x1 = x
+
+                                m_inv = (lower_bound - upper_bound) / (mp_lower_bound - mp_upper_bound)
+                                pt1 = (1 - mp_lower_bound) * m_inv + lower_bound
+
+                                assert lower_bound <= pt1 <= upper_bound
+
+                                # cast upper bound to float so we can ensure it is STRICTLY LESS THAN the int val
+                                fl_upper_bound = float(upper_bound)
+                                while math.ceil(fl_upper_bound) > upper_bound:
+                                    fl_upper_bound *= 0.99999999999999
+
+                                result = scipy.optimize.root_scalar(
+                                    f = run_exc,
+                                    bracket = (
+                                        lower_bound,
+                                        fl_upper_bound,
+                                    ),
+                                    x0 = pt1
+                                )
+                            amount_in = math.ceil(result.root)
+                        else:
+                            amount_in = upper_bound
+
+                        expected_profit = pc.sample(amount_in, block_identifier, timestamp=timestamp) - amount_in
+
+                        # if reducing input by 1 wei results in the same amount out, then use that value (rounding gets fucky)
+                        for i in itertools.count(1):
+                            token_in, token_out = pc.directions[0]
+                            out_normal, _ = pc.circuit[0].token_out_for_exact_in(token_in, token_out, amount_in, block_identifier=block_identifier)
+                            out_reduced_by_1, _ = pc.circuit[0].token_out_for_exact_in(token_in, token_out, amount_in - 1, block_identifier=block_identifier)
+
+                            if out_normal == out_reduced_by_1:
+                                amount_in -= 1
+                                expected_profit += 1
+                            else:
+                                break
+
+                        # for i in itertools.count(1):
+                        #     trying_amount_in = amount_in - i
+                        #     expected_profit_new = pc.sample(trying_amount_in, block_identifier, timestamp=timestamp) - amount_in
+                        #     if expected_profit_new < expected_profit:
+                        #         break # profit going down, give up
+
+                        if expected_profit <= 0:
+                            l.warning('fun indicated profit but expected profit did not!')
+                        else:
+                            to_add = FoundArbitrage(
+                                amount_in   = amount_in,
+                                directions  = pc.directions,
+                                circuit     = pc.circuit,
+                                pivot_token = pc.pivot_token,
+                                profit      = expected_profit,
+                            )
+                            ret.append(to_add)
+            pc.flip()
+        pc.rotate()
+    return ret
+

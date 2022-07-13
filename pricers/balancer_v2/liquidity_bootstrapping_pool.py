@@ -5,11 +5,12 @@ import web3.contract
 import typing
 import logging
 from eth_utils import event_abi_to_log_topic
+from pricers.balancer import BalancerPricer
 from pricers.block_observation_result import BlockObservationResult
 
 from utils import get_abi, get_block_timestamp
 
-from pricers.base import BaseExchangePricer
+from pricers.base import BaseExchangePricer, NotEnoughLiquidityException
 from pricers.balancer_v2.common import ONE, POOL_BALANCE_CHANGED_TOPIC, POOL_REGISTERED_TOPIC, SWAP_TOPIC, TOKENS_DEREGISTERED_TOPIC, TOKENS_REGISTERED_TOPIC, _vault, complement, div_down, div_up, downscale_down, mul_down, mul_up, pow_up, pow_up_legacy, upscale
 
 
@@ -200,61 +201,60 @@ class BalancerV2LiquidityBootstrappingPoolPricer(BaseExchangePricer):
 
     MAX_IN_RATIO = 3 * 10 ** 17 # 0.3e18
 
-    def swap_exact_amount_in(
+    def token_out_for_exact_in(
             self,
             token_in: str,
-            token_amount_in: int,
             token_out: str,
+            token_amount_in: int,
             block_identifier: int,
             timestamp: typing.Optional[int] = None,
             **_,
-        ):
-        assert token_in in self.tokens
-        assert token_out in self.tokens
+        ) -> typing.Tuple[int, float]:
+        assert token_in in self.tokens, f'expected {token_in} in {self.tokens}'
+        assert token_out in self.tokens, f'expected {token_out} in {self.tokens}'
+
+        token_amount_in_not_scaled = token_amount_in
 
         swap_fee = self.get_swap_fee(block_identifier)
 
-        print('token_in before fee', token_amount_in)
-        print('swap_fee', swap_fee)
         fee_amount = mul_up(token_amount_in, swap_fee)
-        print('fee_amount', fee_amount)
         token_amount_in = token_amount_in - fee_amount
 
-        balance_in = self.get_balance(token_in, block_identifier)
-        balance_out = self.get_balance(token_out, block_identifier)
+        balance_in_not_scaled = self.get_balance(token_in, block_identifier)
+        balance_out_not_scaled = self.get_balance(token_out, block_identifier)
 
         # now we must upscale
         token_amount_in = upscale(self.w3, token_in, token_amount_in)
-        balance_in = upscale(self.w3, token_in, balance_in)
-        balance_out = upscale(self.w3, token_out, balance_out)
+        balance_in = upscale(self.w3, token_in, balance_in_not_scaled)
+        balance_out = upscale(self.w3, token_out, balance_out_not_scaled)
 
         weight_in  = self.get_weight(token_in, block_identifier=block_identifier, ts_override=timestamp)
         weight_out = self.get_weight(token_out, block_identifier=block_identifier, ts_override=timestamp)
 
-        print('amount_in', token_amount_in)
-        print('balance_in', balance_in)
-        print('balance_out', balance_out)
-        print('weight_in', weight_in)
-        print('weight_out', weight_out)
-
-        assert token_amount_in <= mul_down(balance_in, BalancerV2LiquidityBootstrappingPoolPricer.MAX_IN_RATIO)
-
-        print('timestamp', timestamp, hex(timestamp))
+        max_in = mul_down(balance_in, BalancerV2LiquidityBootstrappingPoolPricer.MAX_IN_RATIO)
+        if token_amount_in > max_in:
+            raise NotEnoughLiquidityException(None, None, token_amount_in - max_in)
 
         denominator = balance_in + token_amount_in
-        print('denominator', denominator)
         base = div_up(balance_in, denominator)
-        print('base', base) # ok
         exponent = div_down(weight_in, weight_out)
-        print('exponent', exponent) # ok I think?
         power_ = pow_up_legacy(base, exponent)
-        print('power', power_) # wrong, should be 0xdc390e97f6c096f 991795675491207535
 
-        print('power.complement', complement(power_))
         ret = mul_down(balance_out, complement(power_))
-        print('ret', ret)
-        
-        return downscale_down(self.w3, token_out, ret)
+        ret = downscale_down(self.w3, token_out, ret)
+
+        spot_out = BalancerPricer.BONE / BalancerPricer.calc_spot_price(
+            token_balance_in  = balance_in_not_scaled + token_amount_in_not_scaled,
+            token_weight_in   = weight_in,
+            token_balance_out = balance_out_not_scaled - ret,
+            token_weight_out  = weight_out,
+            swap_fee          = swap_fee
+        )
+        curr_price = ret / token_amount_in_not_scaled
+        if ret > 100:
+            assert curr_price > spot_out
+
+        return ret, spot_out
 
     def get_value_locked(self, token_address: str, block_identifier: int) -> int:
         assert token_address in self.get_tokens(block_identifier)
@@ -380,4 +380,9 @@ class BalancerV2LiquidityBootstrappingPoolPricer(BaseExchangePricer):
             pair_prices_updated = updated_pairs,
             swap_enabled = swap_enabled,
             gradual_weight_adjusting_scheduled = gradual_weight_update_scheduled,
+        )
+
+    def copy_without_cache(self) -> 'BaseExchangePricer':
+        return BalancerV2LiquidityBootstrappingPoolPricer(
+            self.w3, self.address, pool_id = self.pool_id
         )

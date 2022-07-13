@@ -28,9 +28,7 @@ l = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser()
-#    parser.add_argument('--mode', type=str, choices=['measure-tvl', 'verify', 'diagnose', 'connect', 'cleanup', 'trace'], help='verification mode', default=None)
     parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
-    parser.add_argument('--id', type=int, default=None, help='id to trace')
 
     subparser = parser.add_subparsers(help='subcommand', dest='subcommand')
     

@@ -85,7 +85,6 @@ def get_scaling_factor(w3: web3.Web3, token: str) -> int:
 
 def upscale(w3: web3.Web3, token: str, amount: int) -> int:
     sc = get_scaling_factor(w3, token)
-    print('sc', token, sc)
     return mul_down(amount, sc)
 
 def downscale_down(w3: web3.Web3, token: str, amount: int) -> int:
@@ -152,7 +151,6 @@ def pow_up(x: int, y: int) -> int:
         return mul_up(x, x)
     
     if y == FOUR:
-        print('FOUR!!!!!!!!!!!!!!!!')
         square = mul_up(x, x)
         return mul_up(square, square)
 
@@ -185,10 +183,8 @@ def pow(x: int, y: int) -> int:
     
     if LN_36_LOWER_BOUND <= x < LN_36_UPPER_BOUND:
         ln_36_x = _ln_36(x)
-        print('ln_36_x', ln_36_x)
         logx_times_y = ((ln_36_x // ONE) * y + ((ln_36_x % ONE) * y) // ONE)
     else:
-        print('owwwwwwwwwwwwwwww')
         logx_times_y = _ln(x) * y
 
     logx_times_y = sol_signed_div(logx_times_y, ONE)

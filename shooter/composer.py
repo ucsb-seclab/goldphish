@@ -5,7 +5,7 @@ and synthesizes the input data for the shooter.
 
 import typing
 import logging
-from pricers.uniswap_v3 import NotEnoughLiqudityException
+from pricers.base import NotEnoughLiquidityException
 
 import shooter.encoder
 import pricers
@@ -114,7 +114,7 @@ def construct_from_found_arbitrage(fa: find_circuit.find.FoundArbitrage, coinbas
             last_out = pricers.out_from_transfer(token_out, amt_out)
         if last_out <= fa.amount_in:
             raise NotEnoughOutException('arbitrage did not result in profit')
-    except NotEnoughLiqudityException:
+    except NotEnoughLiquidityException:
         l.warning('Not enough liquidity to construct this....')
         raise ConstructionException('not enough liquidity')
 

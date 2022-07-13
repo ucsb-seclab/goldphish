@@ -21,7 +21,7 @@ from pricers.balancer import BalancerPricer
 from pricers.pricer_pool import PricerPool
 from pricers.uniswap_v2 import UniswapV2Pricer
 from pricers.uniswap_v3 import UniswapV3Pricer
-from utils import BALANCER_VAULT_ADDRESS, ProgressReporter, get_abi
+from utils import BALANCER_VAULT_ADDRESS, ProgressReporter, get_block_timestamp
 import utils.profiling
 
 
@@ -56,10 +56,6 @@ def seek_candidates(w3: web3.Web3, args: argparse.Namespace):
 
     #
     # Load all candidate profitable arbitrages
-    start_block = 12_369_621
-    end_block = 15_111_000 # w3.eth.get_block('latest')['number']
-    l.info(f'Doing analysis from block {start_block:,} to block {end_block:,}')
-    progress_reporter = ProgressReporter(l, end_block, start_block)
     batch_size_blocks = 100 # batch size for getting logs
     last_processed_block = None
     while True:
@@ -72,7 +68,6 @@ def seek_candidates(w3: web3.Web3, args: argparse.Namespace):
         pricer: PricerPool = load_pool(w3, curr)
         if last_processed_block is not None:
             assert last_processed_block < reservation_start
-            progress_reporter.observe(n_items=((reservation_start - last_processed_block) - 1))
 
         curr_block = reservation_start
         while curr_block <= reservation_end:
@@ -80,10 +75,6 @@ def seek_candidates(w3: web3.Web3, args: argparse.Namespace):
             for block_number, logs in get_relevant_logs(w3, pricer, curr_block, this_end_block):
                 update = pricer.observe_block(block_number, logs)
                 utils.profiling.maybe_log()
-                if block_number < 13_005_172:
-                    # skip ahead TODO remove this
-                    print('skipping!!!')
-                    continue
                 while True:
                     try:
                         process_candidates(w3, pricer, block_number, update, curr)
@@ -98,7 +89,6 @@ def seek_candidates(w3: web3.Web3, args: argparse.Namespace):
                         else:
                             raise e
 
-            progress_reporter.observe(n_items = (this_end_block - curr_block)  + 1)
             curr_block = this_end_block + 1
             last_processed_block = this_end_block
 
@@ -185,7 +175,7 @@ def fill_queue(w3: web3.Web3, curr: psycopg2.extensions.cursor):
         return
 
     start_block = scan_start(curr)
-    end_block = w3.eth.get_block('latest')['number']
+    end_block = 15_111_766 # w3.eth.get_block('latest')['number']
 
     l.info(f'filling queue from {start_block:,} to {end_block:,}')
 
@@ -337,54 +327,69 @@ def get_relevant_logs(
 
     assert batch_start_block <= batch_end_block
 
-    l.debug('start get logs')
+    l.debug(f'start get logs from {batch_start_block:,} to {batch_end_block:,}')
 
-    f: web3._utils.filters.Filter = w3.eth.filter({
-        'address': list(pool._uniswap_v2_pools.keys()),
-        'topics': [['0x' + x.hex() for x in UniswapV2Pricer.RELEVANT_LOGS]],
-        'fromBlock': batch_start_block,
-        'toBlock': batch_end_block,
-    })
+    with utils.profiling.profile('get_logs'):
 
-    logs = f.get_all_entries()
+        assert '0x5Fa464CEfe8901d66C09b85d5Fcdc55b3738c688' in pool._uniswap_v2_pools
 
-    l.debug('got uniswap v2 logs')
+        f: web3._utils.filters.Filter = w3.eth.filter({
+            'address': list(pool._uniswap_v2_pools.keys()),
+            'topics': [['0x' + x.hex() for x in UniswapV2Pricer.RELEVANT_LOGS]],
+            'fromBlock': batch_start_block,
+            'toBlock': batch_end_block,
+        })
 
-    f: web3._utils.filters.Filter = w3.eth.filter({
-        'address': list(pool._uniswap_v3_pools.keys()),
-        'topics': [['0x' + x.hex() for x in UniswapV3Pricer.RELEVANT_LOGS]],
-        'fromBlock': batch_start_block,
-        'toBlock': batch_end_block,
-    })
+        logs = f.get_all_entries()
 
-    logs.extend(f.get_all_entries())
+        l.debug('got uniswap v2 logs')
 
-    l.debug('got uniswap v3 logs')
+        f: web3._utils.filters.Filter = w3.eth.filter({
+            'address': list(pool._uniswap_v3_pools.keys()),
+            'topics': [['0x' + x.hex() for x in UniswapV3Pricer.RELEVANT_LOGS]],
+            'fromBlock': batch_start_block,
+            'toBlock': batch_end_block,
+        })
 
-    f: web3._utils.filters.Filter = w3.eth.filter({
-        'address': list(pool._balancer_v1_pools.keys()),
-        'topics': [['0x' + x.hex() for x in BalancerPricer.RELEVANT_LOGS]],
-        'fromBlock': batch_start_block,
-        'toBlock': batch_end_block,
-    })
+        logs.extend(f.get_all_entries())
 
-    logs.extend(f.get_all_entries())
+        l.debug('got uniswap v3 logs')
 
-    l.debug('got balancer v1 logs')
+        f: web3._utils.filters.Filter = w3.eth.filter({
+            'address': list(pool._sushiswap_v2_pools.keys()),
+            'topics': [['0x' + x.hex() for x in UniswapV2Pricer.RELEVANT_LOGS]],
+            'fromBlock': batch_start_block,
+            'toBlock': batch_end_block,
+        })
 
-    f: web3._utils.filters.Filter = w3.eth.filter({
-        'address': list(pool._balancer_v2_pools.keys()) + [BALANCER_VAULT_ADDRESS],
-        'fromBlock': batch_start_block,
-        'toBlock': batch_end_block,
-    })
+        logs.extend(f.get_all_entries())
 
-    logs.extend(f.get_all_entries())
+        l.debug('got sushiswap v2 logs')
 
-    l.debug('got balancer v2 logs')
+        f: web3._utils.filters.Filter = w3.eth.filter({
+            'address': list(pool._balancer_v1_pools.keys()),
+            'topics': [['0x' + x.hex() for x in BalancerPricer.RELEVANT_LOGS]],
+            'fromBlock': batch_start_block,
+            'toBlock': batch_end_block,
+        })
 
-    logs = sorted(logs, key=lambda x: (x['blockNumber'], x['logIndex']))
+        logs.extend(f.get_all_entries())
 
-    l.debug(f'got {len(logs):,} logs this batch')
+        l.debug('got balancer v1 logs')
+
+        f: web3._utils.filters.Filter = w3.eth.filter({
+            'address': list(pool._balancer_v2_pools.keys()) + [BALANCER_VAULT_ADDRESS],
+            'fromBlock': batch_start_block,
+            'toBlock': batch_end_block,
+        })
+
+        logs.extend(f.get_all_entries())
+
+        l.debug('got balancer v2 logs')
+
+        logs = sorted(logs, key=lambda x: (x['blockNumber'], x['logIndex']))
+
+        l.debug(f'got {len(logs):,} logs this batch')
 
     gather = collections.defaultdict(lambda: [])
     for log in logs:
@@ -401,64 +406,53 @@ def process_candidates(
         updated_exchanges: typing.Dict[typing.Tuple[str, str], typing.List[str]],
         curr: psycopg2.extensions.cursor
     ):
-    # update pricer
     l.debug(f'{len(updated_exchanges)} exchanges updated in block {block_number:,}')
+
+    next_block_ts = get_block_timestamp(w3, block_number + 1)
 
     n_ignored = 0
     n_found = 0
     max_profit_no_fee = -1
-    for p in find_circuit.profitable_circuits(updated_exchanges, pool, block_number, only_weth_pivot=True):
+    for p in find_circuit.profitable_circuits(updated_exchanges, pool, block_number, timestamp=next_block_ts, only_weth_pivot=True):
         if p.profit < MIN_PROFIT_PREFILTER:
             n_ignored += 1
             continue
 
-        # if DEBUG:
-        #     # some debugging
-        #     exchange_outs = {}
-        #     amount = p.amount_in
-        #     for exc, dxn in zip(p.circuit, p.directions):
-        #         if dxn == True:
-        #             amount_out = exc.exact_token0_to_token1(amount, block_identifier=block_number)
-        #             token_out = exc.token1
-        #         else:
-        #             amount_out = exc.exact_token1_to_token0(amount, block_identifier=block_number)
-        #             token_out = exc.token0
-        #         amount_out = pricers.token_transfer.out_from_transfer(token_out, amount_out)
-        #         l.debug(f'{exc.address} out={amount_out}')
-        #         amount = amount_out
-        #         exchange_outs[exc.address] = amount_out
-        #     if amount != p.amount_in + p.profit:
-        #         l.warning(f'did not match up with profit! computed amount_out={amount_out} with profit={p.profit}')
-        #     # run it again using fresh pricers
-        #     amount = p.amount_in
-        #     for exc, dxn in zip(p.circuit, p.directions):
-        #         if isinstance(exc, UniswapV2Pricer):
-        #             pricer = UniswapV2Pricer(w3, exc.address, exc.token0, exc.token1)
-        #         else:
-        #             assert isinstance(exc, UniswapV3Pricer)
-        #             pricer = UniswapV3Pricer(w3, exc.address, exc.token0, exc.token1, exc.fee)
-        #         if dxn == True:
-        #             amount_out = pricer.exact_token0_to_token1(amount, block_identifier=block_number)
-        #             token_out = pricer.token1
-        #         else:
-        #             amount_out = pricer.exact_token1_to_token0(amount, block_identifier=block_number)
-        #             token_out = pricer.token0
-        #         amount_out = pricers.token_transfer.out_from_transfer(token_out, amount_out)
-        #         l.debug(f'fresh {exc.address} out={amount_out}')
-        #         if exchange_outs[exc.address] != amount_out:
-        #             l.debug(f'Amount_out {exc.address} changed from {exchange_outs[exc.address]} to {amount_out}')
-        #         amount = amount_out
-        #     if amount != p.amount_in + p.profit:
-        #         l.debug('This did not match after fresh pricer!!!!!!!! weird!!!!')
-        #         l.debug('----------------------------')
-        #         l.debug(f'Found arbitrage')
-        #         l.debug(f'block_number ..... {block_number}')
-        #         l.debug(f'amount_in ........ {p.amount_in}')
-        #         l.debug(f'expected profit .. {p.profit}')
-        #         for p, dxn in zip(p.circuit, p.directions):
-        #             l.debug(f'    address={p.address} zeroForOne={dxn}')
-        #         l.debug('----------------------------')
-        #         raise Exception('what is this')
+        if False:
+            # some debugging
+            exchange_outs = {}
+            amount = p.amount_in
+            for exc, (token_in, token_out) in zip(p.circuit, p.directions):
+                amount_out = exc.token_out_for_exact_in(token_in, token_out, amount, block_identifier=block_number, timestamp=next_block_ts)
+                amount_out = pricers.token_transfer.out_from_transfer(token_out, amount_out)
+                l.debug(f'{exc.address} out={amount_out}')
+                amount = amount_out
+                exchange_outs[exc.address] = amount_out
+            if amount != p.amount_in + p.profit:
+                l.warning(f'did not match up with profit! computed amount_out={amount_out} expected {p.amount_in + p.profit}')
+
+            # run it again using fresh pricers
+            amount = p.amount_in
+            for exc, (token_in, token_out) in zip(p.circuit, p.directions):
+                pricer = exc.copy_without_cache()
+                amount_out = pricer.token_out_for_exact_in(token_in, token_out, amount, block_identifier=block_number, timestamp=next_block_ts)
+                amount_out = pricers.token_transfer.out_from_transfer(token_out, amount_out)
+                amount = amount_out
+                l.debug(f'fresh {exc.address} out={amount_out}')
+                if exchange_outs[exc.address] != amount_out:
+                    l.debug(f'Amount_out {exc.address} changed from {exchange_outs[exc.address]} to {amount_out}')
+
+            if amount != p.amount_in + p.profit:
+                l.debug('This did not match after fresh pricer!!!!!!!! weird!!!!')
+                l.debug('----------------------------')
+                l.debug(f'Found arbitrage')
+                l.debug(f'block_number ..... {block_number}')
+                l.debug(f'amount_in ........ {p.amount_in}')
+                l.debug(f'expected profit .. {p.profit}')
+                for p, dxn in zip(p.circuit, p.directions):
+                    l.debug(f'    address={p.address} direction={dxn}')
+                l.debug('----------------------------')
+                raise Exception('what is this')
 
 
         # this is potentially profitable, log as a candidate
@@ -471,7 +465,7 @@ def process_candidates(
             """,
             (block_number, [bytes.fromhex(x.address[2:]) for x in p.circuit], dxns, p.amount_in, p.profit)
         )
-        (inserted_id,) = curr.fetchone()
+        # (inserted_id,) = curr.fetchone()
         # l.debug(f'inserted candidate id={inserted_id}')
         n_found += 1
         

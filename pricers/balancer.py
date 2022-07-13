@@ -8,8 +8,7 @@ import decimal
 import typing
 
 from pricers.block_observation_result import BlockObservationResult
-from pricers.uniswap_v3 import NotEnoughLiqudityException
-from .base import BaseExchangePricer
+from .base import BaseExchangePricer, NotEnoughLiquidityException
 import web3
 import web3.types
 import web3.contract
@@ -129,10 +128,7 @@ class BalancerPricer(BaseExchangePricer):
             self.token_denorms[address] = denorm
         return self.token_denorms[address]
 
-    def token_out_for_exact_in(self, token_in: str, token_out: str, token_amount_in: int, block_identifier: int):
-        if self.address == '0x69d460e01070A7BA1bc363885bC8F4F0daa19Bf5':
-            l.debug(f'{self.address}: testing {token_in} -> {token_out} for {token_amount_in}')
-
+    def token_out_for_exact_in(self, token_in: str, token_out: str, token_amount_in: int, block_identifier: int, **_):
         # modeled based off swapExactAmountIn
         # neglects minAmountOut and maxPrice
         _tokens = self.get_tokens(block_identifier)
@@ -150,7 +146,7 @@ class BalancerPricer(BaseExchangePricer):
 
         max_in = BalancerPricer.bmul(token_balance_in, MAX_IN_RATIO)
         if token_amount_in > max_in:
-            raise NotEnoughLiqudityException(None, None, remaining=token_amount_in - max_in)
+            raise NotEnoughLiquidityException(token_amount_in, remaining=token_amount_in - max_in)
 
         swap_fee = self.get_swap_fee(block_identifier)
 
@@ -167,15 +163,12 @@ class BalancerPricer(BaseExchangePricer):
         weight_ratio = BalancerPricer.bdiv(token_weight_in, token_weight_out)
         adjusted_in = BalancerPricer.bsub(BalancerPricer.BONE, swap_fee)
         adjusted_in = BalancerPricer.bmul(token_amount_in, adjusted_in)
-        assert adjusted_in < token_amount_in
+        assert adjusted_in <= token_amount_in, f'expect {adjusted_in} <= {token_amount_in}'
         y = BalancerPricer.bdiv(token_balance_in, BalancerPricer.badd(token_balance_in, adjusted_in))
         foo = BalancerPricer.bpow(y, weight_ratio) # their var name, not mine
         bar = BalancerPricer.bsub(BalancerPricer.BONE, foo)
 
-        print('bar', bar, bar / (BalancerPricer.BONE))
-
         token_amount_out = BalancerPricer.bmul(token_balance_out, bar)
-        print('token_amount_out', token_amount_out)
 
         new_balance_in  = token_balance_in + token_amount_in
         new_balance_out = token_balance_out - token_amount_out
@@ -200,7 +193,7 @@ class BalancerPricer(BaseExchangePricer):
         #     if spot_price_before > divd:
         #         raise TooLittleInput(self.address, block_identifier, f'BalancerV1 {self.address} ({token_in} -> {token_out}) @ {block_identifier} needs more input than {token_amount_in}')
 
-        return token_amount_out
+        return token_amount_out, BalancerPricer.BONE / spot_price_after
 
     def get_value_locked(self, token_address: str, block_identifier: int) -> int:
         assert token_address in self.get_tokens(block_identifier)
@@ -531,5 +524,10 @@ class BalancerPricer(BaseExchangePricer):
             i += 1
 
         return sum_
+
+    def copy_without_cache(self) -> 'BaseExchangePricer':
+        return BalancerPricer(
+            self.w3, self.address
+        )
 
 MAX_IN_RATIO = BalancerPricer.BONE // 2

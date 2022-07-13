@@ -11,6 +11,11 @@ def out_from_transfer(address: str, amount: int) -> int:
     """
     Get the amount actually sent to the recipient if transfer(.., amount) is called.
     """
+
+    # NOTE if this ever becomes anything other than a flat percentage, then
+    # we need to re-visit PricingCircuit.sample_new_price_ratio, which makes
+    # exactly that assumption
+
     if address in [SAITAMA_TOKEN, SANSHU_INU_TOKEN]:
         t_fee = amount // 100 * 2
         return amount - t_fee

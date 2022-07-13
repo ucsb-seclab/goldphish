@@ -53,12 +53,20 @@ class UniswapV2Pricer(BaseExchangePricer):
             self.known_token0_bal, self.known_token1_bal, _ = self.contract.functions.getReserves().call(block_identifier=block_identifier)
         return (self.known_token0_bal, self.known_token1_bal)
 
-    def token_out_for_exact_in(self, token_in: str, token_out: str, amount_in: int, block_identifier: int) -> int:
+    def token_out_for_exact_in(self, token_in: str, token_out: str, amount_in: int, block_identifier: int, **_) -> typing.Tuple[int, float]:
         if token_in == self.token0 and token_out == self.token1:
-            return self.exact_token0_to_token1(amount_in, block_identifier)
+            amt_out = self.exact_token0_to_token1(amount_in, block_identifier)
+            spot = (self.known_token1_bal - amt_out) / (self.known_token0_bal + amount_in)
         elif token_in == self.token1 and token_out == self.token0:
-            return self.exact_token1_to_token0(amount_in, block_identifier)
-        raise NotImplementedError()
+            amt_out = self.exact_token1_to_token0(amount_in, block_identifier)
+            spot = (self.known_token0_bal - amt_out) / (self.known_token1_bal + amount_in)
+        else:
+            raise NotImplementedError()
+
+        # factor in fee
+        spot *= 997 / 1000
+
+        return (amt_out, spot)
 
     def exact_token0_to_token1(self, token0_amount, block_identifier: int) -> int:
         # based off https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol#L43
@@ -140,7 +148,7 @@ class UniswapV2Pricer(BaseExchangePricer):
                     swap_enabled = None,
                     gradual_weight_adjusting_scheduled = None,
                 )
-        
+
         return BlockObservationResult(
             pair_prices_updated = [],
             swap_enabled = None,
@@ -163,4 +171,9 @@ class UniswapV2Pricer(BaseExchangePricer):
         )
         self.known_token0_bal = None
         self.known_token1_bal = None
+
+    def copy_without_cache(self) -> 'BaseExchangePricer':
+        return UniswapV2Pricer(
+            self.w3, self.address, self.token0, self.token1
+        )
 
