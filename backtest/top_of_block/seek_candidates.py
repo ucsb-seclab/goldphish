@@ -331,65 +331,17 @@ def get_relevant_logs(
 
     with utils.profiling.profile('get_logs'):
 
-        assert '0x5Fa464CEfe8901d66C09b85d5Fcdc55b3738c688' in pool._uniswap_v2_pools
-
         f: web3._utils.filters.Filter = w3.eth.filter({
-            'address': list(pool._uniswap_v2_pools.keys()),
-            'topics': [['0x' + x.hex() for x in UniswapV2Pricer.RELEVANT_LOGS]],
             'fromBlock': batch_start_block,
             'toBlock': batch_end_block,
         })
 
         logs = f.get_all_entries()
 
-        l.debug('got uniswap v2 logs')
-
-        f: web3._utils.filters.Filter = w3.eth.filter({
-            'address': list(pool._uniswap_v3_pools.keys()),
-            'topics': [['0x' + x.hex() for x in UniswapV3Pricer.RELEVANT_LOGS]],
-            'fromBlock': batch_start_block,
-            'toBlock': batch_end_block,
-        })
-
-        logs.extend(f.get_all_entries())
-
-        l.debug('got uniswap v3 logs')
-
-        f: web3._utils.filters.Filter = w3.eth.filter({
-            'address': list(pool._sushiswap_v2_pools.keys()),
-            'topics': [['0x' + x.hex() for x in UniswapV2Pricer.RELEVANT_LOGS]],
-            'fromBlock': batch_start_block,
-            'toBlock': batch_end_block,
-        })
-
-        logs.extend(f.get_all_entries())
-
-        l.debug('got sushiswap v2 logs')
-
-        f: web3._utils.filters.Filter = w3.eth.filter({
-            'address': list(pool._balancer_v1_pools.keys()),
-            'topics': [['0x' + x.hex() for x in BalancerPricer.RELEVANT_LOGS]],
-            'fromBlock': batch_start_block,
-            'toBlock': batch_end_block,
-        })
-
-        logs.extend(f.get_all_entries())
-
-        l.debug('got balancer v1 logs')
-
-        f: web3._utils.filters.Filter = w3.eth.filter({
-            'address': list(pool._balancer_v2_pools.keys()) + [BALANCER_VAULT_ADDRESS],
-            'fromBlock': batch_start_block,
-            'toBlock': batch_end_block,
-        })
-
-        logs.extend(f.get_all_entries())
-
-        l.debug('got balancer v2 logs')
-
-        logs = sorted(logs, key=lambda x: (x['blockNumber'], x['logIndex']))
-
         l.debug(f'got {len(logs):,} logs this batch')
+
+    important_addresses = pool.monitored_addresses()
+    logs = list(x for x in logs if x['address'] in important_addresses)
 
     gather = collections.defaultdict(lambda: [])
     for log in logs:

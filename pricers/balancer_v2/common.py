@@ -499,3 +499,9 @@ def _ln_36(x: int) -> int:
     # All that remains is multiplying by 2 (non fixed point).
 
     return seriesSum * 2
+
+def spot(balance_in, weight_in, balance_out, weight_out, swap_fee) -> float:
+    ratio = weight_in / weight_out
+    spot_no_fee = balance_out / (balance_in + 1) * ratio
+    spot_with_fee = spot_no_fee * (ONE - swap_fee) / ONE
+    return spot_with_fee

@@ -56,15 +56,24 @@ class UniswapV2Pricer(BaseExchangePricer):
     def token_out_for_exact_in(self, token_in: str, token_out: str, amount_in: int, block_identifier: int, **_) -> typing.Tuple[int, float]:
         if token_in == self.token0 and token_out == self.token1:
             amt_out = self.exact_token0_to_token1(amount_in, block_identifier)
-            spot = (self.known_token1_bal - amt_out) / (self.known_token0_bal + amount_in)
+            new_reserve_in  = self.known_token0_bal + amount_in
+            new_reserve_out = self.known_token1_bal - amt_out
         elif token_in == self.token1 and token_out == self.token0:
             amt_out = self.exact_token1_to_token0(amount_in, block_identifier)
-            spot = (self.known_token0_bal - amt_out) / (self.known_token1_bal + amount_in)
+            new_reserve_in  = self.known_token1_bal + amount_in
+            new_reserve_out = self.known_token0_bal - amt_out
         else:
             raise NotImplementedError()
 
-        # factor in fee
-        spot *= 997 / 1000
+        if new_reserve_out == 0:
+            spot = 0
+        else:
+            # how much out do we get for 1 unit in?
+            # https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol#L43
+            amount_in_with_fee = 1 * 997
+            numerator = amount_in_with_fee * new_reserve_out
+            denominator = new_reserve_in * 1_000 + amount_in_with_fee
+            spot = numerator / denominator
 
         return (amt_out, spot)
 

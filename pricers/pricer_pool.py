@@ -454,6 +454,7 @@ class PricerPool:
 
 
     def _maybe_log_stats(self):
+        return # don't log ever for now
         if time.time() > self._last_stat_log_ts + self.__class__.STAT_LOG_PERIOD_SECONDS:
             # do log
             hits = self._cache_hits

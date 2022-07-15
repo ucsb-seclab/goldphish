@@ -100,12 +100,10 @@ class UniswapV3Pricer(BaseExchangePricer):
         raise NotImplementedError()
 
     def exact_token0_to_token1(self, token0_in: int, block_identifier) -> typing.Tuple[int, float]:
-        assert token0_in >= 0
         (_, ret, price) = self.swap(zero_for_one=True, amount_specified=token0_in, sqrt_price_limitX96=None, block_identifier=block_identifier)
         return -ret, price
 
     def exact_token1_to_token0(self, token1_in: int, block_identifier) -> typing.Tuple[int, float]:
-        assert token1_in >= 0
         (ret, _, price) = self.swap(zero_for_one=False, amount_specified=token1_in, sqrt_price_limitX96=None, block_identifier=block_identifier)
         return -ret, price
 
@@ -130,7 +128,13 @@ class UniswapV3Pricer(BaseExchangePricer):
             if zero_for_one:
                 price = sqrt_price_x96 * sqrt_price_x96 / (1 << 192)
             else:
-                price = (1 << 192) / (sqrt_price_x96 * sqrt_price_x96)
+                if sqrt_price_x96 == 0:
+                    # not initialized, cannot buy anything for any price
+                    price = 0
+                else:
+                    price = (1 << 192) / (sqrt_price_x96 * sqrt_price_x96)
+
+            price *= (10 ** 6 - self.fee) / (10 ** 6)
 
             return (0, 0, price)
 
@@ -197,7 +201,7 @@ class UniswapV3Pricer(BaseExchangePricer):
                 amount_specified_remaining += amount_out
                 amount_calculated = amount_calculated + (amount_in + fee_amount)
 
-            if sqrt_price_next_X96 == sqrt_price_next_X96: # TODO this is broken is it of any consequence?
+            if sqrt_price_x96 == sqrt_price_next_X96: # TODO this is broken is it of any consequence?
                 if initialized:
                     tick_obj = self.tick_at(next_tick_num, block_identifier)
                     if zero_for_one:
@@ -207,8 +211,7 @@ class UniswapV3Pricer(BaseExchangePricer):
                     assert liquidity >= 0
                 tick = next_tick_num - 1 if zero_for_one else next_tick_num
             elif sqrt_price_x96 != sqrt_price_start_x96:
-                raise NotImplementedError('never got around to this')
-                # tick = UniswapV3Pricer.get_tick_at_sqrt_ratio(sqrt_price_x96)
+                tick = UniswapV3Pricer.get_tick_at_sqrt_ratio(sqrt_price_x96)
 
         if zero_for_one == exact_input:
             amount0 = amount_specified - amount_specified_remaining
@@ -555,7 +558,140 @@ class UniswapV3Pricer(BaseExchangePricer):
         return r
 
     @staticmethod
+    def get_tick_at_sqrt_ratio(sqrt_ratio_x96: int) -> int:
+        assert sqrt_ratio_x96 > 0
+        assert UniswapV3Pricer.MIN_SQRT_RATIO <= sqrt_ratio_x96 < UniswapV3Pricer.MAX_SQRT_RATIO
+
+        ratio = sqrt_ratio_x96 << 32
+
+        r = ratio
+        msb = 0
+
+        f = (1 if r > 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF else 0) << 7
+        msb = msb | f
+        r = r >> f
+
+        f = (1 if r > 0xFFFFFFFFFFFFFFFF else 0) << 6
+        msb = msb | f
+        r = r >> f
+
+        f = (1 if r > 0xFFFFFFFF else 0) << 5
+        msb = msb | f
+        r = r >> f
+
+        f = (1 if r > 0xFFFF else 0) << 4
+        msb = msb | f
+        r = r >> f
+
+        f = (1 if r > 0xFF else 0) << 3
+        msb = msb | f
+        r = r >> f
+
+        f = (1 if r > 0xF else 0) << 2
+        msb = msb | f
+        r = r >> f
+
+        f = (1 if r > 0x3 else 0) << 1
+        msb = msb | f
+        r = r >> f
+
+        f = (1 if r > 0x1 else 0)
+        msb = msb | f
+
+        if msb >= 128:
+            r = ratio >> (msb - 127)
+        else:
+            r = ratio << (127 - msb)
+
+        log_2 = (msb - 128) << 64
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 63)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 62)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 61)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 60)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 59)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 58)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 57)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 56)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 55)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 54)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 53)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 52)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 51)
+        r = r >> f
+
+        r = (r * r) >> 127
+        f = r >> 128
+        log_2 = log_2 | (f << 50)
+
+
+        log_sqrt10001 = log_2 * 255738958999603826347141
+
+        tickLow = ((log_sqrt10001 - 3402992956809132418596140100660247210) >> 128) # & ((1 << 24) - 1)
+        tickHi = ((log_sqrt10001 + 291339464771989622907027621153398088495) >> 128) # & ((1 << 24) - 1)
+
+        if tickLow == tickHi:
+            return tickLow
+        else:
+            if UniswapV3Pricer.get_sqrt_ratio_at_tick(tickHi) <= sqrt_ratio_x96:
+                return tickHi
+            else:
+                return tickLow
+
+
+    @staticmethod
     def get_sqrt_ratio_at_tick(tick_num: int) -> int:
+        print('tick_num', tick_num)
         abs_tick = abs(tick_num)
         assert abs_tick <= UniswapV3Pricer.MAX_TICK
         # idk, taken from https://github.com/Uniswap/v3-core/blob/main/contracts/libraries/TickMath.sol#L24

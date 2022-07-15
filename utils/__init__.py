@@ -1,9 +1,11 @@
+import asyncio
 import datetime
 import typing
 import os
 import json
 import time
 import logging
+import backoff
 import scipy.stats
 import logging
 import logging.handlers
@@ -13,7 +15,9 @@ import web3
 import web3.types
 import web3.contract
 import random
+import websockets.exceptions
 
+from web3.providers.base import JSONBaseProvider
 
 from .throttler import BlockThrottle
 from .profiling import get_measurement, reset_measurement, profile
@@ -58,7 +62,7 @@ class ColoredFormatter(logging.Formatter):
 
 def setup_logging(job_name = None, suppress: typing.List[str] = [], worker_name: typing.Optional[str] = None, root_dir = None, stdout_level = None):
     if root_dir is None:
-        root_dir = '/mnt/goldphish'
+        root_dir = os.getenv('STORAGE_DIR', '/mnt/goldphish')
 
     if stdout_level is None:
         stdout_level = logging.DEBUG
@@ -93,6 +97,56 @@ def setup_logging(job_name = None, suppress: typing.List[str] = [], worker_name:
                   'web3.RequestManager', 'websockets.server', 'asyncio', 'pika'] + suppress:
         logging.getLogger(lname).setLevel(logging.WARNING)
 
+
+class RetryingProvider(JSONBaseProvider):
+    _internal_provider: web3.WebsocketProvider
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._internal_provider = None
+        self._connect()
+
+    def _connect(self):
+        l.debug('connecting to web3')
+        web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
+
+        self._internal_provider = web3.WebsocketProvider(
+            web3_host,
+            websocket_timeout=60 * 5,
+            websocket_kwargs={
+                'max_size': 1024 * 1024 * 1024, # 1 Gb max payload
+            },
+        )
+
+    @backoff.on_exception(
+        backoff.expo,
+        (
+            websockets.exceptions.ConnectionClosedError,
+            asyncio.exceptions.TimeoutError,
+        ),
+        max_time = 10 * 60,
+        factor = 4,
+        on_backoff = lambda x: x['args'][0]._connect()
+    )
+    def make_request(self, method, params):
+        request_data = self.encode_rpc_request(method, params)
+        future = asyncio.run_coroutine_threadsafe(
+            self._internal_provider.coro_make_request(request_data),
+            web3.WebsocketProvider._loop
+        )
+        return future.result()
+
+
+def connect_web3() -> web3.Web3:
+    w3 = web3.Web3(RetryingProvider())
+
+    if not w3.isConnected():
+        l.error(f'Could not connect to web3')
+        exit(1)
+
+    l.debug(f'Connected to web3, chainId={w3.eth.chain_id}')
+
+    return w3
 
 def read_mem(start, read_len, mem):
     b = b''

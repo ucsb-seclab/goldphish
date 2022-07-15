@@ -21,8 +21,9 @@ from backtest.top_of_block.verify import do_verify
 
 import backtest.top_of_block.measure_tvl
 import backtest.top_of_block.seek_candidates
+import backtest.top_of_block.replicate_samples
 
-from utils import setup_logging
+from utils import connect_web3, setup_logging
 
 l = logging.getLogger(__name__)
 
@@ -40,6 +41,9 @@ def main():
     cmd, handler = backtest.top_of_block.measure_tvl.add_args(subparser)
     handlers[cmd] = handler
 
+    cmd, handler = backtest.top_of_block.replicate_samples.add_args(subparser)
+    handlers[cmd] = handler
+
     args = parser.parse_args()
 
     if args.worker_name is None:
@@ -54,15 +58,7 @@ def main():
     # Connect to web3
     #
 
-    web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
-
-    w3 = web3.Web3(web3.WebsocketProvider(
-        web3_host,
-        websocket_timeout=60 * 5,
-        websocket_kwargs={
-            'max_size': 1024 * 1024 * 1024, # 1 Gb max payload
-        },
-    ))
+    w3 = connect_web3()
 
     if not w3.isConnected():
         l.error(f'Could not connect to web3')
@@ -70,31 +66,12 @@ def main():
 
     l.debug(f'Connected to web3, chainId={w3.eth.chain_id}')
 
-    handlers[args.subcommand](w3, args)
-    exit(1)
-
     try:
-        if args.mode == 'verify':
-            l.info(f'Verifying candidate arbitrages')
-            do_verify(w3, job_name, args.worker_name)
-        elif args.mode == 'diagnose':
-            l.info(f'Diagnosing failures')
-            do_diagnose(w3)
-        elif args.mode == 'trace':
-            assert args.id is not None
-            print_trace(w3, args.id)
-        elif args.mode == 'connect':
-            do_find_arb_termination(w3)
-        elif args.mode == 'cleanup':
-            do_cleanup()
-        elif args.mode == 'measure-tvl':
-            pass
-        else:
-            assert args.mode is None
-            seek_candidates(w3, job_name, args.worker_name)
+        handlers[args.subcommand](w3, args)
     except:
-        l.exception('fatal exception')
+        l.exception('top-level exception')
         raise
+
 
 if __name__ == '__main__':
     main()

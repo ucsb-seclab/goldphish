@@ -5,7 +5,6 @@ import time
 import typing
 import psycopg2.extensions
 import tempfile
-import random
 import web3
 import pika
 import web3.types

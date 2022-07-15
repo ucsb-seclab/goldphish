@@ -11,7 +11,7 @@ from pricers.block_observation_result import BlockObservationResult
 from utils import get_abi
 
 from pricers.base import BaseExchangePricer, NotEnoughLiquidityException
-from pricers.balancer_v2.common import ONE, POOL_BALANCE_CHANGED_TOPIC, POOL_REGISTERED_TOPIC, SWAP_TOPIC, TOKENS_DEREGISTERED_TOPIC, TOKENS_REGISTERED_TOPIC, _vault, complement, div_down, div_up, downscale_down, mul_down, mul_up, pow_up, pow_up_legacy, upscale
+from pricers.balancer_v2.common import ONE, POOL_BALANCE_CHANGED_TOPIC, POOL_REGISTERED_TOPIC, SWAP_TOPIC, TOKENS_DEREGISTERED_TOPIC, TOKENS_REGISTERED_TOPIC, _vault, complement, div_down, div_up, downscale_down, mul_down, mul_up, pow_up, pow_up_legacy, spot, upscale
 
 
 l = logging.getLogger(__name__)
@@ -122,25 +122,46 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
         ret = mul_down(balance_out, complement(power_))
         ret = downscale_down(self.w3, token_out, ret)
 
-        spot_out = BalancerPricer.BONE / BalancerPricer.calc_spot_price(
-            token_balance_in  = balance_in_not_scaled + token_amount_in_not_scaled,
-            token_weight_in   = weight_in,
-            token_balance_out = balance_out_not_scaled - ret,
-            token_weight_out  = weight_out,
-            swap_fee          = swap_fee
+        spot_out = spot(
+            balance_in_not_scaled + token_amount_in_not_scaled,
+            weight_in,
+            balance_out_not_scaled - ret,
+            weight_out,
+            swap_fee
         )
-        curr_price = ret / token_amount_in_not_scaled
-        if ret > 100:
-            assert curr_price > spot_out
+
+        # if ret > 100 and token_amount_in_not_scaled > 0:
+        #     curr_price = ret / token_amount_in_not_scaled
+        #     # There's some weirdness here with marginal price when it takes a certain minimum amount to get any out
+        #     # in the first place. Then we end up with a hockey-stick shape on a graph like so:
+        #     #
+        #     #            |     /
+        #     #            |    /
+        #     # amount_out |   /
+        #     #            |  /
+        #     #            +-----------------
+        #     #                 amount_in
+        #     #
+        #     # which means that measuring current price as out / in isn't /really/ accurate since there's some "flat fee"
+        #     # at the start there -- warn anyway when this situation occurs
+
+        #     percent_diff = (spot_out - curr_price) / curr_price * 100
+        #     if percent_diff >= 5:
+        #         # only give a warning for this -- 
+        #         l.warning(f'diff       {percent_diff:.08}%')
+        #         l.warning(f'spot_out   {spot_out}')
+        #         l.warning(f'curr_price {curr_price}')
+        #         l.warning(f'address    {self.address}')
+        #         l.warning(f'pool_id    {self.pool_id.hex()}')
+        #         l.warning(f'block      {block_identifier}')
+        #         l.warning(f'token_in   {token_in}')
+        #         l.warning(f'token_out  {token_out}')
+        #         l.warning(f'amount_in  {token_amount_in_not_scaled}')
+        #         l.warning(f'amount_out {ret}')
+        #         # raise Exception('this should not occur')
+        #     return ret, spot_out
 
         return ret, spot_out
-
-    @staticmethod
-    def spot(balance_in, weight_in, balance_out, weight_out) -> float:
-        exponent = weight_in / weight_out
-        power = pow(balance_in, exponent)
-        complement = 1 - power
-        return balance_out * complement
 
     def get_value_locked(self, token_address: str, block_identifier: int) -> int:
         assert token_address in self.get_tokens(block_identifier)

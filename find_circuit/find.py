@@ -8,6 +8,7 @@ import math
 import typing
 
 import logging
+import numpy as np
 import scipy.optimize
 from pricers.balancer import TooLittleInput
 import pricers.token_transfer
@@ -135,136 +136,136 @@ class PricingCircuit:
         self._directions = list((t2, t1) for (t1, t2) in reversed(self._directions))
 
 
-def detect_arbitrages(
-        pc: PricingCircuit,
-        block_identifier: int,
-        timestamp: typing.Optional[int] = None,
-        only_weth_pivot = False
-    ) -> typing.List[FoundArbitrage]:
-    """
-    KEPT FOR LEGACY REFERENCE -- use the variant _bisection below
-    """
-    l.error('USING legacy arbitrage detector!!!!')
+# def detect_arbitrages(
+#         pc: PricingCircuit,
+#         block_identifier: int,
+#         timestamp: typing.Optional[int] = None,
+#         only_weth_pivot = False
+#     ) -> typing.List[FoundArbitrage]:
+#     """
+#     KEPT FOR LEGACY REFERENCE -- use the variant _bisection below
+#     """
+#     l.error('USING legacy arbitrage detector!!!!')
 
 
-    ret = []
+#     ret = []
 
-    # for each rotation
-    for _ in range(len(pc._circuit)):
-        def run_exc(i):
-            try:
-                return pc.sample(math.ceil(i), block_identifier, timestamp=timestamp) if i >= 0 else -(i + 1000) # encourage optimizer to explore toward +direction
-            except NotEnoughLiquidityException as e:
-                # encourage going toward available liquidity
-                return -(1000 + e.remaining)
+#     # for each rotation
+#     for _ in range(len(pc._circuit)):
+#         def run_exc(i):
+#             try:
+#                 return pc.sample(math.ceil(i), block_identifier, timestamp=timestamp) if i >= 0 else -(i + 1000) # encourage optimizer to explore toward +direction
+#             except NotEnoughLiquidityException as e:
+#                 # encourage going toward available liquidity
+#                 return -(1000 + e.remaining)
 
-        # try each direction
-        for _ in range(2):
+#         # try each direction
+#         for _ in range(2):
 
-            if not (only_weth_pivot and pc.pivot_token != WETH_ADDRESS):
-                # quickly try pushing 100 tokens -- if unprofitable, fail
-                with profile('pricing_quick_check'):
-                    quick_test_amount_in = 100
-                    try:
-                        for quick_test_amount_in_zeros in range(2, 22):
-                            quick_test_amount_in = 10 ** quick_test_amount_in_zeros
-                            try:
-                                quick_test_pr = pc.sample_new_price_ratio(quick_test_amount_in, block_identifier, timestamp=timestamp)
-                                break
-                            except TooLittleInput:
-                                # try the next largest amount
-                                continue
-                        else:
-                            # exhausted quick_test_amount_in options -- probably there's no way to pump enough liquidity
-                            # to this exchange just yet
-                            continue
-                    except NotEnoughLiquidityException:
-                        # not profitable most likely
-                        continue
+#             if not (only_weth_pivot and pc.pivot_token != WETH_ADDRESS):
+#                 # quickly try pushing 100 tokens -- if unprofitable, fail
+#                 with profile('pricing_quick_check'):
+#                     quick_test_amount_in = 100
+#                     try:
+#                         for quick_test_amount_in_zeros in range(2, 22):
+#                             quick_test_amount_in = 10 ** quick_test_amount_in_zeros
+#                             try:
+#                                 quick_test_pr = pc.sample_new_price_ratio(quick_test_amount_in, block_identifier, timestamp=timestamp)
+#                                 break
+#                             except TooLittleInput:
+#                                 # try the next largest amount
+#                                 continue
+#                         else:
+#                             # exhausted quick_test_amount_in options -- probably there's no way to pump enough liquidity
+#                             # to this exchange just yet
+#                             continue
+#                     except NotEnoughLiquidityException:
+#                         # not profitable most likely
+#                         continue
 
 
-                with profile('pricing_optimize'):
-                    if quick_test_pr > 1:
-                        # this may be profitable
+#                 with profile('pricing_optimize'):
+#                     if quick_test_pr > 1:
+#                         # this may be profitable
 
-                        with profile('bounds_seek'):
-                            # search for crossing-point where liquidity does not run out
-                            lower_bound = quick_test_amount_in
-                            upper_bound = (100_000 * (10 ** 18)) # a shit-ton of ether
-                            try:
-                                pc.sample(upper_bound, block_identifier, timestamp=timestamp)
-                            except NotEnoughLiquidityException as e:                                
-                                # we need to adjust upper_bound down juuuust until it's in liquidity range
-                                # do this by binary-search
-                                search_lower = lower_bound
-                                search_upper = upper_bound
-                                while True:
-                                    # rapidly reduce upper bound by orders of 10
-                                    x = search_upper // 10
-                                    try:
-                                        pc.sample(x, block_identifier, timestamp=timestamp)
-                                        break
-                                    except NotEnoughLiquidityException:
-                                        search_upper = x
+#                         with profile('bounds_seek'):
+#                             # search for crossing-point where liquidity does not run out
+#                             lower_bound = quick_test_amount_in
+#                             upper_bound = (100_000 * (10 ** 18)) # a shit-ton of ether
+#                             try:
+#                                 pc.sample(upper_bound, block_identifier, timestamp=timestamp)
+#                             except NotEnoughLiquidityException as e:                                
+#                                 # we need to adjust upper_bound down juuuust until it's in liquidity range
+#                                 # do this by binary-search
+#                                 search_lower = lower_bound
+#                                 search_upper = upper_bound
+#                                 while True:
+#                                     # rapidly reduce upper bound by orders of 10
+#                                     x = search_upper // 10
+#                                     try:
+#                                         pc.sample(x, block_identifier, timestamp=timestamp)
+#                                         break
+#                                     except NotEnoughLiquidityException:
+#                                         search_upper = x
 
-                                while search_lower < search_upper - 1:
-                                    midpoint = search_lower + (search_upper - search_lower) * 3 // 10
-                                    midpoint = (search_lower + search_upper) // 2
-                                    try:
-                                        pc.sample(midpoint, block_identifier)
-                                        search_lower = midpoint
-                                    except NotEnoughLiquidityException as e:
-                                        search_upper = midpoint
+#                                 while search_lower < search_upper - 1:
+#                                     midpoint = search_lower + (search_upper - search_lower) * 3 // 10
+#                                     midpoint = (search_lower + search_upper) // 2
+#                                     try:
+#                                         pc.sample(midpoint, block_identifier)
+#                                         search_lower = midpoint
+#                                     except NotEnoughLiquidityException as e:
+#                                         search_upper = midpoint
                                     
-                                upper_bound = search_lower
+#                                 upper_bound = search_lower
 
 
-                        with profiling.profile('minimize_scalar'):
-                            result = scipy.optimize.minimize_scalar(
-                                fun = lambda x: - (run_exc(x) - x),
-                                bounds = (
-                                    lower_bound, # only a little
-                                    upper_bound, # a shit-ton
-                                ),
-                                method='bounded',
-                            )
+#                         with profiling.profile('minimize_scalar'):
+#                             result = scipy.optimize.minimize_scalar(
+#                                 fun = lambda x: - (run_exc(x) - x),
+#                                 bounds = (
+#                                     lower_bound, # only a little
+#                                     upper_bound, # a shit-ton
+#                                 ),
+#                                 method='bounded',
+#                             )
 
-                        if result.fun < 0:
-                            amount_in = math.ceil(result.x)
-                            expected_profit = pc.sample(amount_in, block_identifier, timestamp=timestamp) - amount_in
+#                         if result.fun < 0:
+#                             amount_in = math.ceil(result.x)
+#                             expected_profit = pc.sample(amount_in, block_identifier, timestamp=timestamp) - amount_in
 
-                            # if reducing input by 1 wei results in the same amount out, then use that value (rounding gets fucky)
-                            for i in itertools.count(1):
-                                token_in, token_out = pc.directions[0]
-                                out_normal = pc.circuit[0].token_out_for_exact_in(token_in, token_out, amount_in, block_identifier=block_identifier)
-                                out_reduced_by_1 = pc.circuit[0].token_out_for_exact_in(token_in, token_out, amount_in - 1, block_identifier=block_identifier)
+#                             # if reducing input by 1 wei results in the same amount out, then use that value (rounding gets fucky)
+#                             for i in itertools.count(1):
+#                                 token_in, token_out = pc.directions[0]
+#                                 out_normal = pc.circuit[0].token_out_for_exact_in(token_in, token_out, amount_in, block_identifier=block_identifier)
+#                                 out_reduced_by_1 = pc.circuit[0].token_out_for_exact_in(token_in, token_out, amount_in - 1, block_identifier=block_identifier)
 
-                                if out_normal == out_reduced_by_1:
-                                    amount_in -= 1
-                                    expected_profit += 1
-                                else:
-                                    break
+#                                 if out_normal == out_reduced_by_1:
+#                                     amount_in -= 1
+#                                     expected_profit += 1
+#                                 else:
+#                                     break
 
-                            # for i in itertools.count(1):
-                            #     trying_amount_in = amount_in - i
-                            #     expected_profit_new = pc.sample(trying_amount_in, block_identifier, timestamp=timestamp) - amount_in
-                            #     if expected_profit_new < expected_profit:
-                            #         break # profit going down, give up
+#                             # for i in itertools.count(1):
+#                             #     trying_amount_in = amount_in - i
+#                             #     expected_profit_new = pc.sample(trying_amount_in, block_identifier, timestamp=timestamp) - amount_in
+#                             #     if expected_profit_new < expected_profit:
+#                             #         break # profit going down, give up
 
-                            if expected_profit <= 0:
-                                l.warning('fun indicated profit but expected profit did not!')
-                            else:
-                                to_add = FoundArbitrage(
-                                    amount_in   = amount_in,
-                                    directions  = pc.directions,
-                                    circuit     = pc.circuit,
-                                    pivot_token = pc.pivot_token,
-                                    profit      = expected_profit,
-                                )
-                                ret.append(to_add)
-            pc.flip()
-        pc.rotate()
-    return ret
+#                             if expected_profit <= 0:
+#                                 l.warning('fun indicated profit but expected profit did not!')
+#                             else:
+#                                 to_add = FoundArbitrage(
+#                                     amount_in   = amount_in,
+#                                     directions  = pc.directions,
+#                                     circuit     = pc.circuit,
+#                                     pivot_token = pc.pivot_token,
+#                                     profit      = expected_profit,
+#                                 )
+#                                 ret.append(to_add)
+#             pc.flip()
+#         pc.rotate()
+#     return ret
 
 
 def detect_arbitrages_bisection(
@@ -287,6 +288,7 @@ def detect_arbitrages_bisection(
 
             if not (only_weth_pivot and pc.pivot_token != WETH_ADDRESS):
                 # quickly try pushing 100 tokens -- if unprofitable, fail
+
                 with profile('pricing_quick_check'):
                     quick_test_amount_in = 100
                     try:
@@ -305,8 +307,7 @@ def detect_arbitrages_bisection(
                     except NotEnoughLiquidityException:
                         # not profitable most likely
                         continue
-
-
+                
                 with profile('pricing_optimize'):
                     if quick_test_pr > 1:
                         # this may be profitable
@@ -327,6 +328,7 @@ def detect_arbitrages_bisection(
                                 x = search_upper // 10
                                 try:
                                     pc.sample(x, block_identifier, timestamp=timestamp)
+                                    search_lower = max(search_lower, x)
                                     break
                                 except NotEnoughLiquidityException:
                                     search_upper = x
@@ -334,19 +336,63 @@ def detect_arbitrages_bisection(
                             while search_lower < search_upper - 1:
                                 midpoint = (search_lower + search_upper) // 2
                                 try:
-                                    pc.sample(midpoint, block_identifier)
+                                    pc.sample(midpoint, block_identifier, timestamp=timestamp)
                                     search_lower = midpoint
                                 except NotEnoughLiquidityException:
                                     search_upper = midpoint
                             upper_bound = search_lower
 
+                        out_lower_bound = pc.sample(lower_bound, block_identifier, timestamp=timestamp)
+                        out_upper_bound = pc.sample(upper_bound, block_identifier, timestamp=timestamp)
+
+                        if out_upper_bound < 100:
+                            # haven't managed to get anything out with the most money we can pump through, abandon
+                            continue
+
+                        if out_lower_bound < 100:
+                            # search for crossing-point where (some) positive tokens come out of lower bound
+                            lower_bound_search_upper = upper_bound
+                            while lower_bound < lower_bound_search_upper - 100:
+                                midpoint = (lower_bound + lower_bound_search_upper) // 2
+                                midpoint_out = pc.sample(midpoint, block_identifier, timestamp=timestamp)
+                                if midpoint_out < 100:
+                                    lower_bound = midpoint
+                                else:
+                                    lower_bound_search_upper = midpoint
+                                    out_lower_bound = midpoint_out
+                            lower_bound = lower_bound_search_upper
+
+                        assert lower_bound <= upper_bound, f'expect {lower_bound} <= {upper_bound}'
+
+                        if out_lower_bound <= lower_bound:
+                            # lower bound is already not profitable
+                            continue
+
                         mp_lower_bound = pc.sample_new_price_ratio(lower_bound, block_identifier, timestamp=timestamp)
                         mp_upper_bound = pc.sample_new_price_ratio(upper_bound, block_identifier, timestamp=timestamp)
 
-                        assert mp_lower_bound > mp_upper_bound
-                        assert 1 < mp_lower_bound
+                        if mp_lower_bound < 1:
+                            amount_in = lower_bound
+                        elif mp_upper_bound > 1:
+                            amount_in = upper_bound
+                        else:
+                            if mp_lower_bound <= mp_upper_bound:
+                                # about to fail, dump info
+                                for p, (t_in, t_out) in zip(pc.circuit, pc.directions):
+                                    print(type(p).__name__, p.address, t_in, t_out)
+                                with open('/mnt/goldphish/pts.txt', mode='w') as fout:
+                                    for amt_in in np.linspace(lower_bound, upper_bound, 200):
+                                        amt_in = int(np.ceil(amt_in))
+                                        profit = pc.sample(amt_in, block_identifier, timestamp=timestamp) - amt_in
+                                        price = pc.sample_new_price_ratio(amt_in, block_identifier, timestamp=timestamp, debug=True)
+                                        fout.write(f'{amt_in},{profit},{price}\n')
+                                print('lower_bound', lower_bound)
+                                print('upper_bound', upper_bound)
+                                print('mp_lower_bound', mp_lower_bound)
+                                print('mp_upper_bound', mp_upper_bound)
+                            assert mp_lower_bound > mp_upper_bound
+                            assert 1 < mp_lower_bound
 
-                        if 1 > mp_upper_bound:
                             # the root (marginal price = 1) lies somewhere within the bounds
                             with profiling.profile('root_find'):
                                 # guess is linear midpoint between the two
@@ -374,22 +420,33 @@ def detect_arbitrages_bisection(
                                     x0 = pt1
                                 )
                             amount_in = math.ceil(result.root)
-                        else:
-                            amount_in = upper_bound
 
                         expected_profit = pc.sample(amount_in, block_identifier, timestamp=timestamp) - amount_in
 
-                        # if reducing input by 1 wei results in the same amount out, then use that value (rounding gets fucky)
-                        for i in itertools.count(1):
-                            token_in, token_out = pc.directions[0]
-                            out_normal, _ = pc.circuit[0].token_out_for_exact_in(token_in, token_out, amount_in, block_identifier=block_identifier)
-                            out_reduced_by_1, _ = pc.circuit[0].token_out_for_exact_in(token_in, token_out, amount_in - 1, block_identifier=block_identifier)
+                        # quickly reduce input amount (optimizes for rounding)
+                        input_reduction = 0
+                        first_token_in, first_token_out = pc.directions[0]
+                        first_out_normal, _ = pc.circuit[0].token_out_for_exact_in(first_token_in, first_token_out, amount_in, block_identifier=block_identifier)
 
-                            if out_normal == out_reduced_by_1:
-                                amount_in -= 1
-                                expected_profit += 1
+                        for i in range(0, 21):
+                            attempting_reduction = 10 ** i
+                            if attempting_reduction >= amount_in:
+                                break
+
+                            try:
+                                out_reduced, _ = pc.circuit[0].token_out_for_exact_in(first_token_in, first_token_out, amount_in - attempting_reduction, block_identifier=block_identifier)
+                            except NotEnoughLiquidityException:
+                                l.critical(f'Ran out of liquidity while sampling {amount_in - attempting_reduction} on {pc.circuit[0].address}')
+                                raise
+
+                            if first_out_normal == out_reduced:
+                                input_reduction = attempting_reduction
                             else:
                                 break
+                        if input_reduction > 0:
+                            # l.debug(f'Reduced input by {input_reduction} to optimize')
+                            amount_in -= input_reduction
+                            expected_profit += input_reduction
 
                         # for i in itertools.count(1):
                         #     trying_amount_in = amount_in - i
@@ -398,7 +455,17 @@ def detect_arbitrages_bisection(
                         #         break # profit going down, give up
 
                         if expected_profit <= 0:
-                            l.warning('fun indicated profit but expected profit did not!')
+                            # for p, (t_in, t_out) in zip(pc.circuit, pc.directions):
+                            #     print(type(p).__name__, p.address, t_in, t_out)
+                            # with open('/mnt/goldphish/pts.txt', mode='w') as fout:
+                            #     for amt_in in np.linspace(lower_bound, amount_in * 1.1, 200):
+                            #         amt_in = int(np.ceil(amt_in))
+                            #         profit = pc.sample(amt_in, block_identifier, timestamp=timestamp) - amt_in
+                            #         price = pc.sample_new_price_ratio(amt_in, block_identifier, timestamp=timestamp, debug=True)
+                            #         fout.write(f'{amt_in},{profit},{price}\n')
+                            # pc.sample(amount_in, block_identifier, timestamp=timestamp, debug=True)
+                            # l.warning('fun indicated profit but expected profit did not!')
+                            pass
                         else:
                             to_add = FoundArbitrage(
                                 amount_in   = amount_in,
