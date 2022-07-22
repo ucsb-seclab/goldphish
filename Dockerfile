@@ -9,7 +9,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_16.x | bash -
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y curl python3 python3-pip nodejs yarn psmisc parallel
 
 RUN npm i -g npm node-gyp@9.0.0 @mapbox/node-pre-gyp@1.0.8
-RUN pip install web3 numpy scipy tabulate pytest networkx cachetools psycopg2-binary backoff pika
+RUN pip install web3 numpy scipy tabulate pytest networkx cachetools psycopg2-binary backoff pika bloom-filter2 leveldb
 
 WORKDIR /opt/
 
@@ -17,6 +17,12 @@ RUN git clone --branch robmcl4/fullyPatched --depth 1 https://github.com/robmcl4
 RUN cd /opt/ganache-fork && npm install && INFURA_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa npm run build
 
 WORKDIR /opt/goldphish
+
+# install ganache dependencies
+COPY vend/ganache/package.json ./vend/ganache/package.json
+RUN cd ./vend/ganache && npm install
+
+COPY vend/ ./vend
 
 # build the shooter contract
 COPY package.json .
@@ -26,12 +32,6 @@ RUN yarn install
 COPY hardhat.config.js .
 COPY contracts contracts
 RUN yarn hardhat compile
-
-# install ganache dependencies
-COPY vend/ganache/package.json ./vend/ganache/package.json
-RUN cd ./vend/ganache && npm install
-
-COPY vend/ ./vend
 
 # copy in our ganache build
 COPY . ./

@@ -28,6 +28,10 @@ def main():
         args.worker_name = socket.gethostname()
     job_name = 'gather_samples'
 
+    print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+    print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+    print('please add an order id to cycle exchanges')
+    exit(1)
 
     setup_logging(job_name, worker_name = args.worker_name)
 

@@ -3,9 +3,9 @@ import typing
 import web3
 import web3.contract
 import web3.types
-from eth_utils import event_abi_to_log_topic
+from eth_utils import event_abi_to_log_topic, keccak
 from pricers.block_observation_result import BlockObservationResult
-from utils import get_abi, profile
+from utils import RetryingProvider, get_abi, profile
 import logging
 
 from pricers.base import BaseExchangePricer, NotEnoughLiquidityException
@@ -16,11 +16,6 @@ Tick = typing.NamedTuple('Tick', [
     ('id', int),
     ('liquidity_gross', int),
     ('liquidity_net', int),
-    ('x_', int),
-    ('x__', int),
-    ('x___', int),
-    ('x____', int),
-    ('x_____', int),
     ('initialized', bool)
 ])
 
@@ -31,6 +26,9 @@ generic_uv3 = web3.Web3().eth.contract(
 UNIV3_SWAP_EVENT_TOPIC = event_abi_to_log_topic(generic_uv3.events.Swap().abi)
 UNIV3_BURN_EVENT_TOPIC = event_abi_to_log_topic(generic_uv3.events.Burn().abi)
 UNIV3_MINT_EVENT_TOPIC = event_abi_to_log_topic(generic_uv3.events.Mint().abi)
+
+SIX = int.to_bytes(6, length=32, byteorder='big', signed=False)
+FIVE = int.to_bytes(5, length=32, byteorder='big', signed=False)
 
 class UniswapV3Pricer(BaseExchangePricer):
     RELEVANT_LOGS = [UNIV3_SWAP_EVENT_TOPIC, UNIV3_BURN_EVENT_TOPIC, UNIV3_MINT_EVENT_TOPIC]
@@ -52,6 +50,9 @@ class UniswapV3Pricer(BaseExchangePricer):
     slot0_cache: typing.Optional[typing.Tuple[int, int]]
     liquidity_cache: typing.Optional[int]
     last_block_observed: int
+    known_token0_balance: typing.Optional[int]
+    known_token1_balance: typing.Optional[int]
+
 
     def __init__(self, w3: web3.Web3, address: str, token0: str, token1: str, fee: int) -> None:
         assert web3.Web3.isChecksumAddress(address)
@@ -69,6 +70,45 @@ class UniswapV3Pricer(BaseExchangePricer):
             10_000: 200,
         }[fee]
         self.set_web3(w3)
+        self.tick_cache = {}
+        self.tick_bitmap_cache = {}
+        self.slot0_cache = None
+        self.liquidity_cache = None
+        self.last_block_observed = None
+        self.known_token0_balance = None
+        self.known_token1_balance = None
+
+    def __getstate__(self):
+        return (
+            self.address,
+            self.token0,
+            self.token1,
+            self.fee,
+            self.tick_spacing,
+            self.tick_cache,
+            self.tick_bitmap_cache,
+            self.slot0_cache,
+            self.liquidity_cache,
+            self.last_block_observed,
+            self.known_token0_balance,
+            self.known_token1_balance,
+        )
+
+    def __setstate__(self, state):
+        (
+            self.address,
+            self.token0,
+            self.token1,
+            self.fee,
+            self.tick_spacing,
+            self.tick_cache,
+            self.tick_bitmap_cache,
+            self.slot0_cache,
+            self.liquidity_cache,
+            self.last_block_observed,
+            self.known_token0_balance,
+            self.known_token1_balance,
+        ) = state
 
     def get_tokens(self, _) -> typing.Set[str]:
         return set([self.token0, self.token1])
@@ -76,20 +116,27 @@ class UniswapV3Pricer(BaseExchangePricer):
     def get_slot0(self, block_identifier, use_cache = True) -> typing.Tuple[int, int]:
         if use_cache == False or self.slot0_cache is None:
             with profile('uniswap_v3_fetch'):
-                (sqrt_ratio_x96, tick, _, _, _, _, _) = self.contract.functions.slot0().call(block_identifier=block_identifier)
+                bslot0 = self.w3.eth.get_storage_at(self.address, '0x0', block_identifier=block_identifier)
+                bslot0 = bslot0.rjust(32, b'\x00')
+                sqrt_price_ratio_x96 = int.from_bytes(bslot0[12:32], byteorder='big', signed=False)
+                tick = int.from_bytes(bslot0[9:12], byteorder='big', signed=True)
+
             if use_cache == False:
-                return (sqrt_ratio_x96, tick)
-            self.slot0_cache = (sqrt_ratio_x96, tick)
+                return (sqrt_price_ratio_x96, tick)
+            self.slot0_cache = (sqrt_price_ratio_x96, tick)
         return self.slot0_cache
 
     def get_liquidity(self, block_identifier, use_cache = True) -> int:
         if use_cache == False or self.liquidity_cache is None:
             with profile('uniswap_v3_fetch'):
-                got = self.contract.functions.liquidity().call(block_identifier=block_identifier)
+                bliquidity = self.w3.eth.get_storage_at(self.address, '0x4', block_identifier=block_identifier)
+                bliquidity = bliquidity.rjust(32, b'\x00')
+                liquidity = int.from_bytes(bliquidity[16:32], byteorder='big', signed=False)
+
             if use_cache == False:
                 l.debug(f'not using cache')
-                return got
-            self.liquidity_cache = got
+                return liquidity
+            self.liquidity_cache = liquidity
         return self.liquidity_cache
 
     def token_out_for_exact_in(self, token_in: str, token_out: str, amount_in: int, block_identifier: int, **_) -> typing.Tuple[int, float]:
@@ -108,13 +155,17 @@ class UniswapV3Pricer(BaseExchangePricer):
         return -ret, price
 
     def token1_out_to_exact_token0_in(self, token1_amount_out, block_identifier: int) -> int:
-        assert token1_amount_out >= 0
-        (ret, _) = self.swap(zero_for_one=True, amount_specified=-token1_amount_out, sqrt_price_limitX96=None, block_identifier=block_identifier)
+        if token1_amount_out == 0:
+            return 0
+        assert token1_amount_out > 0, f'expected {token1_amount_out} > 0'
+        (ret, _, _) = self.swap(zero_for_one=True, amount_specified=-token1_amount_out, sqrt_price_limitX96=None, block_identifier=block_identifier)
         return ret
 
     def token0_out_to_exact_token1_in(self, token0_amount_out, block_identifier: int) -> int:
-        assert token0_amount_out >= 0
-        (_, ret) = self.swap(zero_for_one=False, amount_specified=-token0_amount_out, sqrt_price_limitX96=None, block_identifier=block_identifier)
+        if token0_amount_out == 0:
+            return 0
+        assert token0_amount_out > 0, f'expected {token0_amount_out} > 0'
+        (_, ret, _) = self.swap(zero_for_one=False, amount_specified=-token0_amount_out, sqrt_price_limitX96=None, block_identifier=block_identifier)
         return ret
 
     def swap(self, zero_for_one: bool, amount_specified: int, sqrt_price_limitX96: typing.Optional[int], block_identifier) -> typing.Tuple[int, int, float]:
@@ -130,7 +181,7 @@ class UniswapV3Pricer(BaseExchangePricer):
             else:
                 if sqrt_price_x96 == 0:
                     # not initialized, cannot buy anything for any price
-                    price = 0
+                    price = 0.0
                 else:
                     price = (1 << 192) / (sqrt_price_x96 * sqrt_price_x96)
 
@@ -140,7 +191,7 @@ class UniswapV3Pricer(BaseExchangePricer):
 
         if sqrt_price_x96 == 0:
             # this is not initialized; you cannot get any token out
-            return (0, 0)
+            return (0, 0, 0.0)
         liquidity = self.get_liquidity(block_identifier)
 
         if zero_for_one:
@@ -160,8 +211,6 @@ class UniswapV3Pricer(BaseExchangePricer):
         amount_calculated = 0
 
         while amount_specified_remaining != 0 and sqrt_price_x96 != sqrt_price_limitX96:
-            # if self.address == '0x7cf70eD6213F08b70316bD80F7c2ddDc94E41aC5':
-            #     print(f'amount_specified_remaining={amount_specified_remaining} sqrt_price_limit={sqrt_price_limitX96} sqrt_price={sqrt_price_x96} liquidity={liquidity} tick={tick}')
             sqrt_price_start_x96 = sqrt_price_x96
             # compute tickNext
             next_tick_num, initialized = self.next_initialized_tick_within_one_word(
@@ -201,13 +250,20 @@ class UniswapV3Pricer(BaseExchangePricer):
                 amount_specified_remaining += amount_out
                 amount_calculated = amount_calculated + (amount_in + fee_amount)
 
-            if sqrt_price_x96 == sqrt_price_next_X96: # TODO this is broken is it of any consequence?
+            if sqrt_price_x96 == sqrt_price_next_X96:
                 if initialized:
                     tick_obj = self.tick_at(next_tick_num, block_identifier)
                     if zero_for_one:
                         liquidity -= tick_obj.liquidity_net
                     else:
                         liquidity += tick_obj.liquidity_net
+                    if liquidity < 0:
+                        # about to fail
+                        print(f'address {self.address}')
+                        print(f'block {block_identifier}')
+                        print(f'amount_specified {amount_specified}')
+                        print(f'zero_for_one {zero_for_one}')
+                        print(f'liquidity {liquidity}')
                     assert liquidity >= 0
                 tick = next_tick_num - 1 if zero_for_one else next_tick_num
             elif sqrt_price_x96 != sqrt_price_start_x96:
@@ -474,19 +530,55 @@ class UniswapV3Pricer(BaseExchangePricer):
     def get_tick_bitmap_word(self, word_idx, block_identifier, use_cache = True) -> int:
         if not use_cache or word_idx not in self.tick_bitmap_cache:
             with profile('uniswap_v3_fetch'):
-                self.tick_bitmap_cache[word_idx] = \
-                    self.contract.functions.tickBitmap(word_idx).call(block_identifier=block_identifier)
+                bword_idx = int.to_bytes(word_idx, length=32, byteorder='big', signed=True)
+
+                h = keccak(bword_idx + SIX)
+                result = self.w3.eth.get_storage_at(self.address, h, block_identifier=block_identifier)
+                ret = int.from_bytes(result, byteorder='big', signed=False)
+
+                self.tick_bitmap_cache[word_idx] = ret
         return self.tick_bitmap_cache[word_idx]
 
     def tick_at(self, tick: int, block_identifier, use_cache = True) -> Tick:
         assert UniswapV3Pricer.MIN_TICK <= tick
         assert tick <= UniswapV3Pricer.MAX_TICK
+
         if not use_cache or tick not in self.tick_cache:
+
+            if isinstance(block_identifier, int):
+                block_identifier_encoded = hex(block_identifier)
+            else:
+                block_identifier_encoded = block_identifier
+
+            btick = int.to_bytes(tick, length=32, byteorder='big', signed=True)
+            h = keccak(btick + FIVE)
+
+            reqs = []
+            reqs.append(('eth_getStorageAt', [self.address, '0x' + h.hex(), block_identifier_encoded]))
+
+            h_int = int.from_bytes(h, byteorder='big', signed=False)
+            slot = int.to_bytes(h_int + 3, length=32, byteorder='big', signed=False)
+            reqs.append(('eth_getStorageAt', [self.address, '0x' + slot.hex(), block_identifier_encoded]))
+
             with profile('uniswap_v3_fetch'):
-                self.tick_cache[tick] = Tick(
-                    tick,
-                    *self.contract.functions.ticks(tick).call(block_identifier=block_identifier)
-                )
+                provider: RetryingProvider = self.w3.provider
+                resp = provider.make_request_batch(reqs)
+            assert len(resp) == 2
+
+            bresp_0 = bytes.fromhex(resp[0]['result'][2:])
+            liquidity_gross = int.from_bytes(bresp_0[16:32], byteorder='big', signed=False)
+            liquidity_net = int.from_bytes(bresp_0[0:16], byteorder='big', signed=True)
+
+            bresp_1 = bytes.fromhex(resp[1]['result'][2:])
+            initialized = bool(bresp_1[0])
+
+            self.tick_cache[tick] = Tick(
+                tick,
+                liquidity_gross=liquidity_gross,
+                liquidity_net=liquidity_net,
+                initialized=initialized
+            )
+
         return self.tick_cache[tick]
 
     @staticmethod
@@ -691,7 +783,6 @@ class UniswapV3Pricer(BaseExchangePricer):
 
     @staticmethod
     def get_sqrt_ratio_at_tick(tick_num: int) -> int:
-        print('tick_num', tick_num)
         abs_tick = abs(tick_num)
         assert abs_tick <= UniswapV3Pricer.MAX_TICK
         # idk, taken from https://github.com/Uniswap/v3-core/blob/main/contracts/libraries/TickMath.sol#L24
@@ -751,7 +842,14 @@ class UniswapV3Pricer(BaseExchangePricer):
         return (ratio >> 32) + to_add
 
     def get_value_locked(self, token_address: str, block_identifier: int) -> int:
-        assert token_address in self.get_tokens(block_identifier)
+        if token_address == self.token0:
+            if self.known_token0_balance is not None:
+                return self.known_token0_balance
+        elif token_address == self.token1:
+            if self.known_token1_balance is not None:
+                return self.known_token1_balance
+        else:
+            raise ValueError(f'token {token_address} is not token0 or token1 on {self.address}')
 
         # TVL isn't kept natively, need to query out for it
         erc20: web3.contract.Contract = self.w3.eth.contract(
@@ -759,6 +857,12 @@ class UniswapV3Pricer(BaseExchangePricer):
             abi = get_abi('erc20.abi.json'),
         )
         bal = erc20.functions.balanceOf(self.address).call(block_identifier=block_identifier)
+
+        if token_address == self.token0:
+            self.known_token0_balance = bal
+        else:
+            self.known_token1_balance = bal
+
         return bal
 
     def get_token_weight(self, token_address: str, block_identifier: int) -> decimal.Decimal:
@@ -789,7 +893,7 @@ class UniswapV3Pricer(BaseExchangePricer):
             received_log = True
 
             if len(log['topics']) > 0 and log['topics'][0] == UNIV3_SWAP_EVENT_TOPIC:
-                swap = self.contract.events.Swap().processLog(log)
+                swap = generic_uv3.events.Swap().processLog(log)
                 sqrt_price_x96 = swap['args']['sqrtPriceX96']
                 liquidity = swap['args']['liquidity']
                 tick = swap['args']['tick']
@@ -797,14 +901,30 @@ class UniswapV3Pricer(BaseExchangePricer):
                     sqrt_price_x96, tick
                 )
                 self.liquidity_cache = liquidity
+
+                if self.known_token0_balance is not None:
+                    self.known_token0_balance += swap['args']['amount0']
+                if self.known_token1_balance is not None:
+                    self.known_token1_balance += swap['args']['amount1']
+
             elif len(log['topics']) > 0 and log['topics'][0] in [UNIV3_BURN_EVENT_TOPIC, UNIV3_MINT_EVENT_TOPIC]:
                 if log['topics'][0] == UNIV3_BURN_EVENT_TOPIC:
-                    event = self.contract.events.Burn().processLog(log)
+                    event = generic_uv3.events.Burn().processLog(log)
                     amount = -event['args']['amount']
+
+                    if self.known_token0_balance is not None:
+                        self.known_token0_balance -= event['args']['amount0']
+                    if self.known_token1_balance is not None:
+                        self.known_token1_balance -= event['args']['amount1']
+
                 else:
-                    event = self.contract.events.Mint().processLog(log)
+                    event = generic_uv3.events.Mint().processLog(log)
                     amount = event['args']['amount']
 
+                    if self.known_token0_balance is not None:
+                        self.known_token0_balance += event['args']['amount0']
+                    if self.known_token1_balance is not None:
+                        self.known_token1_balance += event['args']['amount1']
 
                 tick_num_lower = event['args']['tickLower']
                 tick_num_upper = event['args']['tickUpper']
@@ -899,21 +1019,12 @@ class UniswapV3Pricer(BaseExchangePricer):
 
 
     def set_web3(self, w3: web3.Web3):
-        self.contract = w3.eth.contract(
-            address = self.address,
-            abi = get_abi('uniswap_v3/IUniswapV3Pool.json')['abi']
-        )
         self.w3 = w3
-        self.known_token0_bal = None
-        self.known_token1_bal = None
-        self.tick_cache = {}
-        self.tick_bitmap_cache = {}
-        self.slot0_cache = None
-        self.liquidity_cache = None
-        self.last_block_observed = None
 
     def copy_without_cache(self) -> 'BaseExchangePricer':
         return UniswapV3Pricer(
             self.w3, self.address, self.token0, self.token1, self.fee
         )
 
+    def __str__(self) -> str:
+        return f'<UniswapV3Pricer {self.address} token0={self.token0} token1={self.token1} fee={self.fee}>'

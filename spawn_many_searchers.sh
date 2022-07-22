@@ -5,8 +5,6 @@ N_WORKERS=$1
 
 echo "[*] spawning $N_WORKERS searchers";
 
-PREFIX=$3
-
 if [[ "$PREFIX" -ne '' ]];
 then
     PREFIX="$PREFIX-";

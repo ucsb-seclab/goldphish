@@ -12,6 +12,7 @@ from eth_utils import event_abi_to_log_topic
 from pricers.block_observation_result import BlockObservationResult
 
 from pricers.uniswap_v3 import UniswapV3Pricer
+from utils.profiling import profile
 
 from .base import BaseExchangePricer
 from utils import get_abi
@@ -24,6 +25,7 @@ generic_uv2 = web3.Web3().eth.contract(
 )
 UNIV2_SYNC_EVENT_TOPIC = event_abi_to_log_topic(generic_uv2.events.Sync().abi)
 
+RESERVES_SLOT = '0x0000000000000000000000000000000000000000000000000000000000000008'
 
 class UniswapV2Pricer(BaseExchangePricer):
     RELEVANT_LOGS = [UNIV2_SYNC_EVENT_TOPIC]
@@ -32,9 +34,6 @@ class UniswapV2Pricer(BaseExchangePricer):
     address: str
     token0: str
     token1: str
-    contract: web3.contract.Contract
-    token0_contract: web3.contract.Contract
-    token1_contract: web3.contract.Contract
     known_token0_bal: int
     known_token1_bal: int
 
@@ -44,13 +43,27 @@ class UniswapV2Pricer(BaseExchangePricer):
         self.token0 = token0
         self.token1 = token1
         self.set_web3(w3)
+        self.known_token0_bal = None
+        self.known_token1_bal = None
+
+    def __getstate__(self):
+        return (self.address, self.token0, self.token1, self.known_token0_bal, self.known_token1_bal)
+
+    def __setstate__(self, state):
+        self.address, self.token0, self.token1, self.known_token0_bal, self.known_token1_bal = state
 
     def get_tokens(self, _) -> typing.Set[str]:
         return set([self.token0, self.token1])
 
     def get_balances(self, block_identifier) -> typing.Tuple[int, int]:
         if self.known_token0_bal is None or self.known_token1_bal is None:
-            self.known_token0_bal, self.known_token1_bal, _ = self.contract.functions.getReserves().call(block_identifier=block_identifier)
+            breserves = self.w3.eth.get_storage_at(self.address, RESERVES_SLOT, block_identifier=block_identifier)
+
+            reserve1 = int.from_bytes(breserves[4:18], byteorder='big', signed=False)
+            reserve0 = int.from_bytes(breserves[18:32], byteorder='big', signed=False)
+
+            self.known_token0_bal = reserve0
+            self.known_token1_bal = reserve1
         return (self.known_token0_bal, self.known_token1_bal)
 
     def token_out_for_exact_in(self, token_in: str, token_out: str, amount_in: int, block_identifier: int, **_) -> typing.Tuple[int, float]:
@@ -126,7 +139,7 @@ class UniswapV2Pricer(BaseExchangePricer):
         elif token_address == self.token1:
             return bal1
 
-        raise Exception(f'Do not know about token {token_address}')
+        raise Exception(f'Do not know about token {token_address} in {self.address}')
 
     def get_token_weight(self, token_address: str, block_identifier: int) -> decimal.Decimal:
         return decimal.Decimal('0.5')
@@ -143,7 +156,7 @@ class UniswapV2Pricer(BaseExchangePricer):
         # all we care about are Syncs
         for log in reversed(receipts):
             if log['address'] == self.address and len(log['topics']) > 0 and log['topics'][0] == UNIV2_SYNC_EVENT_TOPIC:
-                sync = self.contract.events.Sync().processLog(log)
+                sync = generic_uv2.events.Sync().processLog(log)
                 bal0 = sync['args']['reserve0']
                 assert bal0 >= 0
                 bal1 = sync['args']['reserve1']
@@ -165,24 +178,13 @@ class UniswapV2Pricer(BaseExchangePricer):
         )
 
     def set_web3(self, w3: web3.Web3):
-        self.contract = w3.eth.contract(
-            address = self.address,
-            abi = get_abi('uniswap_v2/IUniswapV2Pair.json')['abi']
-        )
         self.w3 = w3
-        self.token0_contract = w3.eth.contract(
-            address = self.token0,
-            abi = get_abi('erc20.abi.json')
-        )
-        self.token1_contract = w3.eth.contract(
-            address = self.token1,
-            abi = get_abi('erc20.abi.json')
-        )
-        self.known_token0_bal = None
-        self.known_token1_bal = None
+
 
     def copy_without_cache(self) -> 'BaseExchangePricer':
         return UniswapV2Pricer(
             self.w3, self.address, self.token0, self.token1
         )
 
+    def __str__(self) -> str:
+        return f'<UniswapV2Pricer {self.address} token0={self.token0} token1={self.token1}>'

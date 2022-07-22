@@ -21,7 +21,7 @@ import pricers
 
 from utils import get_abi
 from ..utils import CancellationToken, GanacheContextManager, funded_deployer, mine_block
-from .constants import FNAME_EXCHANGES_WITH_BALANCES, THRESHOLDS, univ2_fname, univ3_fname
+from .constants import FNAME_EXCHANGES_WITH_BALANCES, univ2_fname, univ3_fname
 
 
 l = logging.getLogger(__name__)
@@ -270,11 +270,11 @@ class WrappedFoundArbitrage:
         return self.fa.tokens
 
 
-def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor) -> PricerPool:
+def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor, tmpdir: str) -> PricerPool:
     #
     # load known pricer pool
     #
-    pool = PricerPool(w3)
+    pool = PricerPool(w3, tmpdir)
 
     # count total number of exchanges we need to load
     curr.execute(
@@ -360,6 +360,25 @@ def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor) -> PricerPool:
         pool.add_sushiswap_v2(address, token0, token1, origin_block)
         report_progress()
 
+    l.debug('Loading shibaswap ...')
+
+    curr.execute(
+        '''
+        SELECT ss.address, ss.origin_block, t0.address, t1.address
+        FROM shibaswap_exchanges ss
+        JOIN tokens t0 ON ss.token0_id = t0.id
+        JOIN tokens t1 ON ss.token1_id = t1.id
+        '''
+    )
+    for n_loaded, (address, origin_block, token0, token1) in zip(itertools.count(n_loaded), curr):
+        address = w3.toChecksumAddress(address.tobytes())
+        token0 = w3.toChecksumAddress(token0.tobytes())
+        token1 = w3.toChecksumAddress(token1.tobytes())
+        pool.add_shibaswap(address, token0, token1, origin_block)
+        report_progress()
+
+    l.debug('Loading Balancer v1 ...')
+
     curr.execute(
         '''
         SELECT address, origin_block
@@ -369,6 +388,9 @@ def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor) -> PricerPool:
     for n_loaded, (address, origin_block) in zip(itertools.count(n_loaded), curr):
         address = w3.toChecksumAddress(address.tobytes())
         pool.add_balancer_v1(address, origin_block)
+        report_progress()
+
+    l.debug('Loading Balancer v2 ...')
 
     curr.execute(
         '''
@@ -384,6 +406,7 @@ def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor) -> PricerPool:
         address = w3.toChecksumAddress(address.tobytes())
         pool_id = pool_id.tobytes()
         pool.add_balancer_v2(address, pool_id, pool_type, origin_block)
+        report_progress()
 
     l.debug('pool loaded')
 

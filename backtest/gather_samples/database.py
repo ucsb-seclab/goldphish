@@ -69,6 +69,8 @@ def setup_db(curr: psycopg2.extensions.cursor):
             token_out   INTEGER NOT NULL REFERENCES tokens(id)
         );
 
+        CREATE INDEX IF NOT EXISTS idx_sample_arbitrage_cycle_exchanges_cycle_id ON sample_arbitrage_cycle_exchanges (cycle_id);
+
         CREATE TABLE IF NOT EXISTS sample_arbitrage_cycle_exchange_items (
             id                SERIAL PRIMARY KEY NOT NULL,
             cycle_exchange_id INTEGER NOT NULL REFERENCES sample_arbitrage_cycle_exchanges(id) ON DELETE CASCADE,
@@ -76,6 +78,8 @@ def setup_db(curr: psycopg2.extensions.cursor):
             amount_in         NUMERIC(78, 0) NOT NULL,
             amount_out        NUMERIC(78, 0) NOT NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_sample_arbitrage_cycle_exchange_items_cycle_exchange_id ON sample_arbitrage_cycle_exchange_items (cycle_exchange_id);
         '''
     )
     curr.connection.commit()

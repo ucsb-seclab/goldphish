@@ -1,27 +1,28 @@
 import argparse
 import collections
-import gzip
+import signal
 import itertools
 import logging
 import os
+import sys
 import time
 import typing
+import backoff
+import numpy as np
 import web3
 import web3.types
 import web3._utils.filters
 import psycopg2
 import psycopg2.extensions
+import tempfile
 
 from backtest.top_of_block.common import load_pool
-from backtest.top_of_block.constants import FNAME_EXCHANGES_WITH_BALANCES, IMPORTANT_TOPICS_HEX, MIN_PROFIT_PREFILTER, univ2_fname, univ3_fname
-from backtest.utils import CancellationToken, connect_db
+from backtest.top_of_block.constants import MIN_PROFIT_PREFILTER
+from backtest.utils import connect_db
 import pricers
 import find_circuit
-from pricers.balancer import BalancerPricer
 from pricers.pricer_pool import PricerPool
-from pricers.uniswap_v2 import UniswapV2Pricer
-from pricers.uniswap_v3 import UniswapV3Pricer
-from utils import BALANCER_VAULT_ADDRESS, ProgressReporter, get_block_timestamp
+from utils import get_block_timestamp
 import utils.profiling
 
 
@@ -38,9 +39,9 @@ def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.
     parser: argparse.ArgumentParser = subparser.add_parser(parser_name)
 
     parser.add_argument('--setup-db', action='store_true', help='Setup the database (run before mass scan)')
+    parser.add_argument('--fixup-queue', action='store_true', help='Fix the queue in the event that a worker had a spurious shutdown')
 
     return parser_name, seek_candidates
-
 
 def seek_candidates(w3: web3.Web3, args: argparse.Namespace):
     l.info('Starting candidate searching')
@@ -48,86 +49,156 @@ def seek_candidates(w3: web3.Web3, args: argparse.Namespace):
     curr = db.cursor()
     time.sleep(4)
 
+    if args.setup_db and args.fixup_queue:
+        print('Cannot have both --setup-db and --fixup-queue', file=sys.stderr)
+        exit(1)
+
+    if args.fixup_queue:
+        fixup_reservations(curr)
+        db.commit()
+        return
+
     if args.setup_db:
         setup_db(curr)
         fill_queue(w3, curr)
         db.commit()
         return
 
-    #
-    # Load all candidate profitable arbitrages
+    if args.worker_name is None:
+        print('Must supply worker_name', file=sys.stderr)
+        exit(1)
+
+    storage_dir = os.path.join(os.getenv('STORAGE_DIR', '/mnt/goldphish'), 'tmp')
+    if not os.path.isdir(storage_dir):
+        os.mkdir(storage_dir)
+
+    cancel_requested = False
+    def set_cancel_requested(_, __):
+        nonlocal cancel_requested
+        l.info('Cancellation requested')
+        cancel_requested = True
+
+    signal.signal(signal.SIGHUP, set_cancel_requested)
+
     batch_size_blocks = 100 # batch size for getting logs
-    last_processed_block = None
-    while True:
-        maybe_rez = get_reservation(curr)
-        if maybe_rez is None:
-            # we're at the end
-            break
+    with tempfile.TemporaryDirectory(dir=storage_dir) as tmpdir:
+        while not cancel_requested:
+            l.debug(f'getting new reservation')
+            maybe_rez = get_reservation(curr, args.worker_name)
+            if maybe_rez is None:
+                # we're at the end
+                break
 
-        reservation_id, reservation_start, reservation_end = maybe_rez
-        pricer: PricerPool = load_pool(w3, curr)
-        if last_processed_block is not None:
-            assert last_processed_block < reservation_start
+            reservation_id, reservation_start, reservation_end = maybe_rez
 
-        curr_block = reservation_start
-        while curr_block <= reservation_end:
-            this_end_block = min(curr_block + batch_size_blocks - 1, reservation_end)
-            for block_number, logs in get_relevant_logs(w3, pricer, curr_block, this_end_block):
-                update = pricer.observe_block(block_number, logs)
-                utils.profiling.maybe_log()
-                while True:
-                    try:
-                        process_candidates(w3, pricer, block_number, update, curr)
-                        if not DEBUG:
-                            db.commit()
+            # occasionaly database will disconnect while loading the pool
+            # (dunno why) -- if that happens, just back off a bit, reconnect,
+            # and try again
+            def reconnect_db(_):
+                nonlocal db
+                nonlocal curr
+                db = connect_db()
+                curr = db.cursor()
+
+            @backoff.on_exception(
+                backoff.expo,
+                psycopg2.OperationalError,
+                max_time = 10 * 60,
+                factor = 4,
+                on_backoff = reconnect_db,
+            )
+            def get_pricer_with_retry() -> PricerPool:
+                return load_pool(w3, curr, tmpdir)
+
+            pricer = get_pricer_with_retry()
+
+            curr_block = reservation_start
+            while curr_block <= reservation_end:
+                this_end_block = min(curr_block + batch_size_blocks - 1, reservation_end)
+                for block_number, logs in get_relevant_logs(w3, pricer, curr_block, this_end_block):
+
+                    if cancel_requested:
+                        l.debug('shutting down main loop')
                         break
-                    except Exception as e:
-                        db.rollback()
-                        if 'execution aborted (timeout = 5s)' in str(e):
-                            l.exception('Encountered timeout, trying again in a little bit')
-                            time.sleep(30)
-                        else:
-                            raise e
 
-            curr_block = this_end_block + 1
-            last_processed_block = this_end_block
+                    update = pricer.observe_block(block_number, logs)
+                    utils.profiling.maybe_log()
+                    while True:
+                        try:
+                            process_candidates(w3, pricer, block_number, update, curr)
+                            if not DEBUG:
+                                with utils.profiling.profile('db.update'):
+                                    curr.execute(
+                                        'UPDATE candidate_arbitrage_reservations SET progress = %s, updated_on = now()::timestamp where id=%s',
+                                        (block_number, reservation_id),
+                                    )
+                                with utils.profiling.profile('db.commit'):
+                                    db.commit()
+                            break
+                        except Exception as e:
+                            db.rollback()
+                            if 'execution aborted (timeout = 5s)' in str(e):
+                                l.exception('Encountered timeout, trying again in a little bit')
+                                time.sleep(30)
+                            else:
+                                raise e
 
-        # mark reservation as completed
-        if not DEBUG:
-            if True: # not cancellation_token.cancel_requested():
-                assert this_end_block == reservation_end
-                l.debug(f'Completed reservation id={reservation_id:,}')
-                curr.execute(
-                    'UPDATE candidate_arbitrage_reservations SET completed_on = NOW()::timestamp WHERE id = %s',
-                    (reservation_id,)
-                )
-                db.commit()
-            else:
-                # cancellation was requested
-                if curr_block <= reservation_end:
-                    l.info('Splitting off unifinished reservation into new one')
+                if cancel_requested:
+                    break
+
+                curr_block = this_end_block + 1
+
+            # mark reservation as completed
+            if not DEBUG:
+                if not cancel_requested:
+                    assert this_end_block == reservation_end
+                    l.debug(f'Completed reservation id={reservation_id:,}')
+                    curr.execute(
+                        'UPDATE candidate_arbitrage_reservations SET completed_on = NOW()::timestamp WHERE id = %s',
+                        (reservation_id,)
+                    )
+                    db.commit()
+                else:
+                    # cancellation was requested
                     curr.execute(
                         '''
-                        UPDATE candidate_arbitrage_reservations SET block_number_end = %s, completed_on = NOW()::timestamp WHERE id = %s
+                        UPDATE candidate_arbitrage_reservations SET block_number_end = progress, completed_on = NOW()::timestamp WHERE id = %s
+                        RETURNING progress
                         ''',
-                        (this_end_block, reservation_id),
+                        (reservation_id,),
                     )
-                    curr.execute(
-                        '''
-                        INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end)
-                        VALUES (%s, %s)
-                        RETURNING id
-                        ''',
-                        (curr_block, reservation_end)
-                    )
-                    (new_id,) = curr.fetchone()
-                    l.debug(f'Created new reservation id={new_id:,} {curr_block:,} -> {reservation_end:,}')
+                    assert curr.rowcount == 1
+                    (end_inclusive,) = curr.fetchone()
+
+                    if end_inclusive < reservation_end:
+                        l.info('Splitting off unifinished reservation into new one')
+                        curr.execute(
+                            '''
+                            INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end)
+                            VALUES (%s, %s)
+                            RETURNING id
+                            ''',
+                            (end_inclusive + 1, reservation_end)
+                        )
+                        assert curr.rowcount == 1
+                        (new_id,) = curr.fetchone()
+                        l.debug(f'Created new reservation id={new_id:,} {end_inclusive + 1:,} -> {reservation_end:,}')
                     db.commit()
 
 
 def setup_db(curr: psycopg2.extensions.cursor):
     curr.execute(
         """
+        CREATE TABLE IF NOT EXISTS block_modified_exchanges (
+            block_number    INTEGER NOT NULL,
+            uniswap_v2_id   INTEGER REFERENCES uniswap_v2_exchanges (id) ON DELETE CASCADE,
+            sushiswap_v2_id INTEGER REFERENCES sushiv2_swap_exchanges (id) ON DELETE CASCADE,
+            shibaswap_id    INTEGER REFERENCES shibaswap_exchanges (id) ON DELETE CASCADE,
+            uniswap_v3_id   INTEGER REFERENCES uniswap_v3_exchanges (id) ON DELETE CASCADE,
+            balancer_id     INTEGER REFERENCES balancer_exchanges (id) ON DELETE CASCADE,
+            balancer_v2_id  INTEGER REFERENCES balancer_v2_exchanges (id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS candidate_arbitrages (
             id              SERIAL PRIMARY KEY NOT NULL,
             block_number    INTEGER NOT NULL,
@@ -147,6 +218,9 @@ def setup_db(curr: psycopg2.extensions.cursor):
             id                 SERIAL PRIMARY KEY NOT NULL,
             block_number_start INTEGER NOT NULL,
             block_number_end   INTEGER NOT NULL,
+            progress           INTEGER,
+            worker             TEXT,
+            updated_on         TIMESTAMP WITHOUT TIME ZONE,
             claimed_on         TIMESTAMP WITHOUT TIME ZONE,
             completed_on       TIMESTAMP WITHOUT TIME ZONE 
         );
@@ -175,11 +249,11 @@ def fill_queue(w3: web3.Web3, curr: psycopg2.extensions.cursor):
         return
 
     start_block = scan_start(curr)
-    end_block = 15_111_766 # w3.eth.get_block('latest')['number']
+    end_block = 15_111_000 # w3.eth.get_block('latest')['number']
 
     l.info(f'filling queue from {start_block:,} to {end_block:,}')
 
-    n_segments = 1_000
+    n_segments = 2_000
     segment_width = (end_block - start_block) // n_segments
     for i in itertools.count():
         segment_start = start_block + i * segment_width
@@ -214,108 +288,128 @@ def scan_start(curr: psycopg2.extensions.cursor) -> int:
     return ret
 
 
-def get_reservation(curr: psycopg2.extensions.cursor) -> typing.Optional[typing.Tuple[int, int, int]]:
-    curr.execute('BEGIN TRANSACTION')
-    curr.execute('LOCK TABLE candidate_arbitrage_reservations') # for safety
-    query_do_reservation = '''
-        UPDATE candidate_arbitrage_reservations car
-        SET claimed_on = NOW()::timestamp
-        FROM (
-            SELECT id
-            FROM candidate_arbitrage_reservations
-            WHERE claimed_on IS NULL AND completed_on IS NULL AND block_number_start > 13000000
-            ORDER BY block_number_start ASC
-            LIMIT 1
-        ) x
-        WHERE car.id = x.id
-        RETURNING car.id, car.block_number_start, car.block_number_end
-    '''
-    curr.execute(query_do_reservation)
-    maybe_row = curr.fetchall()
+def fixup_reservations(curr: psycopg2.extensions.cursor):
+    answer = input('WARNING: this is destructive. ENSURE ALL WORKERS ARE OFF. To continue type YES: ')
+    if answer.strip().upper() != 'YES':
+        print('Quitting, bye.')
+        curr.connection.rollback() # unnecessary but do it anyway
+        return
 
-    if len(maybe_row) == 0:
-        # no reservations left
+    # count in-progress arbitrages
+    curr.execute(
+        '''
+        SELECT COUNT(*)
+        FROM candidate_arbitrage_reservations
+        WHERE claimed_on IS NOT NULL AND completed_on IS NULL
+        '''
+    )
+    (n_in_progress,) = curr.fetchone()
+    l.debug(f'Have {n_in_progress:,} in-progress reservations')
+
+    # sanity check
+    curr.execute('SELECT COUNT(*) FROM candidate_arbitrage_reservations WHERE progress < block_number_start OR progress > block_number_end')
+    (n_broken,) = curr.fetchone()
+    assert n_broken == 0
+
+    # force completion on anything that should be done but isn't marked yet
+    curr.execute(
+        '''
+        UPDATE candidate_arbitrage_reservations
+        SET completed_on = now()::timestamp
+        WHERE progress = block_number_end AND claimed_on IS NOT NULL AND completed_on IS NULL
+        RETURNING id
+        '''
+    )
+    n_force_closed = curr.rowcount
+    l.debug(f'Forced {n_force_closed:,} reservations to completion')
+
+    # split off anything that's partially in-progress
+    curr.execute(
+        '''
+        INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end)
+        SELECT progress + 1, block_number_end
+        FROM candidate_arbitrage_reservations car
+        WHERE car.claimed_on IS NOT NULL AND
+              car.completed_on IS NULL AND
+              car.progress IS NOT NULL AND
+              car.progress < car.block_number_end
+        RETURNING block_number_end - block_number_start + 1
+        '''
+    )
+    diffs = [x for (x,) in curr]
+    n_new_reservations = len(diffs)
+    l.debug(f'Created {n_new_reservations} new reservations')
+    if len(diffs) > 0:
+        l.debug(f'Median block count in new reservations {int(np.median(diffs))}')
+
+    # force-end in-progress reservations
+    curr.execute(
+        '''
+        UPDATE candidate_arbitrage_reservations car
+        SET block_number_end = progress, completed_on = now()::timestamp
+        WHERE car.claimed_on IS NOT NULL AND
+              car.completed_on IS NULL AND
+              car.progress IS NOT NULL AND
+              car.progress < car.block_number_end
+        '''
+    )
+    n_closed = curr.rowcount
+    assert n_closed == n_new_reservations
+    l.debug(f'Forcibly closed {n_closed} in-progress arbitrage search reservations')
+
+    # force re-open reservations with no progress
+    curr.execute(
+        '''
+        UPDATE candidate_arbitrage_reservations car
+        SET claimed_on = null
+        WHERE
+            car.claimed_on IS NOT NULL AND
+            car.completed_on IS NULL AND
+            car.progress IS NULL
+        '''
+    )
+    n_force_opened = curr.rowcount
+    l.debug(f'Force re-opened {n_force_opened} arbitrage search reservations')
+
+    assert n_force_opened + n_new_reservations + n_force_closed == n_in_progress, f'expected {n_new_reservations + n_force_closed} == {n_in_progress}'
+
+
+def get_reservation(curr: psycopg2.extensions.cursor, worker_name: str) -> typing.Optional[typing.Tuple[int, int, int]]:
+    curr.execute('BEGIN TRANSACTION')
+
+    curr.execute(
+        '''
+        SELECT id, block_number_start, block_number_end
+        FROM candidate_arbitrage_reservations
+        WHERE claimed_on IS NULL AND completed_on IS NULL AND block_number_start > 13000000
+        ORDER BY block_number_start ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+        '''
+    )
+    if curr.rowcount < 1:
         l.info('Finished queue')
         return
 
-    assert len(maybe_row) == 1
-    id_, start, end = maybe_row[0]
+    id_, start, end = curr.fetchone()
+    curr.execute(
+        '''
+        UPDATE candidate_arbitrage_reservations car
+        SET claimed_on = NOW()::timestamp, worker = %s
+        WHERE id = %s
+        ''',
+        (worker_name, id_),
+    )
+    assert curr.rowcount == 1
+
     assert start <= end
 
     l.info(f'Processing reservation id={id_:,} from={start:,} to end={end:,} ({end - start:,} blocks)')
 
     if not DEBUG:
-        curr.execute('COMMIT')
+        curr.connection.commit()
 
     return id_, start, end
-
-
-# def load_exchange_balances(w3: web3.Web3):
-#     if os.path.exists(FNAME_EXCHANGES_WITH_BALANCES):
-#         l.debug(f'already prefetched balances (\'{FNAME_EXCHANGES_WITH_BALANCES}\' exists), no need to redo')
-#         return
-
-#     tip = w3.eth.get_block('latest')
-#     block_number = tip['number'] - 10
-#     l.debug(f'Prefiltering based off balances in block {block_number:,}')
-
-#     with open(FNAME_EXCHANGES_WITH_BALANCES + '.tmp', mode='w') as fout:
-#         with gzip.open(univ2_fname, mode='rt') as fin:
-#             for i, line in enumerate(fin):
-#                 if i % 100 == 0:
-#                     l.debug(f'Processed {i:,} uniswap v2 exchanges for prefilter')
-#                     fout.flush()
-#                 address, origin_block, token0, token1 = line.strip().split(',')
-#                 address = w3.toChecksumAddress(address)
-#                 origin_block = int(origin_block)
-#                 token0 = w3.toChecksumAddress(token0)
-#                 token1 = w3.toChecksumAddress(token1)
-
-#                 # record liquidity balance of both token0 and token1
-#                 try:
-#                     bal_token0 = w3.eth.contract(
-#                         address=token0,
-#                         abi=get_abi('erc20.abi.json'),
-#                     ).functions.balanceOf(address).call()
-#                     bal_token1 = w3.eth.contract(
-#                         address=token1,
-#                         abi=get_abi('erc20.abi.json'),
-#                     ).functions.balanceOf(address).call()
-#                     fout.write(f'2,{address},{origin_block},{token0},{token1},{bal_token0},{bal_token1}\n')
-#                 except:
-#                     l.exception('could not get balance, ignoring')
-
-
-#         l.debug('loaded all uniswap v2 exchanges')
-
-#         with gzip.open(univ3_fname, mode='rt') as fin:
-#             for i, line in enumerate(fin):
-#                 if i % 100 == 0:
-#                     l.debug(f'Processed {i:,} uniswap v3 exchanges for prefilter')
-#                     fout.flush()
-#                 address, origin_block, token0, token1, fee = line.strip().split(',')
-#                 address = w3.toChecksumAddress(address)
-#                 origin_block = int(origin_block)
-#                 token0 = w3.toChecksumAddress(token0)
-#                 token1 = w3.toChecksumAddress(token1)
-#                 fee = int(fee)
-
-#                 # record liquidity balance of both token0 and token1
-#                 try:
-#                     bal_token0 = w3.eth.contract(
-#                         address=token0,
-#                         abi=get_abi('erc20.abi.json'),
-#                     ).functions.balanceOf(address).call()
-#                     bal_token1 = w3.eth.contract(
-#                         address=token1,
-#                         abi=get_abi('erc20.abi.json'),
-#                     ).functions.balanceOf(address).call()
-#                     fout.write(f'3,{address},{origin_block},{token0},{token1},{fee},{bal_token0},{bal_token1}\n')
-#                 except:
-#                     l.exception('could not get balance, ignoring')
-
-#         l.debug('finished load of exchange graph')
-#     os.rename(FNAME_EXCHANGES_WITH_BALANCES + '.tmp', FNAME_EXCHANGES_WITH_BALANCES)
 
 
 def get_relevant_logs(
@@ -409,14 +503,15 @@ def process_candidates(
 
         # this is potentially profitable, log as a candidate
         dxns = [bytes.fromhex(t[2:]) for t, _ in p.directions]
-        curr.execute(
-            """
-            INSERT INTO candidate_arbitrages (block_number, exchanges, directions, amount_in, profit_no_fee)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING (id)
-            """,
-            (block_number, [bytes.fromhex(x.address[2:]) for x in p.circuit], dxns, p.amount_in, p.profit)
-        )
+        with utils.profiling.profile('db.insert'):
+            curr.execute(
+                """
+                INSERT INTO candidate_arbitrages (block_number, exchanges, directions, amount_in, profit_no_fee)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING (id)
+                """,
+                (block_number, [bytes.fromhex(x.address[2:]) for x in p.circuit], dxns, p.amount_in, p.profit)
+            )
         # (inserted_id,) = curr.fetchone()
         # l.debug(f'inserted candidate id={inserted_id}')
         n_found += 1
@@ -427,3 +522,4 @@ def process_candidates(
         l.debug(f'Ignored {n_ignored} arbitrages due to not meeting profit threshold in block {block_number:,}')
     if n_found > 0:
         l.debug(f'Found {n_found} candidate arbitrages in block {block_number:,}')
+

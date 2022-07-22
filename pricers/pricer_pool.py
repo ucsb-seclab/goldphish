@@ -1,11 +1,14 @@
 import collections
+import pickle
 import typing
 import time
 import logging
+import os
 import web3
 import web3.contract
 import web3.types
 
+from utils.profiling import profile, inc_measurement
 from pricers.balancer import BalancerPricer
 from pricers.balancer_v2.liquidity_bootstrapping_pool import BalancerV2LiquidityBootstrappingPoolPricer
 from pricers.balancer_v2.weighted_pool import BalancerV2WeightedPoolPricer
@@ -15,11 +18,25 @@ from .base import BaseExchangePricer
 from .uniswap_v2 import UniswapV2Pricer
 from .uniswap_v3 import UniswapV3Pricer
 from .token_balance_changing_logs import CACHE_INVALIDATING_TOKEN_LOGS
+
 import cachetools
+import leveldb
 
 
 l = logging.getLogger(__name__)
 
+
+class MyLRUCacher(cachetools.LRUCache):
+
+    def __init__(self, pool: 'PricerPool', maxsize: int, *args, **kwargs):
+        super().__init__(maxsize, *args, **kwargs)
+        self.pool = pool
+
+    def popitem(self):
+        k, v = super().popitem()
+        self.pool._evicted(k, v)
+
+_pool_id = 0
 
 class PricerPool:
     """
@@ -27,14 +44,17 @@ class PricerPool:
     Pricers may be materialized in memory, or not.
     LRU caching is in place.
     """
-    STAT_LOG_PERIOD_SECONDS = 60 * 2
+    STAT_LOG_PERIOD_SECONDS = 60 * 10
 
     _w3: web3.Web3
-    _cache: cachetools.LRUCache
+    _cache: typing.Dict[str, BaseExchangePricer]
+    _evictable_cache: cachetools.LRUCache
+
     _token_to_pools: typing.Dict[str, typing.List[str]]
     _token_pairs_to_pools: typing.Dict[typing.Tuple[str, str], typing.List[str]]
     _uniswap_v2_pools: typing.Dict[str, typing.Tuple[str, str]]
     _sushiswap_v2_pools: typing.Dict[str, typing.Tuple[str, str]]
+    _shibaswap_pools: typing.Dict[str, typing.Tuple[str, str]]
     _uniswap_v3_pools: typing.Dict[str, typing.Tuple[str, str, int]]
     _balancer_v1_pools: typing.Dict[str, typing.List[str]]
     _balancer_v2_pools: typing.Dict[str, typing.Tuple[typing.List[str], bytes, str]]
@@ -42,15 +62,34 @@ class PricerPool:
     _balancer_v2_updating_pools: typing.List[BalancerV2LiquidityBootstrappingPoolPricer]
     _origin_blocks: typing.Dict[str, int]
     _cache_hits: int
+    _soft_cache_hits: int
     _cache_misses: int
     _last_stat_log_ts: float
+    _balancer_v2_vault: web3.contract.Contract
 
-    def __init__(self, w3: web3.Web3) -> None:
+    def __init__(self, w3: web3.Web3, tmpdir: typing.Optional[str] = None) -> None:
+        global _pool_id
+        my_pool_id = _pool_id
+        _pool_id += 1
+
+        if tmpdir is not None:
+            assert os.path.isdir(tmpdir)
+            my_dir = os.path.join(tmpdir, str(my_pool_id))
+            os.mkdir(my_dir)
+            self._db = leveldb.LevelDB(filename=my_dir)
+            self._evictable_cache = MyLRUCacher(self, 1_000)
+            l.debug(f'Initialized pricing pool leveldb at {tmpdir}')
+        else:
+            self._db = None
+            self._evictable_cache = cachetools.LRUCache(maxsize=1_000)
+
         self._cache = {} # infinite size cache
+
         self._token_to_pools = collections.defaultdict(lambda: [])
         self._token_pairs_to_pools = collections.defaultdict(lambda: [])
         self._uniswap_v2_pools = {}
         self._sushiswap_v2_pools = {}
+        self._shibaswap_pools = {}
         self._uniswap_v3_pools = {}
         self._balancer_v1_pools = {}
         self._balancer_v2_pools = {}
@@ -58,9 +97,21 @@ class PricerPool:
         self._balancer_v2_updating_pools = []
         self._w3 = w3
         self._cache_hits = 0
+        self._soft_cache_hits = 0
         self._cache_misses = 0
         self._last_stat_log_ts = time.time()
         self._origin_blocks = {}
+        self._balancer_v2_vault = w3.eth.contract(
+            address=BALANCER_VAULT_ADDRESS,
+            abi=get_abi('balancer_v2/Vault.json'),
+        )
+
+    def clear(self):
+        """
+        Reset the pricer pool
+        """
+        self._evictable_cache.clear()
+        self._cache.clear()
 
     def monitored_addresses(self) -> typing.Set[str]:
         """
@@ -69,6 +120,8 @@ class PricerPool:
         ret = set()
         ret.update(self._uniswap_v2_pools.keys())
         ret.update(self._sushiswap_v2_pools.keys())
+        ret.update(self._shibaswap_pools.keys())
+        ret.update(self._uniswap_v3_pools.keys())
         ret.update(self._balancer_v1_pools.keys())
         ret.update(self._balancer_v2_pools.keys())
         ret.add(BALANCER_VAULT_ADDRESS)
@@ -99,6 +152,21 @@ class PricerPool:
         assert origin_block > 0 # sanity check
         assert bytes.fromhex(token0[2:]) < bytes.fromhex(token1[2:])
         self._sushiswap_v2_pools[address] = (token0, token1)
+        self._token_to_pools[token0].append(address)
+        self._token_to_pools[token1].append(address)
+        self._token_pairs_to_pools[(token0, token1)].append(address)
+        self._origin_blocks[address] = origin_block
+
+    def add_shibaswap(self, address: str, token0: str, token1: str, origin_block: int):
+        """
+        Add the given uniswap v2 exchange details to the pricer pool.
+        """
+        assert web3.Web3.isChecksumAddress(address)
+        assert web3.Web3.isChecksumAddress(token0)
+        assert web3.Web3.isChecksumAddress(token1)
+        assert origin_block > 0 # sanity check
+        assert bytes.fromhex(token0[2:]) < bytes.fromhex(token1[2:])
+        self._shibaswap_pools[address] = (token0, token1)
         self._token_to_pools[token0].append(address)
         self._token_to_pools[token1].append(address)
         self._token_pairs_to_pools[(token0, token1)].append(address)
@@ -216,12 +284,6 @@ class PricerPool:
         
         old_tokens.clear()
         old_tokens.extend(tokens)
-
-    def is_uniswap_v2(self, address: str) -> bool:
-        if address in self._uniswap_v2_pools:
-            return True
-        assert address in self._uniswap_v3_pools, 'address was neither uniswap v2 nor v3'
-        return False
 
     def get_exchanges_for(self, token_address: str, block_number: typing.Optional[int] = None) -> typing.Iterable[str]:
         """
@@ -347,35 +409,47 @@ class PricerPool:
         # return ret        
 
     def get_pricer_for(self, address: str) -> typing.Optional[BaseExchangePricer]:
-        self._maybe_log_stats()
+        with profile('get_pricer_for'):
+            self._maybe_log_stats()
 
-        ret = None
+            maybe_cached_pricer = self._evictable_cache.get(address, None) or self._cache.get(address, None)
+            if maybe_cached_pricer is not None:
+                self._cache_hits += 1
+                return maybe_cached_pricer
 
-        maybe_uv2 = self._uniswap_v2_pools.get(address)
-        if maybe_uv2 is not None:
-            token0, token1 = maybe_uv2
-            ret = self._get_uniswap_v2_pricer(address, token0, token1)
-            return ret
+            ret = None
 
-        maybe_sushi = self._sushiswap_v2_pools.get(address)
-        if maybe_sushi is not None:
-            token0, token1 = maybe_sushi
-            ret = self._get_sushiswap_v2_pricer(address, token0, token1)
-            return ret
+            maybe_uv2 = self._uniswap_v2_pools.get(address)
+            if maybe_uv2 is not None:
+                token0, token1 = maybe_uv2
+                ret = self._get_uniswap_v2_pricer(address, token0, token1)
+                return ret
 
-        maybe_uv3 = self._uniswap_v3_pools.get(address)
-        if maybe_uv3 is not None:
-            token0, token1, fee = maybe_uv3
-            return self._get_uniswap_v3_pricer(address, token0, token1, fee)
+            maybe_sushi = self._sushiswap_v2_pools.get(address)
+            if maybe_sushi is not None:
+                token0, token1 = maybe_sushi
+                ret = self._get_sushiswap_v2_pricer(address, token0, token1)
+                return ret
 
-        maybe_balv1 = self._balancer_v1_pools.get(address)
-        if maybe_balv1 is not None:
-            return self._get_balancer_v1_pricer(address)
+            maybe_shiba = self._shibaswap_pools.get(address)
+            if maybe_shiba is not None:
+                token0, token1 = maybe_shiba
+                ret = self._get_shibaswap_pricer(address, token0, token1)
+                return ret
 
-        maybe_balv2 = self._balancer_v2_pools.get(address)
-        if maybe_balv2 is not None:
-            _, pool_id, pool_type = maybe_balv2
-            return self._get_balancer_v2_pricer(address, pool_id, pool_type)
+            maybe_uv3 = self._uniswap_v3_pools.get(address)
+            if maybe_uv3 is not None:
+                token0, token1, fee = maybe_uv3
+                return self._get_uniswap_v3_pricer(address, token0, token1, fee)
+
+            maybe_balv1 = self._balancer_v1_pools.get(address)
+            if maybe_balv1 is not None:
+                return self._get_balancer_v1_pricer(address)
+
+            maybe_balv2 = self._balancer_v2_pools.get(address)
+            if maybe_balv2 is not None:
+                _, pool_id, pool_type = maybe_balv2
+                return self._get_balancer_v2_pricer(address, pool_id, pool_type)
 
         raise NotImplementedError(f'Not sure which pool {address} belongs to')
 
@@ -384,6 +458,8 @@ class PricerPool:
             return set(self._uniswap_v2_pools[address])
         elif address in self._sushiswap_v2_pools:
             return set(self._sushiswap_v2_pools[address])
+        elif address in self._shibaswap_pools:
+            return set(self._shibaswap_pools[address])
         elif address in self._uniswap_v3_pools:
             return set(self._uniswap_v3_pools[address][:2])
         elif address in self._balancer_v1_pools:
@@ -396,55 +472,56 @@ class PricerPool:
         return self._origin_blocks[address]
 
     def _get_uniswap_v2_pricer(self, address: str, token0: str, token1: str) -> BaseExchangePricer:
-        if address in self._cache:
-            self._cache_hits += 1
-            return self._cache[address]
+        maybe_uv2 = self._hydrate_pricer(address)
+        if maybe_uv2 is not None:
+            return maybe_uv2
+
         self._cache_misses += 1
         ret = UniswapV2Pricer(self._w3, address, token0, token1)
-        self._cache[address] = ret
+        self._evictable_cache[address] = ret
         return ret
 
     def _get_sushiswap_v2_pricer(self, address: str, token0: str, token1: str) -> BaseExchangePricer:
-        if address in self._cache:
-            self._cache_hits += 1
-            return self._cache[address]
+        maybe_sv2 = self._hydrate_pricer(address)
+        if maybe_sv2 is not None:
+            return maybe_sv2
+
         self._cache_misses += 1
         ret = UniswapV2Pricer(self._w3, address, token0, token1)
-        self._cache[address] = ret
+        self._evictable_cache[address] = ret
+        return ret
+
+    def _get_shibaswap_pricer(self, address: str, token0: str, token1: str) -> BaseExchangePricer:
+        maybe_shib = self._hydrate_pricer(address)
+        if maybe_shib is not None:
+            return maybe_shib
+
+        self._cache_misses += 1
+        ret = UniswapV2Pricer(self._w3, address, token0, token1)
+        self._evictable_cache[address] = ret
         return ret
 
     def _get_uniswap_v3_pricer(self, address: str, token0: str, token1: str, fee: int) -> BaseExchangePricer:
-        if address in self._cache:
-            self._cache_hits += 1
-            return self._cache[address]
+        maybe_uv3 = self._hydrate_pricer(address)
+        if maybe_uv3 is not None:
+            return maybe_uv3
+
         self._cache_misses += 1
         ret = UniswapV3Pricer(self._w3, address, token0, token1, fee)
-        self._cache[address] = ret
+        self._evictable_cache[address] = ret
         return ret
 
     def _get_balancer_v1_pricer(self, address: str) -> BaseExchangePricer:
-        if address in self._cache:
-            self._cache_hits += 1
-            return self._cache[address]
         self._cache_misses += 1
         ret = BalancerPricer(self._w3, address)
         self._cache[address] = ret
         return ret
 
     def _get_balancer_v2_pricer(self, address: str, pool_id: bytes, pool_type: str) -> BaseExchangePricer:
-        if address in self._cache:
-            self._cache_hits += 1
-            return self._cache[address]
-
-        vault: web3.contract.Contract = self._w3.eth.contract(
-            address=BALANCER_VAULT_ADDRESS,
-            abi=get_abi('balancer_v2/Vault.json'),
-        )
-
         if pool_type in ['WeightedPool', 'WeightedPool2Tokens']:
-            b = BalancerV2WeightedPoolPricer(self._w3, vault, address, pool_id)
+            b = BalancerV2WeightedPoolPricer(self._w3, self._balancer_v2_vault, address, pool_id)
         elif pool_type in ['LiquidityBootstrappingPool', 'NoProtocolFeeLiquidityBootstrappingPool']:
-            b = BalancerV2LiquidityBootstrappingPoolPricer(self._w3, vault, address, pool_id)
+            b = BalancerV2LiquidityBootstrappingPoolPricer(self._w3, self._balancer_v2_vault, address, pool_id)
         else:
             raise Exception(f'not sure how to make {pool_type} pool (address = {address})')
 
@@ -452,19 +529,47 @@ class PricerPool:
         self._cache[address] = b
         return b
 
+    def _hydrate_pricer(self, key: str) -> typing.Optional[BaseExchangePricer]:
+        if self._db is None:
+            return None
+
+        try:
+            with profile('ldb.read'):
+                bs = self._db.Get(key.encode('ascii'))
+                unpickled = pickle.loads(bs)
+            unpickled.set_web3(self._w3)
+            self._evictable_cache[key] = unpickled
+
+            self._soft_cache_hits += 1
+            return unpickled
+        except KeyError:
+            return None
+
+    def _evicted(self, k: str, v: typing.Union[UniswapV2Pricer, UniswapV3Pricer]):
+        with profile('ldb.write'):
+            assert self._db is not None
+            # cache out to leveldb
+            bs = pickle.dumps(v)
+            self._db.Put(k.encode('ascii'), bs)
 
     def _maybe_log_stats(self):
-        return # don't log ever for now
         if time.time() > self._last_stat_log_ts + self.__class__.STAT_LOG_PERIOD_SECONDS:
             # do log
             hits = self._cache_hits
+            soft_hits = self._soft_cache_hits
             misses = self._cache_misses
-            if hits + misses == 0:
-                return
-            hit_percent = hits / (hits + misses) * 100
-            l.debug(f'Pricer pool cache stats: hits={hits} misses={misses} hit_percent={hit_percent:.2f}%')
-            self._last_stat_log_ts = time.time()
 
-    @property
-    def exchange_count(self) -> int:
-        return len(self._uniswap_v2_pools) + len(self._uniswap_v3_pools)
+            n_queries = hits + misses + soft_hits
+            if n_queries == 0:
+                return
+            hit_percent = hits / (n_queries) * 100
+            soft_hit_percent = soft_hits / n_queries * 100
+            miss_percent = misses / n_queries * 100
+
+            l.debug(f'Pricer pool cache stats: size_evictable={len(self._evictable_cache):,} hits={hit_percent:.2f}% soft_hit_percent={soft_hit_percent:.2f}% misses={miss_percent:.2f}%')
+
+            self._last_stat_log_ts = time.time()
+            self._cache_hits = 0
+            self._soft_cache_hits = 0
+            self._cache_misses = 0
+

@@ -5,15 +5,7 @@ import web3.contract
 from eth_utils import event_abi_to_log_topic
 from pricers.token_balance_changing_logs import CACHE_INVALIDATING_TOKEN_LOGS
 
-from utils import WETH_ADDRESS, USDC_ADDRESS, TETHER_ADDRESS, UNI_ADDRESS, WBTC_ADDRESS, get_abi
-
-THRESHOLDS = {
-    WETH_ADDRESS: web3.Web3.toWei('0.01', 'ether'),
-    USDC_ADDRESS: 10 * (10 ** 6),
-    TETHER_ADDRESS: 10 * (10 ** 6),
-    UNI_ADDRESS: web3.Web3.toWei('0.25', 'ether'), # UNI also uses 18 decimals and had a max price of 40, so this is about $400, optimistically
-    WBTC_ADDRESS: 1 * (10 ** 8) // 10_000, # like $1-4 ish?
-}
+from utils import get_abi
 
 
 IMPORTANT_TOPICS: typing.List[bytes] = []
@@ -59,6 +51,6 @@ assert os.path.isfile(univ3_fname)
 
 FNAME_EXCHANGES_WITH_BALANCES = '/mnt/goldphish/exchanges_prefilter.csv'
 
-# profit must be enough to pay for 100k gas @ 10 gwei (both overly optimistic)
-MIN_PROFIT_PREFILTER = (130_000) * (10 * (10 ** 9))
+# profit must be enough to pay for 130k gas @ 20 gwei (both overly optimistic)
+MIN_PROFIT_PREFILTER = (130_000) * (20 * (10 ** 9))
 

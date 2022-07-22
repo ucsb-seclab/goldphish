@@ -22,6 +22,7 @@ from backtest.top_of_block.verify import do_verify
 import backtest.top_of_block.measure_tvl
 import backtest.top_of_block.seek_candidates
 import backtest.top_of_block.replicate_samples
+import backtest.top_of_block.maximal_block_value
 
 from utils import connect_web3, setup_logging
 
@@ -42,6 +43,9 @@ def main():
     handlers[cmd] = handler
 
     cmd, handler = backtest.top_of_block.replicate_samples.add_args(subparser)
+    handlers[cmd] = handler
+
+    cmd, handler = backtest.top_of_block.maximal_block_value.add_args(subparser)
     handlers[cmd] = handler
 
     args = parser.parse_args()

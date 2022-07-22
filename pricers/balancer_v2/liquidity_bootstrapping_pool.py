@@ -149,7 +149,7 @@ class BalancerV2LiquidityBootstrappingPoolPricer(BaseExchangePricer):
         return ps.start_ts < timestamp <= ps.end_ts
 
     def get_tokens(self, _) -> typing.Set[str]:
-        return self.tokens
+        return set(self.tokens)
 
     def get_swap_enabled(self, block_identifier: int) -> bool:
         if self.swap_enabled is None:

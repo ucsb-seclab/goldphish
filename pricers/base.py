@@ -20,6 +20,8 @@ class NotEnoughLiquidityException(Exception):
         self.amount_in = amount_in
         self.remaining = remaining
 
+    def __str__(self) -> str:
+        return f'<NotEnoughLiquidityException amount_in={self.amount_in} amount_remaining={self.remaining}>'
 
 class BaseExchangePricer:
     w3: web3.Web3

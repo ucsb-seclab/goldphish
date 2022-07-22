@@ -128,6 +128,37 @@ class RetryingProvider(JSONBaseProvider):
         factor = 4,
         on_backoff = lambda x: x['args'][0]._connect()
     )
+    def make_request_batch(self, requests: typing.Tuple[str, typing.Any]) -> typing.List[web3.types.RPCResponse]:
+        obj = []
+        for method, params in requests:
+            rpc_dict = {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params or [],
+                "id": next(self.request_counter),
+            }
+            obj.append(rpc_dict)
+        payload = json.dumps(obj).encode('ascii')
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._internal_provider.coro_make_request(payload),
+            web3.WebsocketProvider._loop
+        )
+        ret = future.result()
+        ret = sorted(ret, key=lambda x: x['id'])
+        return ret
+
+
+    @backoff.on_exception(
+        backoff.expo,
+        (
+            websockets.exceptions.ConnectionClosedError,
+            asyncio.exceptions.TimeoutError,
+        ),
+        max_time = 10 * 60,
+        factor = 4,
+        on_backoff = lambda x: x['args'][0]._connect()
+    )
     def make_request(self, method, params):
         request_data = self.encode_rpc_request(method, params)
         future = asyncio.run_coroutine_threadsafe(
