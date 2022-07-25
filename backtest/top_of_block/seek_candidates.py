@@ -29,8 +29,6 @@ import utils.profiling
 l = logging.getLogger(__name__)
 
 LOG_BATCH_SIZE = 200
-RESERVATION_SIZE = 1 * 24 * 60 * 60 // 13 # about 1 days' worth
-
 
 DEBUG = False
 
@@ -381,7 +379,7 @@ def get_reservation(curr: psycopg2.extensions.cursor, worker_name: str) -> typin
         '''
         SELECT id, block_number_start, block_number_end
         FROM candidate_arbitrage_reservations
-        WHERE claimed_on IS NULL AND completed_on IS NULL AND block_number_start > 13000000
+        WHERE claimed_on IS NULL AND completed_on IS NULL
         ORDER BY block_number_start ASC
         LIMIT 1
         FOR UPDATE SKIP LOCKED

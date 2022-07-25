@@ -3,13 +3,16 @@ Attempts to re-find arbitrages that actually occurred on the blockchain.
 """
 
 import argparse
+import subprocess
 import decimal
-import math
+import json
+import os
+import pathlib
 import random
 import time
 import typing
-import numpy as np
 import web3
+import web3.contract
 import web3.types
 import web3._utils.filters
 import psycopg2
@@ -23,11 +26,15 @@ from pricers.balancer import BalancerPricer
 from pricers.balancer_v2.liquidity_bootstrapping_pool import BalancerV2LiquidityBootstrappingPoolPricer
 from pricers.balancer_v2.weighted_pool import BalancerV2WeightedPoolPricer
 from pricers.base import BaseExchangePricer, NotEnoughLiquidityException
+from pricers.token_transfer import out_from_transfer
 from pricers.uniswap_v2 import UniswapV2Pricer
 from pricers.uniswap_v3 import UniswapV3Pricer
 from find_circuit import PricingCircuit
-from find_circuit.find import detect_arbitrages_bisection
-from utils import BALANCER_VAULT_ADDRESS, get_abi
+from find_circuit.find import FoundArbitrage, detect_arbitrages_bisection
+from shooter.encoder import BalancerV1Swap, BalancerV2Swap, UniswapV2Swap, UniswapV3Swap, serialize
+from utils import BALANCER_VAULT_ADDRESS, WETH_ADDRESS, decode_trace_calls, get_abi, pretty_print_trace
+from eth_account import Account
+from eth_account.signers.local import LocalAccount
 
 l = logging.getLogger(__name__)
 
@@ -49,6 +56,7 @@ def replicate(w3: web3.Web3, args: argparse.Namespace):
         return
 
     l.info('Starting replication')
+
     time.sleep(4)
 
     while True:
@@ -59,6 +67,7 @@ def replicate(w3: web3.Web3, args: argparse.Namespace):
             break
 
         try_replicate(w3, curr, candidate)
+        db.commit()
 
         # some jitter for the parallel workers
         if random.choice((True, False)):
@@ -125,7 +134,7 @@ def get_candidate(curr: psycopg2.extensions.cursor):
     (id_,) = curr.fetchone()
     curr.execute('UPDATE sample_arbitrage_replications SET verification_started = true WHERE sample_arbitrage_id = %s', (id_,))
     assert curr.rowcount == 1
-    curr.connection.commit()
+    # curr.connection.commit()
 
     l.debug(f'Processing id_={id_}')
 
@@ -155,7 +164,6 @@ def try_replicate(w3: web3.Web3, curr: psycopg2.extensions.cursor, candidate: in
             (candidate,)
         )
         assert curr.rowcount == 1
-        curr.connection.commit()
         return
 
     curr.execute(
@@ -241,7 +249,6 @@ def try_replicate(w3: web3.Web3, curr: psycopg2.extensions.cursor, candidate: in
             (candidate,)
         )
         assert curr.rowcount == 1
-        curr.connection.commit()
         return
 
     circuit: typing.List[BaseExchangePricer] = []
@@ -266,7 +273,6 @@ def try_replicate(w3: web3.Web3, curr: psycopg2.extensions.cursor, candidate: in
                 (candidate,)
             )
             assert curr.rowcount == 1
-            curr.connection.commit()
             return
 
     assert len(circuit) == len(directions) # this should not be possible to voilate, but just to be sure
@@ -291,17 +297,44 @@ def try_replicate(w3: web3.Web3, curr: psycopg2.extensions.cursor, candidate: in
             (candidate,)
         )
         assert curr.rowcount == 1
-        curr.connection.commit()
         return
 
     # get our profit and compare it to theirs
     arb = maybe_arbs[0]
-    
+
     profit_percent_changed = None
     if original_profit_amount > 0:
         original_profit_amount_dec = decimal.Decimal(original_profit_amount)
         diff = decimal.Decimal(arb.profit) - original_profit_amount_dec
         profit_percent_changed = diff / original_profit_amount_dec * 100
+        l.debug(f'Profit changed by {profit_percent_changed:.2f}%')
+
+    can_attempt_ganache_replicate = arb.pivot_token == WETH_ADDRESS and len(arb.circuit) <= 3
+
+    if can_attempt_ganache_replicate:
+        has_whacky_token = False
+        # find out if it uses any bad tokens we don't know about
+        all_tokens = set(x for x, _ in directions).union(x for _, x in directions)
+        assert len(all_tokens) == len(pc.circuit)
+        for t in all_tokens:
+            curr.execute(
+                '''
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM whacky_tokens wt
+                    JOIN tokens t ON wt.token_id = t.id
+                    WHERE t.address = %s
+                );
+                ''',
+                (bytes.fromhex(t[2:]),)
+            )
+            (is_whacky,) = curr.fetchone()
+            if is_whacky:
+                has_whacky_token = True
+                break
+
+        if not has_whacky_token:
+            ganache_replicate(arb, block_number)
 
     curr.execute(
         '''
@@ -317,7 +350,6 @@ def try_replicate(w3: web3.Web3, curr: psycopg2.extensions.cursor, candidate: in
         (arb.profit, profit_percent_changed, candidate)
     )
     assert curr.rowcount == 1
-    curr.connection.commit()
     return
 
 
@@ -457,3 +489,275 @@ def load_pricer_for(w3: web3.Web3, curr: psycopg2.extensions.cursor, exchange: b
         return p
 
     return None
+
+
+class ReshootResult(typing.NamedTuple):
+    success: bool
+    profit: int
+    gasUsed: int
+
+def ganache_replicate(fa: FoundArbitrage, block_number) -> ReshootResult:
+    proc, w3_ganache, acct, shooter_addr = open_ganache(block_number - 1)
+
+    intermediate_arbitrage, approvals_required = construct_arbitrage(fa, shooter_addr, block_number)
+    for step in intermediate_arbitrage:
+        print(step)
+    payload = serialize(intermediate_arbitrage)
+
+    artifact_path = pathlib.Path(__file__).parent.parent.parent / 'artifacts' / 'contracts' / 'shooter.sol' / 'Shooter.json'
+
+    assert os.path.isfile(artifact_path)
+
+    with open(artifact_path) as fin:
+        artifact = json.load(fin)
+
+    shooter = w3_ganache.eth.contract(
+        address = shooter_addr,
+        abi = artifact['abi'],
+    )
+
+    for addr, token in approvals_required:
+        shooter.functions.doApprove(token, addr).transact({'from': acct.address})
+        l.debug(f'approved {addr} to use token {token}')
+
+    txn = {
+        'from': acct.address,
+        'to': shooter_addr,
+        'data': b'\x00'*4 + payload,
+        'chainId': 1,
+        'gas': 1_000_000,
+        'nonce': w3_ganache.eth.get_transaction_count(acct.address),
+        'gasPrice': 500 * (10 ** 9)
+    }
+    signed = w3_ganache.eth.account.sign_transaction(txn, acct.key)
+
+    txn_hash = w3_ganache.eth.send_raw_transaction(signed['rawTransaction'])
+    receipt = w3_ganache.eth.wait_for_transaction_receipt(txn_hash)
+
+    weth: web3.contract.Contract = w3_ganache.eth.contract(
+        address = WETH_ADDRESS,
+        abi = get_abi('erc20.abi.json'),
+    )
+
+    new_balance = weth.functions.balanceOf(shooter_addr).call()
+    real_profit = new_balance - web3.Web3.toWei(100, 'ether')
+
+    l.debug(f'actual profit: {real_profit} expected profit {fa.profit}')
+
+    tr = w3_ganache.provider.make_request('debug_traceTransaction', [txn_hash.hex()])
+
+    decoded = decode_trace_calls(tr['result']['structLogs'], txn, receipt)
+    pretty_print_trace(decoded, txn, receipt)
+
+    proc.kill()
+    proc.wait()
+
+    if real_profit != fa.profit:
+        raise Exception('what')
+
+    if receipt['status'] == 1:
+        return ReshootResult(
+            success = True,
+            profit  = real_profit,
+            gasUsed = receipt['gasUsed'],
+        )
+    else:
+        return ReshootResult(
+            success = False,
+            profit  = None,
+            gasUsed = None
+        )
+
+
+def construct_arbitrage(fa: FoundArbitrage, shooter_addr: str, block_number) -> typing.Tuple[typing.List, typing.List[typing.Tuple[str, str]]]:
+    assert fa.pivot_token == WETH_ADDRESS
+    ret = []
+    approvals_required: typing.List[typing.Tuple[str, str]] = []
+
+    assert len(fa.circuit) >= 2
+    assert len(fa.directions) >= 2
+
+    amount_in = fa.amount_in
+
+    for p, (token_in, token_out) in zip(fa.circuit, fa.directions):
+        amount_out, _ = p.token_out_for_exact_in(
+            token_in,
+            token_out,
+            amount_in,
+            block_number - 1,
+        )
+
+        if isinstance(p, UniswapV2Pricer):
+            ret.append(UniswapV2Swap(
+                amount_in=None,
+                amount_out=amount_out,
+                exchange=p.address,
+                to=None,
+                zero_for_one=(bytes.fromhex(token_in[2:]) < bytes.fromhex(token_out[2:]))
+            ))
+        elif isinstance(p, UniswapV3Pricer):
+            ret.append(UniswapV3Swap(
+                amount_in=amount_in,
+                exchange=p.address,
+                to=[],
+                zero_for_one=(bytes.fromhex(token_in[2:]) < bytes.fromhex(token_out[2:])),
+                leading_exchanges=None,
+                must_send_input=False
+            ))
+        elif isinstance(p, BalancerPricer):
+            ret.append(BalancerV1Swap(
+                amount_in=amount_in,
+                exchange=p.address,
+                token_in=token_in,
+                token_out=token_out,
+                to=None,
+                requires_approval=False,
+            ))
+            approvals_required.append((p.address, token_in))
+        elif isinstance(p, (BalancerV2WeightedPoolPricer, BalancerV2LiquidityBootstrappingPoolPricer)):
+            ret.append(BalancerV2Swap(
+                pool_id=p.pool_id,
+                amount_in=amount_in,
+                amount_out=amount_out,
+                token_in=token_in,
+                token_out=token_out,
+                to=None
+            ))
+            approvals_required.append((BALANCER_VAULT_ADDRESS, token_in))
+
+        amount_in = out_from_transfer(token_out, amount_out)
+
+    if isinstance(ret[0], UniswapV2Swap):
+        ret[0] = ret[0]._replace(amount_in = fa.amount_in)
+
+    if isinstance(ret[0], UniswapV3Swap):
+        ret[0]  = ret[0]._replace(must_send_input = True)
+
+    ret[-1] = ret[-1]._replace(to = shooter_addr)
+
+    for i in range(len(ret) - 1):
+        p1 = ret[i]
+        p2 = ret[i + 1]
+
+        if isinstance(p2, (BalancerV1Swap, BalancerV2Swap)):
+            ret[i] = p1._replace(to = shooter_addr)
+        else:
+            ret[i] = p1._replace(to = p2.exchange)
+
+
+    gathered = _recurse_gather_uniswap_v3(ret, [])
+    assert isinstance(gathered, list)
+    assert len(gathered) > 0
+    return gathered, approvals_required
+
+def _recurse_gather_uniswap_v3(l, acc):
+    if len(l) == 0:
+        return acc
+
+    if isinstance(l[0], UniswapV3Swap):
+        uv3 = l[0]._replace(leading_exchanges=acc)
+        return _recurse_gather_uniswap_v3(l[1:], [uv3])
+
+    return _recurse_gather_uniswap_v3(l[1:], acc + [l[0]])
+
+_port = 0
+def open_ganache(block_number: int) -> typing.Tuple[subprocess.Popen, web3.Web3, LocalAccount, str]:
+    global _port
+    acct: LocalAccount = Account.from_key(bytes.fromhex('f96003b86ed95cb86eae15653bf4b0bc88691506141a1a9ae23afd383415c268'))
+
+    bin_loc = '/opt/ganache-fork/src/packages/ganache/dist/node/cli.js'
+    cwd_loc = '/opt/ganache-fork/'
+
+    my_pid = os.getpid()
+    ganache_port = 34451 + (my_pid % 500) + _port
+    _port += 1
+
+    web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
+    p = subprocess.Popen(
+        [
+            'node',
+            bin_loc,
+            '--fork.url', web3_host,
+            '--fork.blockNumber', str(block_number),
+            '--server.port', str(ganache_port),
+            '--chain.chainId', '1',
+            # '--chain.hardfork', 'arrowGlacier',
+            '--wallet.accounts', f'{acct.key.hex()},{web3.Web3.toWei(1000, "ether")}',
+        ],
+        stdout=subprocess.DEVNULL,
+        cwd=cwd_loc,
+    )
+
+    l.debug(f'spawned ganache on PID={p.pid} port={ganache_port}')
+
+    w3 = web3.Web3(web3.WebsocketProvider(
+            f'ws://localhost:{ganache_port}',
+            websocket_timeout=60 * 5,
+            websocket_kwargs={
+                'max_size': 1024 * 1024 * 1024, # 1 Gb max payload
+            },
+        )
+    )
+
+    def patch_make_batch_request(requests: typing.Tuple[str, typing.Any]):
+        ret = []
+        for method, args in requests:
+            ret.append(w3.provider.make_request(method, args))
+        return ret
+
+    w3.provider.make_request_batch = patch_make_batch_request
+
+    while not w3.isConnected():
+        time.sleep(0.1)
+
+    assert w3.eth.get_balance(acct.address) == web3.Web3.toWei(1000, 'ether')
+
+    #
+    # deploy the shooter
+    #
+    artifact_path = pathlib.Path(__file__).parent.parent.parent / 'artifacts' / 'contracts' / 'shooter.sol' / 'Shooter.json'
+
+    assert os.path.isfile(artifact_path)
+
+    with open(artifact_path) as fin:
+        artifact = json.load(fin)
+
+    shooter = w3.eth.contract(
+        bytecode = artifact['bytecode'],
+        abi = artifact['abi'],
+    )
+
+    constructor_txn = shooter.constructor().buildTransaction({'from': acct.address})
+    txn_hash = w3.eth.send_transaction(constructor_txn)
+    receipt = w3.eth.wait_for_transaction_receipt(txn_hash)
+
+    shooter_addr = receipt['contractAddress']
+    l.info(f'deployed shooter to {shooter_addr} with admin key {acct.address}')
+
+    shooter = w3.eth.contract(
+        address = shooter_addr,
+        abi = artifact['abi'],
+    )
+
+    #
+    # fund the shooter with some wrapped ether
+    #
+    amt_to_send = w3.toWei(100, 'ether')
+    weth: web3.contract.Contract = w3.eth.contract(
+        address=WETH_ADDRESS,
+        abi=get_abi('weth9/WETH9.json')['abi'],
+    )
+    wrap = weth.functions.deposit().buildTransaction({'value': amt_to_send, 'from': acct.address})
+    wrap_hash = w3.eth.send_transaction(wrap)
+    wrap_receipt = w3.eth.wait_for_transaction_receipt(wrap_hash)
+    assert wrap_receipt['status'] == 1
+
+    # transfer to shooter
+    xfer = weth.functions.transfer(shooter_addr, amt_to_send).buildTransaction({'from': acct.address})
+    xfer_hash = w3.eth.send_transaction(xfer)
+    xfer_receipt = w3.eth.wait_for_transaction_receipt(xfer_hash)
+    assert xfer_receipt['status'] == 1
+
+    l.info(f'Transferred {amt_to_send / (10 ** 18):.2f} ETH to shooter')
+
+    return p, w3, acct, shooter_addr

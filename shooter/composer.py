@@ -11,8 +11,6 @@ import shooter.encoder
 import pricers
 import find_circuit.find
 
-from .constants import MAX_COINBASE_XFER, WETH_ADDRESS
-
 l = logging.getLogger(__name__)
 
 

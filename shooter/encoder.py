@@ -6,138 +6,133 @@ Packs parameters for the shooter.
 
 import itertools
 import typing
+import numpy as np
 import web3
 import web3.types
-import enum
 
-from .constants import MAX_AMOUNT_IN_BRIEF, MAX_AMOUNT_IN_UNISWAP_V2, MAX_AMOUNT_OUT, MAX_COINBASE_XFER, MAX_TARGET_BLOCK, MAX_AMOUNT_IN_SWAP
-
-class FundsRecipient(enum.Enum):
-    SHOOTER = 0x0
-    MSG_SENDER = 0x1
-    NEXT_EXCHANGE = 0x2
-
-class UniswapV2Record(typing.NamedTuple):
-    address: str
-    amount_out: int
-    amount_in_explicit: int
-    recipient: FundsRecipient
-    zero_for_one: bool
-
-    @property
-    def amount(self):
-        return self.amount_out
-
-class UniswapV3Record(typing.NamedTuple):
-    address: str
+class UniswapV2Swap(typing.NamedTuple):
     amount_in: int
+    amount_out: int
+    exchange: str
+    to: str
     zero_for_one: bool
-    recipient: FundsRecipient
 
-    @property
-    def amount(self):
-        return self.amount_in
+    def serialize(self) -> bytes:
+        builder = [
+            int.to_bytes(self.amount_in if self.amount_in else 0, length=32, byteorder='big', signed=False),
+            int.to_bytes(self.amount_out, length=32, byteorder='big', signed=False),
+            bytes.fromhex(self.exchange[2:]),
+            bytes.fromhex(self.to[2:]),
+            b'\x01' if self.zero_for_one else b'\x00',
+        ]
+        return b''.join(builder)
 
-class ExceedsEncodableParamsException(Exception):
+class UniswapV3Swap(typing.NamedTuple):
+    amount_in: int
+    exchange: str
+    to: str
+    zero_for_one: bool
+    leading_exchanges: typing.List
+    must_send_input: bool
 
-    def __init__(self, *args: object) -> None:
-        super().__init__(*args)
+    def serialize(self) -> bytes:
+        assert self.amount_in > 0
 
-def encode_basic(
-        target_block: int,
-        amount_in: int,
-        coinbase_xfer: int,
-        exchanges: typing.List[typing.Union[UniswapV2Record, UniswapV3Record]],
-    ) -> bytes:
-    """
-    Encodes the shooter contract input.
-
-    NOTE: `mode` is fixed at 0 for now
-    """
-    assert isinstance(amount_in, int)
-    assert 0 <= amount_in
-    if amount_in > MAX_AMOUNT_IN_SWAP:
-        raise ExceedsEncodableParamsException('amount_in too big')
-    assert isinstance(target_block, int)
-    assert 0 <= target_block
-
-    assert isinstance(coinbase_xfer, int)
-    assert 0 <= coinbase_xfer
-    assert coinbase_xfer <= MAX_COINBASE_XFER
-
-    assert len(exchanges) >= 2
-    assert isinstance(exchanges[0], UniswapV3Record)
-    assert exchanges[0].recipient in [FundsRecipient.NEXT_EXCHANGE, FundsRecipient.SHOOTER]
-
-    ret =  b''
-    # method selector is always zero
-    ret += b'\x00' * 4
-
-    first_line = 0
-    first_line |= (target_block & MAX_TARGET_BLOCK) << 240
-    if exchanges[0].zero_for_one:
-        first_line |= (0x1 << 239)
-    if exchanges[0].recipient == FundsRecipient.NEXT_EXCHANGE:
-        first_line |= (0x1 << 238)
-    first_line |= int(exchanges[0].address[2:], base=16)
-
-    # do we need extradata?
-    need_extradata = coinbase_xfer > 0 or amount_in > MAX_AMOUNT_IN_BRIEF
-    if not need_extradata:
-        first_line |= (amount_in << 160)
-        ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
-    else:
-        second_line = coinbase_xfer
-        second_line |= amount_in << 64
-        ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
-        ret += int.to_bytes(second_line, length=32, byteorder='big', signed=False)
-
-    for i, ex in zip(itertools.count(1), exchanges[1:]):
-        assert ex.amount > 0
-        assert len(ex.address) == 42
-        assert web3.Web3.isChecksumAddress(ex.address)
-        assert isinstance(ex.zero_for_one, bool)
-        # if uniswap v2, must be last exchange to use MSG_SENDER recipient
-        if isinstance(ex, UniswapV2Record):
-            if ex.recipient == FundsRecipient.MSG_SENDER:
-                assert i + 1 == len(exchanges)
-        if i == len(exchanges) - 1:
-            assert ex.recipient != FundsRecipient.NEXT_EXCHANGE, 'no more exchanges after this one'
-
-        first_line = 0
-
-        # handle flags
-        if isinstance(ex, UniswapV3Record):
-            first_line |= 0x1 << 252
-        if ex.zero_for_one:
-            first_line |= 0x1 << 253
-        first_line |= int(ex.recipient.value) << 254
- 
-        # add address
-        first_line |= int(ex.address[2:], base=16)
-
-        if isinstance(ex, UniswapV2Record) and ex.amount_in_explicit > MAX_AMOUNT_IN_UNISWAP_V2:
-            raise ExceedsEncodableParamsException(f'amount_in for {ex.address} exceeds limits')
-
-        can_infer_amount_out = isinstance(ex, UniswapV2Record) and i == len(exchanges) - 1 and ex.recipient == FundsRecipient.MSG_SENDER
-        if can_infer_amount_out:
-            first_line |= ex.amount_in_explicit << 160
+        if len(self.leading_exchanges) > 0:
+            extradata = serialize(self.leading_exchanges)
         else:
-            # add amount out
-            if ex.amount > MAX_AMOUNT_OUT:
-                raise ExceedsEncodableParamsException(f'exceeds max amount {ex.address}')
-            first_line |= ex.amount << 160
+            extradata = b''
+        extradata = (b'\x01' if self.must_send_input else b'\x00') + extradata
 
-        ret += int.to_bytes(first_line, length=32, byteorder='big', signed=False)
+        builder = [
+            int.to_bytes(self.amount_in, length=32, byteorder='big', signed=True),
+            bytes.fromhex(self.exchange[2:]),
+            bytes.fromhex(self.to[2:]),
+            b'\x01' if self.zero_for_one else b'\x00',
+            int.to_bytes(len(extradata), length=2, byteorder='big', signed=False),
+            extradata,
+        ]
+        return b''.join(builder)
 
-        if not can_infer_amount_out and isinstance(ex, UniswapV2Record) and ex.amount_in_explicit > 0:
-            if ex.amount_in_explicit >= MAX_AMOUNT_IN_UNISWAP_V2:
-                raise ExceedsEncodableParamsException(f'exceeds max amount_in_explicit: {ex.address}')
-            ret += int.to_bytes(
-                ex.amount_in_explicit << 160,
-                length=32,
-                byteorder='big',
-                signed=False
+
+class BalancerV1Swap(typing.NamedTuple):
+    amount_in: int
+    exchange: str
+    token_in: str
+    token_out: str
+    to: str
+    requires_approval: bool
+
+    def serialize(self) -> bytes:
+        assert self.amount_in > 0
+        builder = [
+            int.to_bytes(self.amount_in, length=32, byteorder='big', signed=False),
+            bytes.fromhex(self.exchange[2:]),
+            bytes.fromhex(self.token_in[2:]),
+            bytes.fromhex(self.token_out[2:]),
+            bytes.fromhex(self.to[2:]),
+            b'\x01' if self.requires_approval else b'\x00',
+        ]
+        return b''.join(builder)
+
+
+class BalancerV2Swap(typing.NamedTuple):
+    pool_id: bytes
+    amount_in: int
+    amount_out: int
+    token_in: str
+    token_out: str
+    to: str
+
+    def serialize(self) -> bytes:
+        assert self.amount_in > 0
+        assert self.amount_out > 0
+        assert len(self.pool_id) == 32
+        builder = [
+            self.pool_id,
+            int.to_bytes(self.amount_in, length=32, byteorder='big', signed=False),
+            int.to_bytes(self.amount_out, length=32, byteorder='big', signed=False),
+            bytes.fromhex(self.token_in[2:]),
+            bytes.fromhex(self.token_out[2:]),
+            bytes.fromhex(self.to[2:]),
+        ]
+
+        return b''.join(builder)
+
+
+def serialize(l: typing.List[typing.Union[UniswapV2Swap, UniswapV3Swap, BalancerV1Swap, BalancerV2Swap]]) -> bytes:
+    # assert 2 <= len(l) <= 3
+    builder = []
+    builder.append(
+        int.to_bytes(len(l), length=1, byteorder='big', signed=False),
+    )
+    serialized = [x.serialize() for x in l]
+    offsets = [0] + list(np.cumsum([len(x) for x in serialized])[:-1])
+    offsets = [o + (1 + 3 * 3) for o in offsets]
+    assert len(offsets) == len(l)
+
+    # pad with 0 offset to 3
+    offsets.extend(0 for _ in range(3 - len(offsets)))
+
+    for i, o in enumerate(offsets):
+        if i < len(l):
+            type_ = {
+                UniswapV2Swap:  1,
+                UniswapV3Swap:  2,
+                BalancerV1Swap: 3,
+                BalancerV2Swap: 4,
+            }[type(l[i])]
+            builder.append(
+                int.to_bytes(type_, length=1, byteorder='big', signed=False)
+            )
+            builder.append(
+                int.to_bytes(int(o), length=2, byteorder='big', signed=False)
+            )
+        else:
+            builder.append(
+                b'\x00\x00\x00'
             )
 
-    return ret
+    builder.extend(serialized)
+    return b''.join(builder)
+

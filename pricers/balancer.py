@@ -131,18 +131,24 @@ class BalancerPricer(BaseExchangePricer):
     def token_out_for_exact_in(self, token_in: str, token_out: str, token_amount_in: int, block_identifier: int, **_):
         # modeled based off swapExactAmountIn
         # neglects minAmountOut and maxPrice
+        if not self.get_public_swap(block_identifier):
+            l.warning(f'Not yet public swap: {self.address}')
+            return 0, 0.0
+
         _tokens = self.get_tokens(block_identifier)
 
         assert token_in in _tokens
         assert token_out in _tokens
-
-        assert self.get_public_swap(block_identifier), 'must be publicSwap'
 
         token_weight_in  = self.get_denorm_weight(token_in,  block_identifier)
         token_weight_out = self.get_denorm_weight(token_out, block_identifier)
 
         token_balance_in  = self.get_balance(token_in, block_identifier)
         token_balance_out = self.get_balance(token_out, block_identifier)
+
+        if token_balance_out == 0:
+            # this fucks up some calculations, so just call it 0
+            return 0, 0.0
 
         max_in = BalancerPricer.bmul(token_balance_in, MAX_IN_RATIO)
         if token_amount_in > max_in:
@@ -164,7 +170,16 @@ class BalancerPricer(BaseExchangePricer):
         adjusted_in = BalancerPricer.bsub(BalancerPricer.BONE, swap_fee)
         adjusted_in = BalancerPricer.bmul(token_amount_in, adjusted_in)
         assert adjusted_in <= token_amount_in, f'expect {adjusted_in} <= {token_amount_in}'
-        y = BalancerPricer.bdiv(token_balance_in, BalancerPricer.badd(token_balance_in, adjusted_in))
+
+        denominator = BalancerPricer.badd(token_balance_in, adjusted_in)
+        if denominator == 0:
+            # The following division is about to blow up. Probably we asked for 0 input
+            # with 0 original balance. Just return reporting that no amount is available
+            # for purchase.
+            assert token_balance_in == 0
+            assert adjusted_in == 0
+            return 0, 0.0
+        y = BalancerPricer.bdiv(token_balance_in, denominator)
         foo = BalancerPricer.bpow(y, weight_ratio) # their var name, not mine
         bar = BalancerPricer.bsub(BalancerPricer.BONE, foo)
 
@@ -175,25 +190,30 @@ class BalancerPricer(BaseExchangePricer):
 
         assert new_balance_out >= 0
 
-        spot_price_after = BalancerPricer.calc_spot_price(
-            new_balance_in,
-            token_weight_in,
-            new_balance_out,
-            token_weight_out,
-            swap_fee,
-        )
+        if new_balance_out > 0:
 
-        assert spot_price_after >= spot_price_before
+            spot_price_after = BalancerPricer.calc_spot_price(
+                new_balance_in,
+                token_weight_in,
+                new_balance_out,
+                token_weight_out,
+                swap_fee,
+            )
 
-        # if token_amount_out > 100:
-        #     # I guess just a double-check that we didn't fuck up rounding?
-        #     divd = BalancerPricer.bdiv(token_amount_in, token_amount_out)
-        #     print('spot_price_before', spot_price_before)
-        #     print('divd             ', divd)
-        #     if spot_price_before > divd:
-        #         raise TooLittleInput(self.address, block_identifier, f'BalancerV1 {self.address} ({token_in} -> {token_out}) @ {block_identifier} needs more input than {token_amount_in}')
+            assert spot_price_after >= spot_price_before
 
-        return token_amount_out, BalancerPricer.BONE / spot_price_after
+            # if token_amount_out > 100:
+            #     # I guess just a double-check that we didn't fuck up rounding?
+            #     divd = BalancerPricer.bdiv(token_amount_in, token_amount_out)
+            #     print('spot_price_before', spot_price_before)
+            #     print('divd             ', divd)
+            #     if spot_price_before > divd:
+            #         raise TooLittleInput(self.address, block_identifier, f'BalancerV1 {self.address} ({token_in} -> {token_out}) @ {block_identifier} needs more input than {token_amount_in}')
+
+            return token_amount_out, BalancerPricer.BONE / spot_price_after
+        else:
+            # new_balance_out == 0
+            return token_amount_out, 0.0 # marginal price is now 0
 
     def get_value_locked(self, token_address: str, block_identifier: int) -> int:
         assert token_address in self.get_tokens(block_identifier)
@@ -379,8 +399,8 @@ class BalancerPricer(BaseExchangePricer):
         ):
         assert token_balance_in >= 0
         assert token_balance_out >= 0
-        assert token_weight_in >= 0
-        assert token_weight_out >= 0
+        assert token_weight_in > 0
+        assert token_weight_out > 0
         assert swap_fee >= 0
         
         numer = BalancerPricer.bdiv(token_balance_in, token_weight_in)

@@ -9,7 +9,6 @@ curr.execute(
     '''
     SELECT SUM(block_number_end - block_number_start + 1)
     FROM candidate_arbitrage_reservations
-    WHERE block_number_start >= 13000000
     '''
 )
 (total_blocks,) = curr.fetchone()
