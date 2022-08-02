@@ -238,7 +238,8 @@ contract Shooter // is
 
     function doApprove(IERC20 token, address delegate) external {
         require(msg.sender == deployer);
-        token.approve(delegate, 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+        (bool success, bytes memory data) = address(token).call(abi.encodeWithSelector(IERC20.approve.selector, delegate, 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'Approve');
     }
 
     /** fallback to accept payments of Ether */

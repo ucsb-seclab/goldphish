@@ -16,6 +16,20 @@ OPEN_ALEXA_TOKEN = '0x1788430620960F9a70e3DC14202a3A35ddE1A316'
 RYOSHIS_VISION_TOKEN = '0x777E2ae845272a2F540ebf6a3D03734A5a8f618e'
 TENSET_TOKEN = '0x7FF4169a6B5122b664c51c95727d87750eC07c84'
 
+def is_known_fee(address: str) -> bool:
+    return address in [
+        SAITAMA_TOKEN,
+        SANSHU_INU_TOKEN,
+        KISHU_INU_TOKEN,
+        PAXOS_GOLD_TOKEN,
+        DEGO_FINANCE_TOKEN,
+        HOKKAIDU_INU_TOKEN,
+        FEG_TOKEN,
+        CULT_DAO_TOKEN,
+        OPEN_ALEXA_TOKEN,
+        RYOSHIS_VISION_TOKEN,
+        TENSET_TOKEN,
+    ]
 
 def out_from_transfer(address: str, amount: int) -> int:
     """

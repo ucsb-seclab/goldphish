@@ -23,7 +23,7 @@ import backtest.top_of_block.measure_tvl
 import backtest.top_of_block.seek_candidates
 import backtest.top_of_block.replicate_samples
 import backtest.top_of_block.maximal_block_value
-import backtest.top_of_block.connect_arb_campaign
+import backtest.top_of_block.shoot
 
 from utils import connect_web3, setup_logging
 
@@ -49,7 +49,7 @@ def main():
     cmd, handler = backtest.top_of_block.maximal_block_value.add_args(subparser)
     handlers[cmd] = handler
 
-    cmd, handler = backtest.top_of_block.connect_arb_campaign.add_args(subparser)
+    cmd, handler = backtest.top_of_block.shoot.add_args(subparser)
     handlers[cmd] = handler
 
     args = parser.parse_args()

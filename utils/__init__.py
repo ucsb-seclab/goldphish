@@ -165,7 +165,8 @@ class RetryingProvider(JSONBaseProvider):
             self._internal_provider.coro_make_request(request_data),
             web3.WebsocketProvider._loop
         )
-        return future.result()
+        ret = future.result()
+        return ret
 
 
 def connect_web3() -> web3.Web3:
@@ -179,16 +180,23 @@ def connect_web3() -> web3.Web3:
 
     return w3
 
+BLANK_WORD = '00' * 32
 def read_mem(start, read_len, mem):
     b = b''
     for idx in range(start, start + read_len):
         byte = idx % 32
         word = idx // 32
         if word >= len(mem):
-            word_content = '00' * 32
+            word_content = BLANK_WORD
         else:
             word_content = mem[word]
-        b += bytes.fromhex(word_content[byte*2:byte*2+2])
+        
+        adjusted_byte_idx = byte - (32 - len(word_content) // 2)
+        if adjusted_byte_idx < 0:
+            b += b'\x00'
+        else:
+            assert adjusted_byte_idx * 2 + 2 <= len(word_content)
+            b += bytes.fromhex(word_content[adjusted_byte_idx*2:adjusted_byte_idx*2+2])
     return b
 
 
@@ -211,7 +219,7 @@ def pretty_print_trace(parsed, txn: web3.types.TxData, receipt: web3.types.TxRec
                 print(padding + '  ' + item['data'][i:i+32].hex())
         elif 'CALL' in item['type']:
             gas_usage =  item['gasStart'] - item['gasEnd']
-            print(padding + item['type'] + ' ' + item['callee'] + f' gas consumed = {gas_usage:,} [{item["traceStart"]}, {item["traceEnd"]}]')
+            print(padding + item['type'] + ' ' + item['callee'] + f' gas consumed = {gas_usage} [{item["traceStart"]}, {item["traceEnd"]}]')
             method_sel = item['args'][:4].hex()
             if method_sel == '128acb08':
                 print(padding + 'UniswapV3Pool.swap()')
@@ -249,13 +257,6 @@ def pretty_print_trace(parsed, txn: web3.types.TxData, receipt: web3.types.TxRec
 
 def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxReceipt):
     # sum the gas and see if things square up
-    gas_from_call = txn['gas'] - trace[0]['gas']
-    print(f'Gas from call: {gas_from_call:,}')
-    all_gas_usage = sum(sl['gasCost'] for sl in trace)
-    print(f'Trace all_gas_usage {all_gas_usage:,}')
-    print(f'Trace sum gas usage {gas_from_call + all_gas_usage:,}')
-    print(f'Reported gas usage {receipt["gasUsed"]:,}')
-
     ctx = {
         'type': 'root',
         'from': txn['from'],
@@ -264,8 +265,15 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
         'gasStart': trace[0]['gas'],
         'actions': [],
     }
+    root_ctx = ctx
     ctx_stack = [ctx]
+    desync = False
     for i, sl in enumerate(trace):
+        if 'depth' in sl:
+            if sl['depth'] != len(ctx_stack) and not desync:
+                desync = True
+                l.critical(f'Context stack depth desync!!!!! i={i}')
+
         if sl['op'] == 'REVERT':
             mem_offset = int(sl['stack'][-1], base=16)
             mem_len = int(sl['stack'][-2], base=16)
@@ -279,7 +287,7 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
             })
         if sl['op'] == 'RETURN':
             ret_offset = int(sl['stack'][-1], base=16)
-            ret_len = int(sl['stack'][-1], base=16)
+            ret_len = int(sl['stack'][-2], base=16)
             b = read_mem(ret_offset, ret_len, sl['memory'])
             ctx['actions'].append({
                 'type': 'RETURN',
@@ -306,8 +314,13 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
                 'args': b,
                 'actions': []
             })
-            ctx_stack.append(ctx)
-            ctx = ctx['actions'][-1]
+            # ensure that next instruction increases depth, if not then the target contract is empty
+            if i + 1 < len(trace) and trace[i + 1]['depth'] == sl['depth'] + 1:
+                ctx_stack.append(ctx)
+                ctx = ctx['actions'][-1]
+            else:
+                ctx['actions'][-1]['gasEnd'] = sl['gas']
+                ctx['actions'][-1]['traceEnd'] = i
         if sl['op'] == 'DELEGATECALL':
             dest = '0x' + sl['stack'][-2].replace('0x', '').lstrip('0').rjust(40, '0')
             arg_offset = int(sl['stack'][-4], base=16)
@@ -322,8 +335,12 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
                 'args': b,
                 'actions': []
             })
-            ctx_stack.append(ctx)
-            ctx = ctx['actions'][-1]
+            if i + 1 < len(trace) and trace[i + 1]['depth'] == sl['depth'] + 1:
+                ctx_stack.append(ctx)
+                ctx = ctx['actions'][-1]
+            else:
+                ctx['actions'][-1]['gasEnd'] = sl['gas']
+                ctx['actions'][-1]['traceEnd'] = i
         if sl['op'] == 'CALL':
             dest = '0x' + sl['stack'][-2].replace('0x', '').lstrip('0').rjust(40, '0')
             arg_offset = int(sl['stack'][-4], base=16)
@@ -338,8 +355,12 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
                 'args': b,
                 'actions': []
             })
-            ctx_stack.append(ctx)
-            ctx = ctx['actions'][-1]
+            if i + 1 < len(trace) and trace[i + 1]['depth'] == sl['depth'] + 1:
+                ctx_stack.append(ctx)
+                ctx = ctx['actions'][-1]
+            else:
+                ctx['actions'][-1]['gasEnd'] = sl['gas']
+                ctx['actions'][-1]['traceEnd'] = i
         if sl['op'] == 'LOG3' and sl['stack'][-3].replace('0x', '').lstrip('0') == 'ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef':
             from_ = '0x' + sl['stack'][-4].replace('0x', '').lstrip('0').rjust(40, '0')
             to_ = '0x' + sl['stack'][-5].replace('0x', '').lstrip('0').rjust(40, '0')
@@ -352,7 +373,11 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
                 'to': web3.Web3.toChecksumAddress(to_[-40:]),
                 'value': val,
             })
-    return ctx
+
+    if ctx != root_ctx:
+        l.critical(f'Context didnt pop all the way!!!')
+
+    return root_ctx
 
 
 def get_abi(abiname) -> typing.Any:

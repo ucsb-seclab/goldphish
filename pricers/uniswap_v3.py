@@ -134,7 +134,6 @@ class UniswapV3Pricer(BaseExchangePricer):
                 liquidity = int.from_bytes(bliquidity[16:32], byteorder='big', signed=False)
 
             if use_cache == False:
-                l.debug(f'not using cache')
                 return liquidity
             self.liquidity_cache = liquidity
         return self.liquidity_cache
@@ -259,11 +258,12 @@ class UniswapV3Pricer(BaseExchangePricer):
                         liquidity += tick_obj.liquidity_net
                     if liquidity < 0:
                         # about to fail
-                        print(f'address {self.address}')
-                        print(f'block {block_identifier}')
-                        print(f'amount_specified {amount_specified}')
-                        print(f'zero_for_one {zero_for_one}')
-                        print(f'liquidity {liquidity}')
+                        l.critical('About to fail')
+                        l.critical(f'address {self.address}')
+                        l.critical(f'block {block_identifier}')
+                        l.critical(f'amount_specified {amount_specified}')
+                        l.critical(f'zero_for_one {zero_for_one}')
+                        l.critical(f'liquidity {liquidity}')
                     assert liquidity >= 0
                 tick = next_tick_num - 1 if zero_for_one else next_tick_num
             elif sqrt_price_x96 != sqrt_price_start_x96:
@@ -565,7 +565,7 @@ class UniswapV3Pricer(BaseExchangePricer):
                 resp = provider.make_request_batch(reqs)
             assert len(resp) == 2
 
-            bresp_0 = bytes.fromhex(resp[0]['result'][2:])
+            bresp_0 = bytes.fromhex(resp[0]['result'][2:]).rjust(32, b'\x00')
             liquidity_gross = int.from_bytes(bresp_0[16:32], byteorder='big', signed=False)
             liquidity_net = int.from_bytes(bresp_0[0:16], byteorder='big', signed=True)
 
