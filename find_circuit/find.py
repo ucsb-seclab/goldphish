@@ -342,7 +342,7 @@ def detect_arbitrages_bisection(
                                     l.warning('fl_lower_bound crossed fl_upper_bound')
                                     amount_in = math.ceil(fl_lower_bound)
 
-                        expected_profit = pc.sample(amount_in, block_identifier, timestamp=timestamp) - amount_in
+                        expected_profit = pc.sample(amount_in, block_identifier, timestamp=timestamp, fee_transfer_calculator=fee_transfer_calculator) - amount_in
 
                         # quickly reduce input amount (optimizes for rounding)
                         input_reduction = 0
@@ -478,7 +478,6 @@ def find_upper_bound(
         assert last_token == t_in
 
         try:
-            l.debug(f'feeding {curr_amt} into exchange {p.address}')
             amt_out, _ = p.token_out_for_exact_in(
                 t_in,
                 t_out,

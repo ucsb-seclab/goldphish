@@ -6,6 +6,8 @@ and checking against our model for the same or different profit before fees.
 """
 
 import argparse
+import datetime
+import itertools
 import os
 import subprocess
 import sys
@@ -42,6 +44,74 @@ def main():
     db = connect_db()
     curr = db.cursor()
 
+
+    # curr.execute(
+    #     '''
+    #     SELECT id, start_block, end_block_exclusive
+    #     FROM backrun_detection_reservations
+    #     WHERE started_on IS NULL AND finished_on IS NULL
+    #     '''
+    # )
+    # for id_, start_block, end_block in list(curr):
+    #     curr.execute(
+    #         '''
+    #         DELETE FROM sample_arbitrage_backrun_detections bd
+    #         WHERE EXISTS(
+    #             SELECT 1
+    #             FROM sample_arbitrages sa
+    #             WHERE sa.id = bd.sample_arbitrage_id AND %s <= sa.block_number AND sa.block_number < %s
+    #         )
+    #         ''',
+    #         (start_block, end_block),
+    #     )
+    #     l.info(f'Deleted {curr.rowcount:,} from {start_block:,} to {end_block:,}')
+
+    # input('continue?')
+
+    # return
+
+    # # quick fixup
+    # l.debug(f'fixing up')
+
+    # d = datetime.datetime(year=2022, month=8, day=8, hour=22, minute=55)
+
+    # curr.execute(
+    #     '''
+    #     SELECT id, start_block, end_block_exclusive
+    #     FROM backrun_detection_reservations
+    #     WHERE (finished_on > %s)
+    #     ''',
+    #     (d,)
+    # )
+    # l.info(f'Have {curr.rowcount} reservations to fix-up')
+    # for id_, start_block, end_block in list(curr):
+    #     curr.execute(
+    #         '''
+    #         DELETE FROM sample_arbitrage_backrun_detections bd
+    #         WHERE EXISTS(
+    #             SELECT 1
+    #             FROM sample_arbitrages sa
+    #             WHERE sa.id = bd.sample_arbitrage_id AND %s <= sa.block_number AND sa.block_number < %s
+    #         )
+    #         ''',
+    #         (start_block, end_block),
+    #     )
+    #     l.info(f'Deleted {curr.rowcount:,} from {start_block:,} to {end_block:,}')
+
+    #     curr.execute(
+    #         '''
+    #         UPDATE backrun_detection_reservations SET started_on = NULL, finished_on = NULL WHERE id = %s
+    #         ''',
+    #         (id_,)
+    #     )
+    #     assert curr.rowcount == 1
+
+    # input('Continue?')
+
+    # db.commit()
+
+    # return
+
     web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
     w3 = web3.Web3(web3.WebsocketProvider(
         web3_host,
@@ -57,8 +127,8 @@ def main():
 
     l.debug(f'Connected to web3, chainId={w3.eth.chain_id}')
 
-    ganache_proc, ganache_w3 = open_ganache()
-    exit(1)
+    # ganache_proc, ganache_w3 = open_ganache()
+    # exit(1)
 
     ganache_proc = None
     try:
@@ -119,14 +189,7 @@ def fill_queue(curr: psycopg2.extensions.cursor):
     # see if we need to fill queue    
     curr.execute('SELECT count(*) FROM backrun_detection_reservations')
 
-
     (n_rows,) = curr.fetchone()
-    if n_rows > 0:
-        l.error('Queue already created.')
-        exit(1)
-
-
-    l.debug(f'filling queue...')
 
     # find lowest / highest blocks where we have sample arbitrage transactions
     curr.execute(
@@ -138,6 +201,64 @@ def fill_queue(curr: psycopg2.extensions.cursor):
     min_block, max_block = curr.fetchone()
     assert min_block < max_block
     assert (max_block - min_block) > 1000
+
+    if n_rows > 0:
+        l.error('Queue already created.')
+
+        # check for expanding back and forward
+        curr.execute('SELECT MIN(start_block), MAX(end_block_exclusive) FROM backrun_detection_reservations')
+        reservations_start_at, reservations_end_at_exclusive = curr.fetchone()
+
+        batch_size = 1000
+
+        n_inserted = 0
+        if reservations_start_at > min_block:
+            l.info('expanding back in history')
+            # fill from start to end
+            for i in itertools.count():
+                this_start_block = i * batch_size + min_block
+                this_end_block = min(reservations_start_at, (i + 1) * batch_size + min_block)
+                if this_start_block > reservations_start_at:
+                    break
+                curr.execute(
+                    '''
+                    INSERT INTO backrun_detection_reservations (start_block, end_block_exclusive)
+                    VALUES (%s, %s)
+                    ''',
+                    (this_start_block, this_end_block)
+                )
+                assert curr.rowcount == 1
+                n_inserted += 1
+
+        if reservations_end_at_exclusive < max_block:
+            l.info('expanding forward in history')
+            # fill from start to end
+            for i in itertools.count():
+                this_start_block = i * batch_size + reservations_end_at_exclusive
+                this_end_block = min(max_block + 1, (i + 1) * batch_size + reservations_end_at_exclusive)
+                if this_start_block > max_block + 1:
+                    break
+                curr.execute(
+                    '''
+                    INSERT INTO backrun_detection_reservations (start_block, end_block_exclusive)
+                    VALUES (%s, %s)
+                    ''',
+                    (this_start_block, this_end_block)
+                )
+                assert curr.rowcount == 1
+                n_inserted += 1
+
+        l.info(f'Inserted {n_inserted} reservations')
+        if n_inserted > 0:
+            input('ENTER to commit')
+            curr.connection.commit()
+            input('ENTER to continue')
+            raise Exception('stop')
+
+        exit(1)
+
+
+    l.debug(f'filling queue...')
 
     # break into 10,000 reservations
     lower_bounds, step = np.linspace(min_block, max_block, 10_000, dtype=int, retstep=True)
@@ -204,7 +325,6 @@ def open_ganache() -> typing.Tuple[subprocess.Popen, web3.Web3]:
             '--fork.url', web3_host,
             '--server.port', str(ganache_port),
             '--chain.chainId', '1',
-            '--chain.hardfork', 'arrowGlacier',
         ],
         stdout=subprocess.DEVNULL,
         cwd=cwd_loc,
@@ -212,7 +332,15 @@ def open_ganache() -> typing.Tuple[subprocess.Popen, web3.Web3]:
 
     l.debug(f'spawned ganache on PID={p.pid} port={ganache_port}')
 
-    w3 = web3.Web3(web3.WebsocketProvider(f'ws://localhost:{ganache_port}'))
+    w3 = web3.Web3(
+        web3.WebsocketProvider(
+            f'ws://localhost:{ganache_port}',
+            websocket_timeout=60 * 5,
+            websocket_kwargs={
+                'max_size': 1024 * 1024 * 1024, # 1 Gb max payload
+            },
+        )
+    )
 
     while not w3.isConnected():
         time.sleep(0.1)
@@ -242,7 +370,7 @@ def do_reorder(w3_mainnet: web3.Web3, w3_ganache: web3.Web3, curr: psycopg2.exte
 
     l.info(f'finished with reservation id={reservation_id:,}')
     curr.execute(
-        'UPDATE backrun_detection_reservations SET started_on = now()::timestamp WHERE id = %s',
+        'UPDATE backrun_detection_reservations SET finished_on = now()::timestamp WHERE id = %s',
         (reservation_id,)
     )
     curr.connection.commit()
@@ -302,14 +430,14 @@ def test_a_reorder(
 
     for log in resp['result']['logs']:
         topics = tuple(bytes.fromhex(topic) for topic in log['indexes'])
-        if topics[0] != ERC20_TRANSFER_TOPIC:
+        if len(topics) == 0 or topics[0] != ERC20_TRANSFER_TOPIC:
             continue
         address = w3_mainnet.toChecksumAddress(log['address'])
         payload = log['payload']
         logs_reshoot.append((address, topics, payload))
 
     for log in original_receipt['logs']:
-        if log['topics'][0] != ERC20_TRANSFER_TOPIC:
+        if len(log['topics']) == 0 or log['topics'][0] != ERC20_TRANSFER_TOPIC:
             continue
         logs_original.append((
             log['address'],

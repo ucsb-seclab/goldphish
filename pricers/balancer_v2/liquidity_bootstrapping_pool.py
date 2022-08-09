@@ -236,12 +236,15 @@ class BalancerV2LiquidityBootstrappingPoolPricer(BaseExchangePricer):
             raise NotEnoughLiquidityException(None, None, token_amount_in - max_in)
 
         denominator = balance_in + token_amount_in
-        base = div_up(balance_in, denominator)
-        exponent = div_down(weight_in, weight_out)
-        power_ = pow_up_legacy(base, exponent)
+        if denominator > 0:
+            base = div_up(balance_in, denominator)
+            exponent = div_down(weight_in, weight_out)
+            power_ = pow_up_legacy(base, exponent)
 
-        ret = mul_down(balance_out, complement(power_))
-        ret = downscale_down(self.w3, token_out, ret)
+            ret = mul_down(balance_out, complement(power_))
+            ret = downscale_down(self.w3, token_out, ret)
+        else:
+            ret = 0
 
         spot_out = spot(
             balance_in_not_scaled + token_amount_in_not_scaled,

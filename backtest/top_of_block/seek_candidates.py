@@ -28,9 +28,11 @@ import utils.profiling
 
 l = logging.getLogger(__name__)
 
-LOG_BATCH_SIZE = 200
+LOG_BATCH_SIZE = 100
 
 DEBUG = False
+
+TMP_REMOVE_ME_FOR_FIXUP_ONLY = True
 
 def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.Callable[[web3.Web3, argparse.Namespace], None]]:
     parser_name = 'seek-candidates'
@@ -109,6 +111,7 @@ def seek_candidates(w3: web3.Web3, args: argparse.Namespace):
                 return load_pool(w3, curr, tmpdir)
 
             pricer = get_pricer_with_retry()
+            pricer.warm(reservation_start)
 
             curr_block = reservation_start
             while curr_block <= reservation_end:
@@ -172,11 +175,12 @@ def seek_candidates(w3: web3.Web3, args: argparse.Namespace):
                         l.info('Splitting off unifinished reservation into new one')
                         curr.execute(
                             '''
-                            INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end)
-                            VALUES (%s, %s)
+                            INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end, priority)
+                            SELECT %s, %s, priority
+                            FROM candidate_arbitrage_reservations WHERE id = %s
                             RETURNING id
                             ''',
-                            (end_inclusive + 1, reservation_end)
+                            (end_inclusive + 1, reservation_end, reservation_id,)
                         )
                         assert curr.rowcount == 1
                         (new_id,) = curr.fetchone()
@@ -187,16 +191,6 @@ def seek_candidates(w3: web3.Web3, args: argparse.Namespace):
 def setup_db(curr: psycopg2.extensions.cursor):
     curr.execute(
         """
-        CREATE TABLE IF NOT EXISTS block_modified_exchanges (
-            block_number    INTEGER NOT NULL,
-            uniswap_v2_id   INTEGER REFERENCES uniswap_v2_exchanges (id) ON DELETE CASCADE,
-            sushiswap_v2_id INTEGER REFERENCES sushiv2_swap_exchanges (id) ON DELETE CASCADE,
-            shibaswap_id    INTEGER REFERENCES shibaswap_exchanges (id) ON DELETE CASCADE,
-            uniswap_v3_id   INTEGER REFERENCES uniswap_v3_exchanges (id) ON DELETE CASCADE,
-            balancer_id     INTEGER REFERENCES balancer_exchanges (id) ON DELETE CASCADE,
-            balancer_v2_id  INTEGER REFERENCES balancer_v2_exchanges (id) ON DELETE CASCADE
-        );
-
         CREATE TABLE IF NOT EXISTS candidate_arbitrages (
             id              SERIAL PRIMARY KEY NOT NULL,
             block_number    INTEGER NOT NULL,
@@ -220,7 +214,8 @@ def setup_db(curr: psycopg2.extensions.cursor):
             worker             TEXT,
             updated_on         TIMESTAMP WITHOUT TIME ZONE,
             claimed_on         TIMESTAMP WITHOUT TIME ZONE,
-            completed_on       TIMESTAMP WITHOUT TIME ZONE 
+            completed_on       TIMESTAMP WITHOUT TIME ZONE,
+            priority           INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS candidate_arbitrage_blocks_to_verify (
@@ -246,28 +241,39 @@ def fill_queue(w3: web3.Web3, curr: psycopg2.extensions.cursor):
         l.debug('not filling queue')
         return
 
-    start_block = scan_start(curr)
-    end_block = 15_111_000 # w3.eth.get_block('latest')['number']
-
-    l.info(f'filling queue from {start_block:,} to {end_block:,}')
-
-    n_segments = 2_000
-    segment_width = (end_block - start_block) // n_segments
-    for i in itertools.count():
-        segment_start = start_block + i * segment_width
-        segment_end = min(end_block, segment_start + segment_width - 1)
-
-        if segment_start > end_block:
-            break
+    # fill queue from sample priorities, splitting 1 into 3
+    curr.execute('SELECT start_block, end_block, priority from block_samples order by start_block asc')
+    for start_block, end_block, priority in list(curr):
+        divide_1 = start_block + (end_block - start_block) // 3
+        divide_2 = start_block + (end_block - start_block) * 2 // 3
 
         curr.execute(
             '''
-            INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end)
-            VALUES (%s, %s)
+            INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end, priority)
+            VALUES (%s, %s, %s)
             ''',
-            (segment_start, segment_end),
+            (start_block, divide_1, priority),
         )
-        assert curr.rowcount == 1
+        curr.execute(
+            '''
+            INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end, priority)
+            VALUES (%s, %s, %s)
+            ''',
+            (divide_1 + 1, divide_2, priority),
+        )
+        curr.execute(
+            '''
+            INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end, priority)
+            VALUES (%s, %s, %s)
+            ''',
+            (divide_2 + 1, end_block, priority),
+        )
+
+
+    curr.execute('SELECT COUNT(*) FROM candidate_arbitrage_reservations')
+    (n_inserted,) = curr.fetchone()
+
+    l.info(f'Added {n_inserted} reservations')
 
 
 def scan_start(curr: psycopg2.extensions.cursor) -> int:
@@ -292,6 +298,51 @@ def fixup_reservations(curr: psycopg2.extensions.cursor):
         print('Quitting, bye.')
         curr.connection.rollback() # unnecessary but do it anyway
         return
+
+    if time.time() < 1659889982.4060774 + 80 * 60:
+        l.warning('Breaking down reservations!!')
+
+        min_res_size = LOG_BATCH_SIZE // 2
+
+        curr.execute(
+            '''
+            SELECT id, block_number_start, block_number_end, priority
+            FROM candidate_arbitrage_reservations
+            WHERE completed_on IS NULL and claimed_on IS NULL and (block_number_end - block_number_start + 1) > %s AND priority < 100
+            ''',
+            (min_res_size * 2,),
+        )
+
+        n_closed = curr.rowcount
+        l.debug(f'halving {n_closed:,} reservations')
+        input('continue?')
+        for id_, block_number_start, block_number_end, priority in list(curr):
+            midpoint = (block_number_end + block_number_start) // 2
+            assert block_number_start < midpoint < block_number_end
+            # break in half
+            curr.execute(
+                '''
+                INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end, priority)
+                VALUES (%s, %s, %s)
+                ''',
+                (block_number_start, midpoint, priority),
+            )
+            curr.execute(
+                '''
+                INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end, priority)
+                VALUES (%s, %s, %s)
+                ''',
+                (midpoint + 1, block_number_end, priority),
+            )
+            curr.execute(
+                '''
+                DELETE FROM candidate_arbitrage_reservations WHERE id = %s
+                ''',
+                (id_,)
+            )
+
+        return
+
 
     # count in-progress arbitrages
     curr.execute(
@@ -324,8 +375,8 @@ def fixup_reservations(curr: psycopg2.extensions.cursor):
     # split off anything that's partially in-progress
     curr.execute(
         '''
-        INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end)
-        SELECT progress + 1, block_number_end
+        INSERT INTO candidate_arbitrage_reservations (block_number_start, block_number_end, priority)
+        SELECT progress + 1, block_number_end, priority
         FROM candidate_arbitrage_reservations car
         WHERE car.claimed_on IS NOT NULL AND
               car.completed_on IS NULL AND
@@ -380,7 +431,7 @@ def get_reservation(curr: psycopg2.extensions.cursor, worker_name: str) -> typin
         SELECT id, block_number_start, block_number_end
         FROM candidate_arbitrage_reservations
         WHERE claimed_on IS NULL AND completed_on IS NULL
-        ORDER BY block_number_start ASC
+        ORDER BY priority ASC
         LIMIT 1
         FOR UPDATE SKIP LOCKED
         '''
@@ -500,7 +551,25 @@ def process_candidates(
 
 
         # this is potentially profitable, log as a candidate
-        dxns = [bytes.fromhex(t[2:]) for t, _ in p.directions]
+
+        # ONLY IF IT DOESNT EXIST ALREADY
+        if TMP_REMOVE_ME_FOR_FIXUP_ONLY:
+            dxns = [bytes.fromhex(t[2:]) for t, _ in p.directions]
+            curr.execute(
+                '''
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM candidate_arbitrages
+                    WHERE block_number = %s AND exchanges = %s AND directions = %s
+                );
+                ''',
+                (block_number, [bytes.fromhex(x.address[2:]) for x in p.circuit], dxns,)
+            )
+            (exists_already,) = curr.fetchone()
+            if exists_already:
+                l.warning(f'already exists, ignoring...')
+                continue
+
         with utils.profiling.profile('db.insert'):
             curr.execute(
                 """

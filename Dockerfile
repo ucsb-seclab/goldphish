@@ -13,16 +13,10 @@ RUN pip install web3 numpy scipy tabulate pytest networkx cachetools psycopg2-bi
 
 WORKDIR /opt/
 
-RUN git clone --branch robmcl4/fullyPatched --depth 1 https://github.com/robmcl4/ganache.git ganache-fork
+RUN git clone --branch robmcl4/myFork --depth 1 https://github.com/robmcl4/ganache.git ganache-fork
 RUN cd /opt/ganache-fork && npm install && INFURA_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa npm run build
 
 WORKDIR /opt/goldphish
-
-# install ganache dependencies
-COPY vend/ganache/package.json ./vend/ganache/package.json
-RUN cd ./vend/ganache && npm install
-
-COPY vend/ ./vend
 
 # build the shooter contract
 COPY package.json .

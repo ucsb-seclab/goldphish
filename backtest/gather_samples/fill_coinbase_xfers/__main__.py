@@ -17,8 +17,14 @@ l = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
+    parser.add_argument('--n-workers', type=int)
+    parser.add_argument('--id', type=int)
 
     args = parser.parse_args()
+
+    assert args.n_workers > args.id
+    assert args.id >= 0
+
     if args.worker_name is None:
         args.worker_name = socket.gethostname()
     job_name = 'fill_coinbase_xfers'
@@ -57,10 +63,16 @@ def main():
     db.autocommit = False
     l.debug(f'connected to postgresql (mainnet)')
 
-    fill_txn_coinbase_transfers(w3, db, db_mainnet)
+    fill_txn_coinbase_transfers(w3, db, db_mainnet, args.id, args.n_workers)
 
 
-def fill_txn_coinbase_transfers(w3: web3.Web3, db_mine: psycopg2.extensions.connection, db_mainnet: psycopg2.extensions.connection):
+def fill_txn_coinbase_transfers(
+        w3: web3.Web3,
+        db_mine: psycopg2.extensions.connection,
+        db_mainnet: psycopg2.extensions.connection,
+        id_: int,
+        n_workers: int,
+    ):
     curr_mine = db_mine.cursor()
     curr_mainnet = db_mainnet.cursor()
 
@@ -68,8 +80,9 @@ def fill_txn_coinbase_transfers(w3: web3.Web3, db_mine: psycopg2.extensions.conn
         '''
         SELECT distinct block_number
         FROM sample_arbitrages sa
-        WHERE coinbase_xfer IS NULL
-        '''
+        WHERE coinbase_xfer IS NULL AND mod(block_number, %s) = %s
+        ''',
+        (n_workers, id_),
     )
     n_blocks_to_process = curr_mine.rowcount
     l.info(f'Have {n_blocks_to_process:,} blocks to process')

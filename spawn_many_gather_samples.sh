@@ -2,7 +2,7 @@
 
 # utility for spawning a whole bunch of sample gatherers
 
-N_WORKERS=$(($2 - $1 + 1))
+N_WORKERS=$1
 
 echo "[*] spawning $N_WORKERS gatherers";
 
@@ -13,4 +13,4 @@ then
     PREFIX="$PREFIX-";
 fi;
 
-seq $1 $2 | parallel -j $N_WORKERS --ungroup taskset -c '{}' python3 -m backtest.gather_samples --worker-name "${PREFIX}gather-samples{}"
+seq 0 "$(($N_WORKERS - 1))" | parallel --halt now,fail=1 --nice -10 -j $N_WORKERS --ungroup python3 -m backtest.gather_samples --worker-name "${PREFIX}gather-samples{}"

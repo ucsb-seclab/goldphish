@@ -12,18 +12,14 @@ import web3._utils.filters
 import logging
 import logging.handlers
 from backtest.top_of_block.cleanup import do_cleanup
-from backtest.top_of_block.find_arb_termination import do_find_arb_termination
-
-from backtest.top_of_block.one_off_trace import print_trace
-from backtest.top_of_block.diagnose_failures import do_diagnose
-from backtest.top_of_block.seek_candidates import seek_candidates
-from backtest.top_of_block.verify import do_verify
 
 import backtest.top_of_block.measure_tvl
 import backtest.top_of_block.seek_candidates
 import backtest.top_of_block.replicate_samples
 import backtest.top_of_block.maximal_block_value
-import backtest.top_of_block.shoot
+import backtest.top_of_block.relay
+import backtest.top_of_block.fill_arb_duration
+import backtest.top_of_block.generate_sample
 
 from utils import connect_web3, setup_logging
 
@@ -49,7 +45,13 @@ def main():
     cmd, handler = backtest.top_of_block.maximal_block_value.add_args(subparser)
     handlers[cmd] = handler
 
-    cmd, handler = backtest.top_of_block.shoot.add_args(subparser)
+    cmd, handler = backtest.top_of_block.fill_arb_duration.add_args(subparser)
+    handlers[cmd] = handler
+
+    cmd, handler = backtest.top_of_block.generate_sample.add_args(subparser)
+    handlers[cmd] = handler
+
+    cmd, handler = backtest.top_of_block.relay.add_args(subparser)
     handlers[cmd] = handler
 
     args = parser.parse_args()

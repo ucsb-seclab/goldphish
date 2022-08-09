@@ -29,6 +29,7 @@ TETHER_ADDRESS = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
 USDC_ADDRESS = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
 UNI_ADDRESS = '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984'
 WBTC_ADDRESS = '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599'
+DAI_ADDRESS = '0x6b175474e89094c44da98b954eedeac495271d0f'
 BALANCER_VAULT_ADDRESS = '0xBA12222222228d8Ba445958a75a0704d566BF2C8'
 
 
@@ -211,15 +212,24 @@ def pretty_print_trace(parsed, txn: web3.types.TxData, receipt: web3.types.TxRec
     while len(stack) > 0:
         depth, item = stack.pop()
         padding = '    ' * depth
-        if item['type'] == 'REVERT':
+        if item['type'] == 'OUT-OF-GAS':
+            print(padding + 'OUT OF GAS')
+        elif item['type'] == 'REVERT':
             print(padding + 'REVERT ' + web3.Web3.toText(item['message']))
         elif item['type'] == 'RETURN':
             print(padding + 'RETURN')
             for i in range(0, len(item['data']), 32):
                 print(padding + '  ' + item['data'][i:i+32].hex())
         elif 'CALL' in item['type']:
-            gas_usage =  item['gasStart'] - item['gasEnd']
-            print(padding + item['type'] + ' ' + item['callee'] + f' gas consumed = {gas_usage} [{item["traceStart"]}, {item["traceEnd"]}]')
+            if 'gasStart' in item and 'gasEnd in item':
+                gas_usage =  item['gasStart'] - item['gasEnd']
+            else:
+                gas_usage = '????'
+            if 'traceStart' in item and 'traceEnd' in item:
+                sz_trace_range = f'[{item["traceStart"]}, {item["traceEnd"]}]'
+            else:
+                sz_trace_range = ''
+            print(padding + item['type'] + ' ' + item['callee'] + f' gas consumed = {gas_usage} {sz_trace_range}')
             method_sel = item['args'][:4].hex()
             if method_sel == '128acb08':
                 print(padding + 'UniswapV3Pool.swap()')
@@ -242,6 +252,9 @@ def pretty_print_trace(parsed, txn: web3.types.TxData, receipt: web3.types.TxRec
                 print(padding + method_sel)
                 for i in range(4, len(item['args']), 32):
                     print(padding + item['args'][i:i+32].hex())
+            if method_sel == '52bbbe29':
+                (_, dec) = balv2.decode_function_input(item['args'])
+                print(dec)
             for sub_action in reversed(item['actions']):
                 stack.append((depth + 1, sub_action))
         elif item['type'] == 'REVERT':
@@ -272,7 +285,20 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
         if 'depth' in sl:
             if sl['depth'] != len(ctx_stack) and not desync:
                 desync = True
-                l.critical(f'Context stack depth desync!!!!! i={i}')
+                l.critical(f'Context stack depth desync!!!!! i={i} (probably out of gas)')
+                assert sl['depth'] == len(ctx_stack) - 1
+                ctx['actions'].append({
+                    'type': 'OUT-OF-GAS',
+                })
+
+                if i + 1 < len(trace):
+                    ctx['gasEnd'] = trace[i+1]['gas']
+                else:
+                    ctx['gasEnd'] = sl['gas'] - sl['gasCost']
+                ctx['traceEnd'] = i
+                ctx = ctx_stack.pop()
+                continue
+
 
         if sl['op'] == 'REVERT':
             mem_offset = int(sl['stack'][-1], base=16)
@@ -378,6 +404,46 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
         l.critical(f'Context didnt pop all the way!!!')
 
     return root_ctx
+
+
+def parse_ganache_call_trace(trace):
+    if trace['type'] == 'root':
+        return {
+            'type': 'root',
+            'from': web3.Web3.toChecksumAddress('0x' + trace['from'].rjust(40, '0')),
+            'callee': web3.Web3.toChecksumAddress('0x' + trace['callee'].rjust(40, '0')),
+            'traceStart': 0,
+            'gasStart': 0,
+            'actions': [parse_ganache_call_trace(x) for x in trace['actions']],
+        }
+    elif 'CALL' in trace['type']:
+        return {
+            'type': 'CALL',
+            'callee': web3.Web3.toChecksumAddress('0x' + trace['callee'].rjust(40, '0')),
+            'from': web3.Web3.toChecksumAddress('0x' + trace['from'].rjust(40, '0')),
+            'args': bytes.fromhex(trace['args']),
+            'actions': [parse_ganache_call_trace(x) for x in trace['actions']],
+        }
+    elif trace['type'] == 'OUT-OF-GAS':
+        return trace
+    elif trace['type'] == 'RETURN':
+        return {
+            'type': 'RETURN',
+            'data': bytes.fromhex(trace['data'])
+        }
+    elif trace['type'] == 'REVERT':
+        return {
+            'type': 'REVERT',
+            'message': bytes.fromhex(trace['message'])
+        }
+    elif trace['type'] == 'TRANSFER':
+        return {
+            'type': 'TRANSFER',
+            'from': web3.Web3.toChecksumAddress('0x' + trace['from'].rjust(40, '0')),
+            'to': web3.Web3.toChecksumAddress('0x' + trace['to'].rjust(40, '0')),
+            'value': int(trace['value'], 16)
+        }
+    raise Exception(f'cannot handle {trace}')
 
 
 def get_abi(abiname) -> typing.Any:
@@ -554,6 +620,16 @@ uv3: web3.contract.Contract = web3.Web3().eth.contract(
 uv2: web3.contract.Contract = web3.Web3().eth.contract(
     address=b'\x00' * 20,
     abi=get_abi('uniswap_v2/IUniswapV2Pair.json')['abi'],
+)
+
+balv1: web3.contract.Contract = web3.Web3().eth.contract(
+    address=b'\x00' * 20,
+    abi=get_abi('balancer_v1/bpool.abi.json'),
+)
+
+balv2: web3.contract.Contract = web3.Web3().eth.contract(
+    address=b'\x00' * 20,
+    abi=get_abi('balancer_v2/Vault.json'),
 )
 
 erc20: web3.contract.Contract = web3.Web3().eth.contract(

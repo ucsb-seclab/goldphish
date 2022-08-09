@@ -11,7 +11,6 @@ import logging
 from eth_utils import event_abi_to_log_topic
 from pricers.block_observation_result import BlockObservationResult
 
-from pricers.uniswap_v3 import UniswapV3Pricer
 from utils.profiling import profile
 
 from .base import BaseExchangePricer

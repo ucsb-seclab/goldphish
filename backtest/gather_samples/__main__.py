@@ -28,11 +28,6 @@ def main():
         args.worker_name = socket.gethostname()
     job_name = 'gather_samples'
 
-    print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-    print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-    print('please add an order id to cycle exchanges')
-    exit(1)
-
     setup_logging(job_name, worker_name = args.worker_name)
 
     try:
@@ -42,9 +37,10 @@ def main():
         curr = db.cursor()
 
         setup_db(curr)
-        start_block = 12_369_621
-        end_block = 14_324_572
-        setup_reservations(curr, start_block, end_block + 1)
+        curr.execute('SELECT MIN(start_block), MAX(end_block) FROM block_samples')
+
+        start_block, end_block = curr.fetchone()
+        setup_reservations(curr, start_block, end_block)
 
         web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
 
@@ -162,14 +158,65 @@ class ReservationContextManager:
                 l.debug(f'split remaining work of reservation id={self.id} into id={new_reservation_id}')
             self.curr.connection.commit()
 
-BATCH_SIZE_BLOCKS = 5_000
+BATCH_SIZE_BLOCKS = 1_000
 def setup_reservations(curr: psycopg2.extensions.cursor, start_block: int, end_block_inclusive: int):
     curr.execute('LOCK TABLE gather_sample_arbitrages_reservations')
+
     curr.execute('SELECT COUNT(*) FROM gather_sample_arbitrages_reservations')
     (res_cnt,) = curr.fetchone()
     if res_cnt > 0:
-        # no need, already have reservations
-        curr.connection.commit()
+        # already have some reservations
+
+        # test for expanding back or forward in history
+
+        curr.execute('SELECT MIN(from_block), MAX(to_block_exclusive) FROM gather_sample_arbitrages_reservations')
+        reservations_start_at, reservations_end_at_exclusive = curr.fetchone()
+
+        n_inserted = 0
+        if reservations_start_at > start_block:
+            l.info('expanding back in history')
+            # fill from start to end
+            for i in itertools.count():
+                this_start_block = i * BATCH_SIZE_BLOCKS + start_block
+                this_end_block = min(reservations_start_at, (i + 1) * BATCH_SIZE_BLOCKS + start_block)
+                if this_start_block > reservations_start_at:
+                    break
+                curr.execute(
+                    '''
+                    INSERT INTO gather_sample_arbitrages_reservations (from_block, to_block_exclusive)
+                    VALUES (%s, %s)
+                    RETURNING id
+                    ''',
+                    (this_start_block, this_end_block)
+                )
+                assert curr.rowcount == 1
+                n_inserted += 1
+
+        if reservations_end_at_exclusive < end_block_inclusive + 1:
+            l.info('expanding forward in history')
+            # fill from start to end
+            for i in itertools.count():
+                this_start_block = i * BATCH_SIZE_BLOCKS + reservations_end_at_exclusive
+                this_end_block = min(end_block_inclusive + 1, (i + 1) * BATCH_SIZE_BLOCKS + reservations_end_at_exclusive)
+                if this_start_block > end_block_inclusive + 1:
+                    break
+                curr.execute(
+                    '''
+                    INSERT INTO gather_sample_arbitrages_reservations (from_block, to_block_exclusive)
+                    VALUES (%s, %s)
+                    RETURNING id
+                    ''',
+                    (this_start_block, this_end_block)
+                )
+                assert curr.rowcount == 1
+                n_inserted += 1
+
+        l.info(f'Inserted {n_inserted} reservations')
+        if n_inserted > 0:
+            input('ENTER to commit')
+            curr.connection.commit()
+            input('ENTER to continue')
+            raise Exception('stop')
     else:
         l.debug(f'inserting reservations')
         for i in itertools.count():

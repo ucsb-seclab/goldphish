@@ -246,7 +246,7 @@ class PricerPool:
                 if b.get_swap_enabled(block_identifier):
                     tokens = b.get_tokens(block_identifier)
                     self._set_tokens(addr, tokens)
-                self._balancer_v2_updating_pools(b)
+                    self._balancer_v2_updating_pools.append(b)
 
 
     def _set_tokens(self, address: str, tokens: typing.List[str]):
@@ -325,8 +325,8 @@ class PricerPool:
 
         # look for balancer v2 pricers that are currently updating prices based
         # on timestamp, regardless of logs
-        ts = get_block_timestamp(self._w3, block_number)
         n_updating = 0
+        ts = get_block_timestamp(self._w3, block_number)
         for p in self._balancer_v2_updating_pools:
             if p.is_in_adjustment_range(ts + 13, block_number):
                 n_updating += 1
@@ -372,8 +372,10 @@ class PricerPool:
                 update_results.append((p, result))
 
         for p, result in update_results:
-            if result.swap_enabled == True and isinstance(p, BalancerPricer):
+            if result.swap_enabled == True and isinstance(p, (BalancerPricer, BalancerV2WeightedPoolPricer, BalancerV2LiquidityBootstrappingPoolPricer)):
                 # _just_ enabled swap
+                if isinstance(p, BalancerV2LiquidityBootstrappingPoolPricer):
+                    self._balancer_v2_updating_pools.append(p)
                 block_number = logs[0]['blockNumber']
                 self._set_tokens(p.address, p.get_tokens(block_number))
             elif result.swap_enabled == False:

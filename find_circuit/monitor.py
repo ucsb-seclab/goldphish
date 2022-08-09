@@ -7,8 +7,12 @@ import time
 import typing
 
 import web3
+import backtest.top_of_block.seek_candidates
 import pricers
 import logging
+from pricers.balancer import BalancerPricer
+from pricers.balancer_v2.liquidity_bootstrapping_pool import BalancerV2LiquidityBootstrappingPoolPricer
+from pricers.balancer_v2.weighted_pool import BalancerV2WeightedPoolPricer
 
 from pricers.base import BaseExchangePricer
 import utils
@@ -48,6 +52,12 @@ def profitable_circuits(
         t_start = time.time()
         try:
             item = next(it_pcs)
+
+            if backtest.top_of_block.seek_candidates.TMP_REMOVE_ME_FOR_FIXUP_ONLY:
+                # if there's no Balancer (v1 or v2) in the circuit, don't bother
+                has_balancer = any(isinstance(x, (BalancerPricer, BalancerV2WeightedPoolPricer, BalancerV2LiquidityBootstrappingPoolPricer)) for x in item._circuit)
+                if not has_balancer:
+                    continue
 
             # generate a unique key for this circuit to ensure we don't have to explore it more than once
             # since the detector works both forward, backward, and in all rotations.
