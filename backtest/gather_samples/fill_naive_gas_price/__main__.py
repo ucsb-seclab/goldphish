@@ -304,7 +304,7 @@ def estimate_gas(curr: psycopg2.extensions.cursor, id_: int, n_workers: int):
             niche_sz += 'shiba|'
         if has_balancer_v1:
             niche_sz += 'balv1|'
-        if has_balancer_v1:
+        if has_balancer_v2:
             niche_sz += 'balv2|'
 
         niches_updated.add(niche_sz)

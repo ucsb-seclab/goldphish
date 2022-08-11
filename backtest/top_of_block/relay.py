@@ -42,8 +42,8 @@ from utils import BALANCER_VAULT_ADDRESS, DAI_ADDRESS, TETHER_ADDRESS, USDC_ADDR
 l = logging.getLogger(__name__)
 
 DEBUG = False
-DEBUG_RESERVATION = 497883
-DEBUG_CANDIDATE = 648381392
+DEBUG_RESERVATION = 128839
+DEBUG_CANDIDATE = 1303660660
 
 
 SHOOTER_ARTIFACT_PATH = pathlib.Path(__file__).parent.parent.parent / 'artifacts' / 'contracts' / 'shooter.sol' / 'Shooter.json'
@@ -131,7 +131,7 @@ def relay(w3: web3.Web3, args: argparse.Namespace):
 
     @backoff.on_exception(
         backoff.expo,
-        psycopg2.OperationalError,
+        (psycopg2.OperationalError, OSError),
         max_time = 10 * 60,
         factor = 4,
         on_backoff = reconnect_db,
@@ -178,7 +178,8 @@ def process_reservation(
         tmpdir: str,
         worker_id: int,
     ):
-    fee_calculator.sync(curr, block_number)
+    if not DEBUG:
+        fee_calculator.sync(curr, block_number)
 
     timestamp_to_use = w3.eth.get_block(block_number + 1)['timestamp']
 
@@ -213,191 +214,196 @@ def process_reservation(
 
     proc, w3_ganache, acct, shooter_address = open_ganache(block_number, tmpdir, worker_id)
 
-    for i, candidate in enumerate(candidates):
-        if DEBUG and candidate.id_ != DEBUG_CANDIDATE:
-            continue
-        l.debug(f'relaying id={candidate.id_}')
+    try:
 
-        # report progress
-        if i > 0 and i in percent_marks:
-            elapsed = time.time() - t_start
-            nps = i / elapsed
-            remain = len(candidates) - i
-            eta_seconds = remain / nps
-            eta = datetime.timedelta(seconds=eta_seconds)
+        for i, candidate in enumerate(candidates):
+            if DEBUG and candidate.id_ != DEBUG_CANDIDATE:
+                continue
+            l.debug(f'relaying id={candidate.id_}')
 
-            l.debug(f'Working, {i:,}/{len(candidates):,} ({round(i / len(candidates) * 100)}%) complete, ETA {eta}')
+            # report progress
+            if i > 0 and i in percent_marks:
+                elapsed = time.time() - t_start
+                nps = i / elapsed
+                remain = len(candidates) - i
+                eta_seconds = remain / nps
+                eta = datetime.timedelta(seconds=eta_seconds)
 
-        # find if we should skip bc of a banned exchange
-        these_banned_exchanges = set(candidate.exchanges).intersection(banned_exchanges)
-        if len(these_banned_exchanges) > 0:
-            # this is a banned arbitrage, ignore it
-            n_banned_skipped += 1
-            sz_banned_exchanges = ','.join(sorted(these_banned_exchanges))
-            results_failure[candidate.id_] = f'Broken exchange/s: {sz_banned_exchanges}'
-            l.debug(f'Skipping arbitrage id={candidate.id_} because it uses banned tokens {sz_banned_exchanges}')
-            continue
+                l.debug(f'Working, {i:,}/{len(candidates):,} ({round(i / len(candidates) * 100)}%) complete, ETA {eta}')
 
-        # find if we should skip bc of a banned token
-        all_tokens = set(x for x, _ in candidate.directions)
+            # find if we should skip bc of a banned exchange
+            these_banned_exchanges = set(candidate.exchanges).intersection(banned_exchanges)
+            if len(these_banned_exchanges) > 0:
+                # this is a banned arbitrage, ignore it
+                n_banned_skipped += 1
+                sz_banned_exchanges = ','.join(sorted(these_banned_exchanges))
+                results_failure[candidate.id_] = f'Broken exchange/s: {sz_banned_exchanges}'
+                l.debug(f'Skipping arbitrage id={candidate.id_} because it uses banned tokens {sz_banned_exchanges}')
+                continue
 
-        these_banned_tokens = all_tokens.intersection(banned_tokens)
-        if len(these_banned_tokens) > 0:
-            # this is a banned arbitrage, ignore it
-            n_banned_skipped += 1
-            sz_banned_tokens = ','.join(sorted(these_banned_tokens))
-            results_failure[candidate.id_] = f'Broken token/s: {sz_banned_tokens}'
-            l.debug(f'Skipping arbitrage id={candidate.id_} because it uses banned tokens {sz_banned_tokens}')
-            continue
+            # find if we should skip bc of a banned token
+            all_tokens = set(x for x, _ in candidate.directions)
 
-        # find if we should skip bc of token interference
-        does_interfere = False
-        for t in all_tokens:
-            maybe_interferers = interfering_tokens.get(t, None)
-            if maybe_interferers is not None:
-                interferers = maybe_interferers.intersection(candidate.exchanges)
-                if len(interferers) > 0:
-                    sz_interferers = ','.join(sorted(interferers))
-                    results_failure[candidate.id_] = f'Token {t} interferes with {sz_interferers}'
-                    l.debug(f'Skipping arbitrage id={candidate.id_} because {t} interferes with {sz_interferers}')
-                    does_interfere = True
-                    break
+            these_banned_tokens = all_tokens.intersection(banned_tokens)
+            if len(these_banned_tokens) > 0:
+                # this is a banned arbitrage, ignore it
+                n_banned_skipped += 1
+                sz_banned_tokens = ','.join(sorted(these_banned_tokens))
+                results_failure[candidate.id_] = f'Broken token/s: {sz_banned_tokens}'
+                l.debug(f'Skipping arbitrage id={candidate.id_} because it uses banned tokens {sz_banned_tokens}')
+                continue
 
-        for exchange, (t1, t2) in zip(candidate.exchanges, candidate.directions):
-            if exchange in incompatible_tokens and len(incompatible_tokens[exchange].intersection([t1, t2])) > 0:
-                l.debug(f'Skipping arbitrage id={candidate.id_} because {exchange} has an incompatible token in the circuit')
+            # find if we should skip bc of token interference
+            does_interfere = False
+            for t in all_tokens:
+                maybe_interferers = interfering_tokens.get(t, None)
+                if maybe_interferers is not None:
+                    interferers = maybe_interferers.intersection(candidate.exchanges)
+                    if len(interferers) > 0:
+                        sz_interferers = ','.join(sorted(interferers))
+                        results_failure[candidate.id_] = f'Token {t} interferes with {sz_interferers}'
+                        l.debug(f'Skipping arbitrage id={candidate.id_} because {t} interferes with {sz_interferers}')
+                        does_interfere = True
+                        break
 
-        if does_interfere:
-            n_banned_skipped += 1
-            continue
+            for exchange, (t1, t2) in zip(candidate.exchanges, candidate.directions):
+                if exchange in incompatible_tokens and len(incompatible_tokens[exchange].intersection([t1, t2])) > 0:
+                    l.debug(f'Skipping arbitrage id={candidate.id_} because {exchange} has an incompatible token in the circuit')
 
-        # get pricers
-        circuit = []
-        for x in candidate.exchanges:
-            if x in pricer_cache:
-                circuit.append(pricer_cache[x])
+            if does_interfere:
+                n_banned_skipped += 1
+                continue
+
+            # get pricers
+            circuit = []
+            for x in candidate.exchanges:
+                if x in pricer_cache:
+                    circuit.append(pricer_cache[x])
+                else:
+                    pricer = load_pricer_for(w3_ganache, curr, x)
+                    assert pricer is not None
+                    pricer_cache[x] = pricer
+                    circuit.append(pricer)
+
+            fa = FoundArbitrage(
+                circuit = circuit,
+                directions = candidate.directions,
+                pivot_token = WETH_ADDRESS,
+                amount_in = candidate.amount_in,
+                profit = candidate.profit_before_fee,
+            )
+
+            if DEBUG:
+                for p in circuit:
+                    l.debug(str(p))
+                pc = PricingCircuit(
+                    [load_pricer_for(w3, curr, x) for x in candidate.exchanges],
+                    candidate.directions
+                )
+                # pc.sample(fa.amount_in, block_number, timestamp_to_use, debug = True, fee_transfer_calculator=fee_calculator)
+                maybe_fa = detect_arbitrages_bisection(
+                    pc,
+                    block_number,
+                    timestamp = timestamp_to_use,
+                    try_all_directions = False,
+                    fee_transfer_calculator = fee_calculator
+                )
+
+            fee_calculator.infer_relays_and_aliases(fa, shooter_address)
+            
+            has_fees = any(fee_calculator.has_fee(t) for t in all_tokens)
+
+            if DEBUG:
+                if len(maybe_fa) == 0:
+                    # no arbitrages found, is it because we had fees?
+                    if has_fees:
+                        l.debug('No arbitrage after applying inferred fees')
+                    else:
+                        l.critical(f'Could not replicate arbitrage!!!!!')
+                        l.critical(f'id = {candidate.id_}')
+                        l.critical(f'block_number = {block_number}')
+                        l.critical(f'found_arbitrage = {fa}')
+                        raise Exception('could not replicate!!')
+
+                (rep_fa,) = maybe_fa
+
+                if not has_fees:
+                    if rep_fa.profit != candidate.profit_before_fee:
+                        l.critical(f'profit changed!!! old: {candidate.profit_before_fee / 10 ** 18:.5f} vs new {rep_fa.profit / 10 ** 18:.5f} ETH')
+                    else:
+                        l.debug(f'replicated arbitrage')
+                    
+                    if rep_fa.amount_in != fa.amount_in:
+                        l.critical('amount_in changed')
+                        l.critical(f'old {fa.amount_in}')
+                        l.critical(f'new {rep_fa.amount_in}')
+
+
+            try:
+                result = auto_adapt_attempt_shoot_candidate(
+                    w3_ganache,
+                    curr,
+                    acct,
+                    shooter_address,
+                    fa,
+                    fee_calculator,
+                    timestamp=timestamp_to_use,
+                    must_recompute = has_fees,
+                )
+            except NotEnoughLiquidityException:
+                l.critical(f'Problem with relaying ... trying with recompute on')
+                result = auto_adapt_attempt_shoot_candidate(
+                    w3_ganache,
+                    curr,
+                    acct,
+                    shooter_address,
+                    fa,
+                    fee_calculator,
+                    timestamp=timestamp_to_use,
+                    must_recompute = True,
+                )
+            if isinstance(result, DiagnosisBrokenToken):
+                assert result.token_address not in KNOWN_TOKENS, f'Token {result.token_address} should not be banned ever'
+                banned_tokens.add(result.token_address)
+                new_banned_tokens.add(result.token_address)
+                n_banned_skipped += 1
+                results_failure[candidate.id_] = f'Broken token/s: {result.token_address}'
+            elif isinstance(result, DiagnosisBadExchange):
+                banned_exchanges.add(result.exchange)
+                new_banned_exchanges.add(result.exchange)
+                n_banned_skipped += 1
+                results_failure[candidate.id_] = f'Broken exchange/s: {result.exchange}'
+            elif isinstance(result, DiagnosisOther):
+                results_failure[candidate.id_] = result.reason
+            elif isinstance(result, DiagnosisNoArbitrageOnFeeApplied):
+                n_no_arb_on_fee += 1
+                results_failure[candidate.id_] = f'No arbitrage after applying fees'
+            elif isinstance(result, DiagnosisExchangeInterference):
+                if result.token_address in interfering_tokens:
+                    interfering_tokens[result.token_address].add(result.exchange_address)
+                else:
+                    interfering_tokens[result.token_address] = set((result.exchange_address,))
+                results_failure[candidate.id_] = f'Token interferes with a circuit exchange'
+            elif isinstance(result, DiagnosisIncompatibleToken):
+                if result.exchange_address in incompatible_tokens:
+                    incompatible_tokens[result.exchange_address].add(result.token_address)
+                else:
+                    interfering_tokens[result.exchange_address] = set((result.token_address,))
+                results_failure[candidate.id_] = f'Token incompatible with {result.exchange_address}'
+            elif isinstance(result, AutoAdaptShootSuccess):
+                results_success[candidate.id_] = result
             else:
-                pricer = load_pricer_for(w3_ganache, curr, x)
-                assert pricer is not None
-                pricer_cache[x] = pricer
-                circuit.append(pricer)
+                raise Exception(f'Not sure what this is: {result}')
 
-        fa = FoundArbitrage(
-            circuit = circuit,
-            directions = candidate.directions,
-            pivot_token = WETH_ADDRESS,
-            amount_in = candidate.amount_in,
-            profit = candidate.profit_before_fee,
-        )
-
-        if DEBUG:
-            for p in circuit:
-                l.debug(str(p))
-            pc = PricingCircuit(
-                [load_pricer_for(w3, curr, x) for x in candidate.exchanges],
-                candidate.directions
-            )
-            # pc.sample(fa.amount_in, block_number, timestamp_to_use, debug = True, fee_transfer_calculator=fee_calculator)
-            maybe_fa = detect_arbitrages_bisection(
-                pc,
-                block_number,
-                timestamp = timestamp_to_use,
-                try_all_directions = False,
-                fee_transfer_calculator = fee_calculator
-            )
-
-        fee_calculator.infer_relays_and_aliases(fa, shooter_address)
-        
-        has_fees = any(fee_calculator.has_fee(t) for t in all_tokens)
-
-        if DEBUG:
-            if len(maybe_fa) == 0:
-                # no arbitrages found, is it because we had fees?
-                if has_fees:
-                    l.debug('No arbitrage after applying inferred fees')
-                else:
-                    l.critical(f'Could not replicate arbitrage!!!!!')
-                    l.critical(f'id = {candidate.id_}')
-                    l.critical(f'block_number = {block_number}')
-                    l.critical(f'found_arbitrage = {fa}')
-                    raise Exception('could not replicate!!')
-
-            (rep_fa,) = maybe_fa
-
-            if not has_fees:
-                if rep_fa.profit != candidate.profit_before_fee:
-                    l.critical(f'profit changed!!! old: {candidate.profit_before_fee / 10 ** 18:.5f} vs new {rep_fa.profit / 10 ** 18:.5f} ETH')
-                else:
-                    l.debug(f'replicated arbitrage')
-                
-                if rep_fa.amount_in != fa.amount_in:
-                    l.critical('amount_in changed')
-                    l.critical(f'old {fa.amount_in}')
-                    l.critical(f'new {rep_fa.amount_in}')
-
-
+        l.debug(f'Skipped {n_banned_skipped:,} arbitrages due to banned token or exchange use')
+        l.debug(f'Had {n_no_arb_on_fee:,} arbitrages that diasappeared on applying fee')
+        l.debug(f'Had {len(results_success):,} successful arbitrages in {block_number}')
+    finally:
         try:
-            result = auto_adapt_attempt_shoot_candidate(
-                w3_ganache,
-                curr,
-                acct,
-                shooter_address,
-                fa,
-                fee_calculator,
-                timestamp=timestamp_to_use,
-                must_recompute = has_fees,
-            )
-        except NotEnoughLiquidityException:
-            l.critical(f'Problem with relaying ... trying with recompute on')
-            result = auto_adapt_attempt_shoot_candidate(
-                w3_ganache,
-                curr,
-                acct,
-                shooter_address,
-                fa,
-                fee_calculator,
-                timestamp=timestamp_to_use,
-                must_recompute = True,
-            )
-        if isinstance(result, DiagnosisBrokenToken):
-            assert result.token_address not in KNOWN_TOKENS, f'Token {result.token_address} should not be banned ever'
-            banned_tokens.add(result.token_address)
-            new_banned_tokens.add(result.token_address)
-            n_banned_skipped += 1
-            results_failure[candidate.id_] = f'Broken token/s: {result.token_address}'
-        elif isinstance(result, DiagnosisBadExchange):
-            banned_exchanges.add(result.exchange)
-            new_banned_exchanges.add(result.exchange)
-            n_banned_skipped += 1
-            results_failure[candidate.id_] = f'Broken exchange/s: {result.exchange}'
-        elif isinstance(result, DiagnosisOther):
-            results_failure[candidate.id_] = result.reason
-        elif isinstance(result, DiagnosisNoArbitrageOnFeeApplied):
-            n_no_arb_on_fee += 1
-            results_failure[candidate.id_] = f'No arbitrage after applying fees'
-        elif isinstance(result, DiagnosisExchangeInterference):
-            if result.token_address in interfering_tokens:
-                interfering_tokens[result.token_address].add(result.exchange_address)
-            else:
-                interfering_tokens[result.token_address] = set((result.exchange_address,))
-            results_failure[candidate.id_] = f'Token interferes with a circuit exchange'
-        elif isinstance(result, DiagnosisIncompatibleToken):
-            if result.exchange_address in incompatible_tokens:
-                incompatible_tokens[result.exchange_address].add(result.token_address)
-            else:
-                interfering_tokens[result.exchange_address] = set((result.token_address,))
-            results_failure[candidate.id_] = f'Token incompatible with {result.exchange_address}'
-        elif isinstance(result, AutoAdaptShootSuccess):
-            results_success[candidate.id_] = result
-        else:
-            raise Exception(f'Not sure what this is: {result}')
-
-    l.debug(f'Skipped {n_banned_skipped:,} arbitrages due to banned token or exchange use')
-    l.debug(f'Had {n_no_arb_on_fee:,} arbitrages that diasappeared on applying fee')
-    l.debug(f'Had {len(results_success):,} successful arbitrages in {block_number}')
-
-    proc.kill()
-    proc.wait()
+            proc.kill()
+            proc.wait()
+        except:
+            l.exception('could not kill proc')
 
     # assert len(results_success) + len(results_failure) == len(candidates)
 
@@ -476,7 +482,7 @@ def fixup_db(curr: psycopg2.extensions.cursor):
         '''
         UPDATE candidate_arbitrage_reshoot_blocks
         SET claimed_on = NULL
-        WHERE completed_on IS NULL AND claimed_on IS NOT NULL -- AND (now()::timestamp - claimed_on) > interval '5 minutes'
+        WHERE completed_on IS NULL AND claimed_on IS NOT NULL -- AND (now()::timestamp - claimed_on) > interval '300 minutes'
         '''
     )
     resp = input(f'Requeued {curr.rowcount} entries, continue? type yes to continue:')
@@ -755,26 +761,25 @@ def open_ganache(
     for _ in range(10):
         if w3.eth.get_balance(acct.address) == web3.Web3.toWei(1000, 'ether'):
             break
-        l.debug('Backing off on balance check...')
         time.sleep(0.01)
 
     #
-    # deploy the shooter
+    # deploy the relayer
     #
-    shooter = w3.eth.contract(
+    relayer = w3.eth.contract(
         bytecode = SHOOTER_ARTIFACT['bytecode'],
         abi = SHOOTER_ARTIFACT['abi'],
     )
 
-    constructor_txn = shooter.constructor().buildTransaction({'from': acct.address})
+    constructor_txn = relayer.constructor().buildTransaction({'from': acct.address})
     txn_hash = w3.eth.send_transaction(constructor_txn)
     receipt = w3.eth.wait_for_transaction_receipt(txn_hash)
 
-    shooter_addr = receipt['contractAddress']
-    l.info(f'deployed shooter to {shooter_addr} with admin key {acct.address}')
+    relayer_addr = receipt['contractAddress']
+    l.debug(f'deployed relayer to {relayer_addr} with admin key {acct.address}')
 
-    shooter = w3.eth.contract(
-        address = shooter_addr,
+    relayer = w3.eth.contract(
+        address = relayer_addr,
         abi = SHOOTER_ARTIFACT['abi'],
     )
 
@@ -792,14 +797,14 @@ def open_ganache(
     assert wrap_receipt['status'] == 1
 
     # transfer to shooter
-    xfer = weth.functions.transfer(shooter_addr, amt_to_send).buildTransaction({'from': acct.address})
+    xfer = weth.functions.transfer(relayer_addr, amt_to_send).buildTransaction({'from': acct.address})
     xfer_hash = w3.eth.send_transaction(xfer)
     xfer_receipt = w3.eth.wait_for_transaction_receipt(xfer_hash)
     assert xfer_receipt['status'] == 1
 
-    l.info(f'Transferred {amt_to_send / (10 ** 18):.2f} ETH to shooter')
+    l.debug(f'Transferred {amt_to_send / (10 ** 18):.2f} ETH to shooter')
 
-    return p, w3, acct, shooter_addr
+    return p, w3, acct, relayer_addr
 
 
 class CandidateArbitrage(typing.NamedTuple):
@@ -1091,6 +1096,35 @@ def diagnose_failure(
         receipt: web3.types.TxReceipt,
         timestamp: int,
     ) -> DiagnosisBrokenToken:
+    if DEBUG:
+        txn = w3_ganache.eth.get_transaction(receipt['transactionHash'])
+        with tempfile.NamedTemporaryFile() as f:
+            fname = f.name
+            got = w3_ganache.provider.make_request(
+                'debug_traceTransactionToFile',
+                [
+                    receipt['transactionHash'].hex(),
+                    {'disableStorage': True, 'file_name': fname},
+                ]
+            )
+            assert got['result'] == 'OK', f'expected OK result but got {got}'
+
+            stat = os.stat(fname)
+            l.debug(f'File size was {stat.st_size // 1024 // 1024} MB')
+
+            trace = {'result': json.load(f)}
+
+        if 'result' not in trace:
+            print(trace)
+
+        with open('/mnt/goldphish/trace.txt', mode='w') as fout:
+            for sl in trace['result']['structLogs']:
+                fout.write(str(sl) + '\n')
+
+        decoded_old = decode_trace_calls(trace['result']['structLogs'], txn, receipt)
+        pretty_print_trace(decoded_old, txn, receipt)
+
+
     l.debug('diagnosing shoot failure...')
     l.debug(f'gas usage: {receipt["gasUsed"]:,}')
     if receipt['gasUsed'] > 1_000_000:
@@ -1194,33 +1228,6 @@ def diagnose_failure(
     result = w3_ganache.provider.make_request('debug_callTrace', [receipt['transactionHash'].hex()])
 
     decoded = parse_ganache_call_trace(result['result'])
-
-    if DEBUG:
-        with tempfile.NamedTemporaryFile() as f:
-            fname = f.name
-            got = w3_ganache.provider.make_request(
-                'debug_traceTransactionToFile',
-                [
-                    receipt['transactionHash'].hex(),
-                    {'disableStorage': True, 'file_name': fname},
-                ]
-            )
-            assert got['result'] == 'OK', f'expected OK result but got {got}'
-
-            stat = os.stat(fname)
-            l.debug(f'File size was {stat.st_size // 1024 // 1024} MB')
-
-            trace = {'result': json.load(f)}
-
-        if 'result' not in trace:
-            print(trace)
-
-        with open('/mnt/goldphish/trace.txt', mode='w') as fout:
-            for sl in trace['result']['structLogs']:
-                fout.write(str(sl) + '\n')
-
-        decoded_old = decode_trace_calls(trace['result']['structLogs'], txn, receipt)
-        pretty_print_trace(decoded_old, txn, receipt)
 
     #
     # DFS through call tree to see if source of revert was a token

@@ -326,6 +326,18 @@ def decode_trace_calls(trace, txn: web3.types.TxData, receipt: web3.types.TxRece
                 ctx['gasEnd'] = sl['gas'] - sl['gasCost']
             ctx['traceEnd'] = i
             ctx = ctx_stack.pop()
+        if sl['op'] in ['CREATE', 'CREATE2']:
+            ctx['actions'].append({
+                'type': sl['op'],
+                'gasStart': sl['gas'],
+                'traceStart': i,
+                'callee': 'UNKNOWN',
+                'from': ctx['callee'],
+                'args': b'',
+                'actions': []
+            })
+            ctx_stack.append(ctx)
+            ctx = ctx['actions'][-1]
         if sl['op'] == 'STATICCALL':
             dest = '0x' + sl['stack'][-2].replace('0x', '').lstrip('0').rjust(40, '0')
             arg_offset = int(sl['stack'][-3], base=16)
@@ -442,6 +454,12 @@ def parse_ganache_call_trace(trace):
             'from': web3.Web3.toChecksumAddress('0x' + trace['from'].rjust(40, '0')),
             'to': web3.Web3.toChecksumAddress('0x' + trace['to'].rjust(40, '0')),
             'value': int(trace['value'], 16)
+        }
+    elif trace['type'] in ['CREATE', 'CREATE2']:
+        return {
+            'type': trace['type'],
+            'from': web3.Web3.toChecksumAddress('0x' + trace['from'].rjust(40, '0')),
+            'to': 'UNKNOWN',
         }
     raise Exception(f'cannot handle {trace}')
 
