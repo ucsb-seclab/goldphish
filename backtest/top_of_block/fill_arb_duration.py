@@ -658,7 +658,7 @@ def setup_db(
         CREATE INDEX IF NOT EXISTS idx_candidate_arbitrage_campaigns_bne ON candidate_arbitrage_campaigns (block_number_end);
 
         CREATE TABLE IF NOT EXISTS candidate_arbitrage_campaign_member (
-            candidate_arbitrage_id       INTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
+            candidate_arbitrage_id       BIGINTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
             candidate_arbitrage_campaign INTEGER NOT NULL REFERENCES candidate_arbitrage_campaigns (id) ON DELETE CASCADE,
             profit_after_fee_wei         NUMERIC(78, 0) NOT NULL
         );

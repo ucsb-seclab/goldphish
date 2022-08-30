@@ -192,7 +192,7 @@ def setup_db(curr: psycopg2.extensions.cursor):
     curr.execute(
         """
         CREATE TABLE IF NOT EXISTS candidate_arbitrages (
-            id              SERIAL PRIMARY KEY NOT NULL,
+            id              BIGSERIAL PRIMARY KEY NOT NULL,
             block_number    INTEGER NOT NULL,
             exchanges       bytea[] NOT NULL,
             directions      bytea[] NOT NULL,
@@ -217,16 +217,6 @@ def setup_db(curr: psycopg2.extensions.cursor):
             completed_on       TIMESTAMP WITHOUT TIME ZONE,
             priority           INTEGER NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS candidate_arbitrage_blocks_to_verify (
-            block_number INTEGER PRIMARY KEY NOT NULL,
-            max_profit_no_fee NUMERIC(78, 0) NOT NULL,
-            verify_started  TIMESTAMP WITHOUT TIME ZONE,
-            verify_finished TIMESTAMP WITHOUT TIME ZONE
-        );
-
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_to_verify_block_number ON candidate_arbitrage_blocks_to_verify(block_number);
-        CREATE INDEX IF NOT EXISTS idx_candidate_arbitrage_blocks_to_verify_max_profit_no_fee ON candidate_arbitrage_blocks_to_verify (max_profit_no_fee);
         """
     )
 

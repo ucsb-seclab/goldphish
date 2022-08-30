@@ -5,9 +5,11 @@ Since this is generally an NP-complete problem, we just use a simple
 naive (Greedy) algorithm.
 """
 
+import collections
 import itertools
 import logging
 import psycopg2.extensions
+import psycopg2.extras
 import argparse
 import typing
 import web3
@@ -39,76 +41,118 @@ def find_mev(w3: web3.Web3, args: argparse.Namespace):
 
     l.info('starting mev-finding')
 
-    blocks_to_analyze = get_blocks_to_analyze(curr)
-    l.info(f'Have {len(blocks_to_analyze):,} blocks to analyze')
+    for priority in range(1, 29+1):
+        curr.execute(f'SELECT start_block, end_block FROM block_samples WHERE priority = %s', (priority,))
+        assert curr.rowcount == 1
+        start_block, end_block = curr.fetchone()
 
-    for block_number in blocks_to_analyze:
-        analyze_block(w3, curr, block_number)
+        analyze_blocks(curr, start_block, end_block)
 
 
 def setup_db(curr: psycopg2.extensions.cursor):
     l.info('setting up database')
     curr.execute(
         '''
-        CREATE TABLE IF NOT EXISTS candidate_arbitrages_mev_selected (
-            candidate_arbitrage_id INTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE
+        CREATE TABLE IF NOT EXISTS candidate_arbitrages_mev (
+            block_number INTEGER NOT NULL,
+            mev          NUMERIC(78, 0) NOT NULL
         );
 
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_arbitrages_mev_selected_id ON candidate_arbitrages_mev_selected (candidate_arbitrage_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_arbitrages_mev_block_number ON candidate_arbitrages_mev (block_number);
+
+
+        CREATE TABLE IF NOT EXISTS candidate_arbitrages_mev_selected (
+            block_number INTEGER NOT NULL,
+            candidate_arbitrage_id BIGINTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_candidate_arbitrages_mev_selected_block_number ON candidate_arbitrages_mev_selected (block_number);
+        CREATE INDEX IF NOT EXISTS idx_candidate_arbitrages_mev_selected_id ON candidate_arbitrages_mev_selected (candidate_arbitrage_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_arbitrages_mev_selected_block_number_id ON candidate_arbitrages_mev_selected (block_number, candidate_arbitrage_id);
         '''
     )
 
-
-def get_blocks_to_analyze(curr: psycopg2.extensions.cursor) -> typing.List[int]:
-    curr.execute(
-        '''
-        SELECT completed_on IS NOT NULL, block_number_start, block_number_end, progress
-        FROM candidate_arbitrage_reservations
-        WHERE claimed_on IS NOT NULL
-        '''
-    )
-
-    ret = []
-    for completed, start_block, end_block, progress in curr:
-        if completed:
-            assert progress == end_block
-        ret.extend(range(start_block, progress + 1))
-    
-    assert len(set(ret)) == len(ret)
-
-    return sorted(ret)
 
 ARBITRAGE_NODE = 0x1
 EXCHANGE_NODE = 0x2
-def analyze_block(w3: web3.Web3, curr: psycopg2.extensions.cursor, block_number: int):
-    # get all arbitrages and form the conflict graph
+def analyze_blocks(curr: psycopg2.extensions.cursor, start_block: int, end_block: int):
+    # get all arbitrage campaigns and arbitrages
     curr.execute(
         '''
-        SELECT id, exchanges, directions, profit_no_fee
-        FROM candidate_arbitrages WHERE block_number = %s
+        SELECT id, block_number_start, block_number_end
+        FROM candidate_arbitrage_campaigns
+        WHERE gas_pricer = 'median' AND niche LIKE 'nfb|%%' AND %s <= block_number_start AND block_number_end <= %s
         ''',
-        (block_number,)
+        (start_block, end_block)
     )
-    l.debug(f'Have {curr.rowcount:,} arbitrages in block {block_number}')
-    if curr.rowcount == 0:
-        return
+    l.debug(f'Have {curr.rowcount:,} campaigns in this priority')
+    
+    candidates = list(curr)
+    candidates_with_arbitrage = []
+    for id_, block_number_start, block_number_end in candidates:
+        curr.execute(
+            '''
+            SELECT ca.block_number, ca.exchanges, profit_after_fee_wei, ca.id
+            FROM candidate_arbitrage_campaign_member
+            JOIN candidate_arbitrages ca ON ca.id = candidate_arbitrage_campaign_member.candidate_arbitrage_id
+            WHERE candidate_arbitrage_campaign = %s
+            ORDER BY ca.block_number
+            ''',
+            (id_,)
+        )
+        assert curr.rowcount > 0, f'campaign {id_} had no candidates'
+        candidates_with_arbitrage.append((id_, block_number_start, block_number_end, list(curr)))
+
+    candidates_by_start_block = collections.defaultdict(lambda: [])
+    candidates_by_end_block = collections.defaultdict(lambda: [])
+    for c in candidates_with_arbitrage:
+        block_number_start = c[1]
+        block_number_end = c[2]
+        candidates_by_start_block[block_number_start].append(c)
+        candidates_by_end_block[block_number_end].append(c)
+
+    running_campaigns = {}
+
+    for block_number in range(start_block, end_block + 1):
+        for c in candidates_by_start_block[block_number]:
+            id_ = c[0]
+            running_campaigns[id_] = c
+        
+        for c in candidates_by_end_block[block_number - 1]:
+            id_ = c[0]
+            del running_campaigns[id_]
+        
+        l.debug(f'Have {len(running_campaigns):,} campaigns running in block {block_number:,}')
+
+        available_candidates = []
+        for c in running_campaigns.values():
+            these_candidates = c[3]
+            candidate = these_candidates[0]
+            for maybe_candidate in these_candidates[1:]:
+                if maybe_candidate[0] <= block_number:
+                    candidate = maybe_candidate
+                else:
+                    break
+            
+            available_candidates.append(candidate)
+    
+        analyze_block(curr, available_candidates, block_number)
+        curr.connection.commit()
+
+def analyze_block(curr: psycopg2.extensions.cursor, candidates: typing.List[typing.Tuple[int, typing.List[bytes], int, int]], block_number: int):
+    l.debug(f'Have {len(candidates):,} arbitrages in block {block_number}')
 
     g = nx.Graph()
 
-    for id_, exchanges, directions, profit_no_fee in curr:
+    for _, exchanges, profit, id_ in candidates:
         exchanges = [e.tobytes() for e in exchanges]
-        directions = [d.tobytes() for d in directions]
-        assert directions[0] == bytes.fromhex(WETH_ADDRESS[2:])
-        directions = list(zip(directions, directions[1:] + [directions[0]]))
-        profit_no_fee = int(profit_no_fee)
+        profit = int(profit)
 
         assert 2 <= len(exchanges) <= 3
-        assert len(directions) == len(exchanges)
 
-        g.add_node(id_, weight=profit_no_fee, type=ARBITRAGE_NODE)
-        for exc, dir in zip(exchanges, directions):
-            dir = tuple(sorted(dir))
-            node = (exc, dir)
+        g.add_node(id_, weight=profit, type=ARBITRAGE_NODE)
+        for exc in exchanges:
+            node = exc
             if not g.has_node(node):
                 g.add_node(node, type=EXCHANGE_NODE)
             g.add_edge(id_, node)
@@ -145,5 +189,22 @@ def analyze_block(w3: web3.Web3, curr: psycopg2.extensions.cursor, block_number:
         g.remove_node(largest_node_by_weight)
 
     total_weight = sum(selected_arbitrage_weights)
+
+    psycopg2.extras.execute_batch(
+        curr,
+        '''
+        INSERT INTO candidate_arbitrages_mev_selected (block_number, candidate_arbitrage_id)
+        VALUES (%s, %s)
+        ''',
+        zip(itertools.repeat(block_number), selected_arbitrages)
+    )
+
+    curr.execute(
+        '''
+        INSERT INTO candidate_arbitrages_mev (block_number, mev) VALUES (%s, %s)
+        ''',
+        (block_number, total_weight)
+    )
+
     l.debug(f'Selected {len(selected_arbitrages):,} arbitrages in block {block_number} totaling {total_weight / (10 ** 18):.8f} ETH')
 

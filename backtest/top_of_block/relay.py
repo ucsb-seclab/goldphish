@@ -1,4 +1,3 @@
-import asyncio
 import collections
 import datetime
 import decimal
@@ -38,6 +37,8 @@ from shooter.composer import construct_arbitrage
 from shooter.encoder import serialize
 
 from utils import BALANCER_VAULT_ADDRESS, DAI_ADDRESS, TETHER_ADDRESS, USDC_ADDRESS, WBTC_ADDRESS, WETH_ADDRESS, decode_trace_calls, get_abi, parse_ganache_call_trace, pretty_print_trace
+from utils.profiling import inc_measurement, maybe_log, profile
+
 
 l = logging.getLogger(__name__)
 
@@ -217,8 +218,9 @@ def process_reservation(
     try:
 
         for i, candidate in enumerate(candidates):
-            if DEBUG and candidate.id_ != DEBUG_CANDIDATE:
-                continue
+            if DEBUG:
+                maybe_log()
+
             l.debug(f'relaying id={candidate.id_}')
 
             # report progress
@@ -293,7 +295,7 @@ def process_reservation(
                 profit = candidate.profit_before_fee,
             )
 
-            if DEBUG:
+            if False and DEBUG:
                 for p in circuit:
                     l.debug(str(p))
                 pc = PricingCircuit(
@@ -313,7 +315,7 @@ def process_reservation(
             
             has_fees = any(fee_calculator.has_fee(t) for t in all_tokens)
 
-            if DEBUG:
+            if False and DEBUG:
                 if len(maybe_fa) == 0:
                     # no arbitrages found, is it because we had fees?
                     if has_fees:
@@ -482,7 +484,7 @@ def fixup_db(curr: psycopg2.extensions.cursor):
         '''
         UPDATE candidate_arbitrage_reshoot_blocks
         SET claimed_on = NULL
-        WHERE completed_on IS NULL AND claimed_on IS NOT NULL -- AND (now()::timestamp - claimed_on) > interval '300 minutes'
+        WHERE completed_on IS NULL AND claimed_on IS NOT NULL AND (now()::timestamp - claimed_on) > interval '150 minutes'
         '''
     )
     resp = input(f'Requeued {curr.rowcount} entries, continue? type yes to continue:')
@@ -490,35 +492,6 @@ def fixup_db(curr: psycopg2.extensions.cursor):
         curr.connection.rollback()
         print('bye')
         return
-
-    if time.time() < 1659633624.0104673 + 60 * 60:
-        curr.execute(
-            '''
-            CREATE TEMP TABLE tmp_bad_blocks AS
-            SELECT block_number
-            FROM candidate_arbitrage_reshoot_blocks
-            WHERE (now()::timestamp - claimed_on) < interval '1 hour'
-            '''
-        )
-        curr.execute(
-            '''
-            UPDATE candidate_arbitrage_reshoot_blocks
-            SET claimed_on = NULL, completed_on = NULL
-            WHERE EXISTS(SELECT 1 FROM tmp_bad_blocks tbb WHERE tbb.block_number = candidate_arbitrage_reshoot_blocks.block_number)
-            '''
-        )
-        l.debug(f'reset {curr.rowcount:,} reservations')
-        curr.execute(
-            '''
-            DELETE FROM candidate_arbitrage_relay_results
-            WHERE EXISTS(
-                SELECT 1 FROM candidate_arbitrages WHERE candidate_arbitrage_relay_results.candidate_arbitrage_id = candidate_arbitrages.id AND 
-                EXISTS(SELECT 1 FROM tmp_bad_blocks tbb WHERE tbb.block_number = candidate_arbitrages.block_number) 
-            )
-            '''
-        )
-        l.debug(f'deleted {curr.rowcount} arbitrage results')
-        input(f'ENTER to continue')
 
 
 def reset_db(curr: psycopg2.extensions.cursor):
@@ -577,7 +550,7 @@ def setup_db(curr: psycopg2.extensions.cursor):
         CREATE INDEX IF NOT EXISTS idx_inferred_token_fee_on_transfer_token_id ON inferred_token_fee_on_transfer (token_id);
 
         CREATE TABLE IF NOT EXISTS candidate_arbitrage_relay_results (
-            candidate_arbitrage_id INTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
+            candidate_arbitrage_id BIGINTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
             shoot_success          BOOLEAN NOT NULL,
             failure_reason         TEXT,
             gas_used               INTEGER CHECK ((shoot_success = true and gas_used is not null) OR (shoot_success = false and gas_used is null)),
@@ -589,7 +562,7 @@ def setup_db(curr: psycopg2.extensions.cursor):
         CREATE INDEX IF NOT EXISTS idx_candidate_arbitrage_relay_results_shoot_success ON candidate_arbitrage_relay_results (shoot_success);
 
         CREATE TABLE IF NOT EXISTS candidate_arbitrage_relay_results_used_fees (
-            candidate_arbitrage_id INTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
+            candidate_arbitrage_id BIGINTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
             fee_used               INTEGER NOT NULL REFERENCES inferred_token_fee_on_transfer (id) ON DELETE CASCADE
         );
 
@@ -652,7 +625,7 @@ def fill_queue(curr: psycopg2.extensions.cursor):
 def get_reservation(curr: psycopg2.extensions.cursor, worker_name: str) -> typing.Optional[typing.Tuple[int, int]]:
     curr.execute('BEGIN TRANSACTION')
 
-    if not DEBUG:
+    if True: # not DEBUG:
         curr.execute(
             '''
             SELECT id, block_number
@@ -705,6 +678,8 @@ def open_ganache(
         worker_id: int,
     ) -> typing.Tuple[subprocess.Popen, web3.Web3, LocalAccount, str]:
     global _port
+    t_start = time.time()
+
     acct: LocalAccount = Account.from_key(bytes.fromhex('f96003b86ed95cb86eae15653bf4b0bc88691506141a1a9ae23afd383415c268'))
 
     bin_loc = '/opt/ganache-fork/src/packages/ganache/dist/node/cli.js'
@@ -822,7 +797,7 @@ def get_candidates_in_block(
     ) -> typing.List[
         CandidateArbitrage
     ]:
-    if not DEBUG:
+    if True: # not DEBUG:
         curr.execute(
             '''
             SELECT id, exchanges, directions, amount_in, profit_no_fee
@@ -914,7 +889,8 @@ def auto_adapt_attempt_shoot_candidate(
     inferred_fees: typing.Dict[typing.Any, typing.List[decimal.Decimal]] = collections.defaultdict(lambda: [])
 
     while True:
-        result = w3_ganache.provider.make_request('evm_snapshot', [])
+        with profile('evm_snapshot'):
+            result = w3_ganache.provider.make_request('evm_snapshot', [])
         snapshot_id = int(result['result'][2:], base=16)
 
         if must_recompute:
@@ -923,13 +899,14 @@ def auto_adapt_attempt_shoot_candidate(
                 fa.circuit,
                 fa.directions
             )
-            maybe_fa = detect_arbitrages_bisection(
-                pc,
-                'latest',
-                try_all_directions=False,
-                fee_transfer_calculator=fee_transfer_calculator,
-                timestamp=timestamp,
-            )
+            with profile('recompute arbitrage'):
+                maybe_fa = detect_arbitrages_bisection(
+                    pc,
+                    'latest',
+                    try_all_directions=False,
+                    fee_transfer_calculator=fee_transfer_calculator,
+                    timestamp=timestamp,
+                )
             assert len(maybe_fa) <= 1
             if len(maybe_fa) == 0:
                 l.debug(f'No arbitrage on re-shoot')
@@ -938,14 +915,15 @@ def auto_adapt_attempt_shoot_candidate(
             fa = maybe_fa[0]
 
         try:
-            maybe_receipt = attempt_relay_candidate(
-                w3_ganache,
-                account,
-                shooter_address,
-                fa,
-                fee_transfer_calculator,
-                timestamp
-            )
+            with profile('attempt_relay'):
+                maybe_receipt = attempt_relay_candidate(
+                    w3_ganache,
+                    account,
+                    shooter_address,
+                    fa,
+                    fee_transfer_calculator,
+                    timestamp
+                )
 
             if isinstance(maybe_receipt, DiagnosisBrokenToken):
                 return maybe_receipt
@@ -953,7 +931,8 @@ def auto_adapt_attempt_shoot_candidate(
             receipt = maybe_receipt
 
             if receipt['status'] != 1:
-                diagnosis = diagnose_failure(w3_ganache, account, shooter_address, fa, fee_transfer_calculator, receipt, timestamp)
+                with profile('diagnose'):
+                    diagnosis = diagnose_failure(w3_ganache, account, shooter_address, fa, fee_transfer_calculator, receipt, timestamp)
                 if isinstance(diagnosis, (DiagnosisBrokenToken, DiagnosisBadExchange, DiagnosisExchangeInterference, DiagnosisIncompatibleToken, DiagnosisOther)):
                     return diagnosis
                 elif isinstance(diagnosis, DiagnosisFeeOnTransfer):
@@ -1013,7 +992,8 @@ def auto_adapt_attempt_shoot_candidate(
                     token_fees_used = fee_transfer_calculator.get_fees_used(fa)
                 )
         finally:
-            result = w3_ganache.provider.make_request('evm_revert', [snapshot_id])
+            with profile('evm_revert'):
+                result = w3_ganache.provider.make_request('evm_revert', [snapshot_id])
             assert result['result'] == True, 'snapshot revert should be success'
 
 
@@ -1078,8 +1058,9 @@ def attempt_relay_candidate(
 
     txn_hash = w3_ganache.eth.send_raw_transaction(signed['rawTransaction'])
     
-    w3_ganache.provider.make_request('evm_mine', [timestamp])
-    receipt = w3_ganache.eth.wait_for_transaction_receipt(txn_hash)
+    with profile('evm_mine'):
+        w3_ganache.provider.make_request('evm_mine', [timestamp])
+        receipt = w3_ganache.eth.wait_for_transaction_receipt(txn_hash)
 
     result = w3_ganache.provider.make_request('miner_start', [])
     assert result['result'] == True
@@ -1188,7 +1169,8 @@ def diagnose_failure(
     for address, token in sorted(expected_transfers.keys()):
         this_erc20: web3.contract.Contract = w3_ganache.eth.contract(address=token, abi=get_abi('erc20.abi.json'))
         try:
-            bal = this_erc20.functions.balanceOf(address).call(block_identifier=receipt['blockNumber'] - 1)
+            with profile('get_balance'):
+                bal = this_erc20.functions.balanceOf(address).call(block_identifier=receipt['blockNumber'] - 1)
         except ValueError as e:
             if 'VM Exception while processing transaction: revert' in str(e):
                 return DiagnosisBrokenToken(
@@ -1225,7 +1207,8 @@ def diagnose_failure(
 
     txn = w3_ganache.eth.get_transaction(receipt['transactionHash'])
 
-    result = w3_ganache.provider.make_request('debug_callTrace', [receipt['transactionHash'].hex()])
+    with profile('debug_callTrace'):
+        result = w3_ganache.provider.make_request('debug_callTrace', [receipt['transactionHash'].hex()])
 
     decoded = parse_ganache_call_trace(result['result'])
 
@@ -1360,7 +1343,8 @@ def diagnose_failure(
             # must query
             this_erc20: web3.contract.Contract = w3_ganache.eth.contract(address=token, abi=get_abi('erc20.abi.json'))
             try:
-                bal = this_erc20.functions.balanceOf(address).call(block_identifier=receipt['blockNumber'] - 1)
+                with profile('get_balance'):
+                    bal = this_erc20.functions.balanceOf(address).call(block_identifier=receipt['blockNumber'] - 1)
             except ValueError as e:
                 if 'VM Exception while processing transaction: revert' in str(e):
                     return DiagnosisBrokenToken(
@@ -1529,139 +1513,124 @@ def diagnose_failure(
     raise Exception('Failure to diagnose')
 
 
-def load_broken_tokens_at(curr: psycopg2.extensions.cursor, block_number: int):
-    """
-    Load tokens that were banned before block_number
-    """
-    curr.execute(
-        '''
-        SELECT address
-        FROM broken_tokens
-        JOIN tokens ON tokens.id = broken_tokens.token_id
-        WHERE broken_at_block_number <= %s
-        ''',
-        (block_number,)
-    )
-    return set(web3.Web3.toChecksumAddress(x.tobytes()) for (x,) in curr)
-
-
 def load_pricer_for(
         w3: web3.Web3,
         curr: psycopg2.extensions.cursor,
         exchange: str,
     ) -> typing.Optional[pricers.BaseExchangePricer]:
-    bexchange = bytes.fromhex(exchange[2:])
+    with profile('load_pricer_for'):
+        bexchange = bytes.fromhex(exchange[2:])
 
-    curr.execute(
-        '''
-        SELECT t0.address, t1.address
-        FROM uniswap_v2_exchanges uv2
-        JOIN tokens t0 ON uv2.token0_id = t0.id
-        JOIN tokens t1 ON uv2.token1_id = t1.id
-        WHERE uv2.address = %s
-        ''',
-        (bexchange,)
-    )
-    if curr.rowcount > 0:
-        assert curr.rowcount == 1
-
-        token0, token1 = curr.fetchone()
-        token0 = w3.toChecksumAddress(token0.tobytes())
-        token1 = w3.toChecksumAddress(token1.tobytes())
-        p = UniswapV2Pricer(w3, exchange, token0, token1)
-        return p
-
-    curr.execute(
-        '''
-        SELECT t0.address, t1.address
-        FROM sushiv2_swap_exchanges sv2
-        JOIN tokens t0 ON sv2.token0_id = t0.id
-        JOIN tokens t1 ON sv2.token1_id = t1.id
-        WHERE sv2.address = %s
-        ''',
-        (bexchange,)
-    )
-    if curr.rowcount > 0:
-        assert curr.rowcount == 1
-
-        token0, token1 = curr.fetchone()
-        token0 = w3.toChecksumAddress(token0.tobytes())
-        token1 = w3.toChecksumAddress(token1.tobytes())
-        p = UniswapV2Pricer(w3, exchange, token0, token1)
-        return p
-
-    curr.execute(
-        '''
-        SELECT t0.address, t1.address
-        FROM shibaswap_exchanges ss
-        JOIN tokens t0 ON ss.token0_id = t0.id
-        JOIN tokens t1 ON ss.token1_id = t1.id
-        WHERE ss.address = %s
-        ''',
-        (bexchange,)
-    )
-    if curr.rowcount > 0:
-        assert curr.rowcount == 1
-
-        token0, token1 = curr.fetchone()
-        token0 = w3.toChecksumAddress(token0.tobytes())
-        token1 = w3.toChecksumAddress(token1.tobytes())
-        p = UniswapV2Pricer(w3, exchange, token0, token1)
-        return p
-
-    curr.execute(
-        '''
-        SELECT t0.address, t1.address, originalfee
-        FROM uniswap_v3_exchanges uv3
-        JOIN tokens t0 ON uv3.token0_id = t0.id
-        JOIN tokens t1 ON uv3.token1_id = t1.id
-        WHERE uv3.address = %s            
-        ''',
-        (bexchange,)
-    )
-    if curr.rowcount > 0:
-        assert curr.rowcount == 1
-        token0, token1, fee = curr.fetchone()
-        token0 = w3.toChecksumAddress(token0.tobytes())
-        token1 = w3.toChecksumAddress(token1.tobytes())
-        p = UniswapV3Pricer(w3, exchange, token0, token1, fee)
-        return p
-
-    curr.execute(
-        '''
-        SELECT EXISTS(SELECT 1 FROM balancer_exchanges WHERE address = %s)
-        ''',
-        (bexchange,)
-    )
-    (is_balancerv1,) = curr.fetchone()
-    if is_balancerv1:
-        p = BalancerPricer(w3, exchange)
-        return p
-
-    curr.execute(
-        '''
-        SELECT pool_id, pool_type
-        FROM balancer_v2_exchanges
-        WHERE address = %s
-        ''',
-        (bexchange,)
-    )
-    if curr.rowcount > 0:
-        assert curr.rowcount == 1
-        pool_id, pool_type = curr.fetchone()
-        pool_id = pool_id.tobytes()
-
-        vault = w3.eth.contract(
-            address = BALANCER_VAULT_ADDRESS,
-            abi = get_abi('balancer_v2/Vault.json'),
+        curr.execute(
+            '''
+            SELECT t0.address, t1.address
+            FROM uniswap_v2_exchanges uv2
+            JOIN tokens t0 ON uv2.token0_id = t0.id
+            JOIN tokens t1 ON uv2.token1_id = t1.id
+            WHERE uv2.address = %s
+            ''',
+            (bexchange,)
         )
+        if curr.rowcount > 0:
+            assert curr.rowcount == 1
 
-        if pool_type in ['WeightedPool', 'WeightedPool2Tokens']:
-            return BalancerV2WeightedPoolPricer(w3, vault, exchange, pool_id)
-        elif pool_type in ['LiquidityBootstrappingPool', 'NoProtocolFeeLiquidityBootstrappingPool']:
-            return BalancerV2LiquidityBootstrappingPoolPricer(w3, vault, exchange, pool_id)
+            token0, token1 = curr.fetchone()
+            token0 = w3.toChecksumAddress(token0.tobytes())
+            token1 = w3.toChecksumAddress(token1.tobytes())
+            p = UniswapV2Pricer(w3, exchange, token0, token1)
+            return p
 
-    l.error(f'Could not find exchange for address {exchange}')
+        curr.execute(
+            '''
+            SELECT t0.address, t1.address
+            FROM sushiv2_swap_exchanges sv2
+            JOIN tokens t0 ON sv2.token0_id = t0.id
+            JOIN tokens t1 ON sv2.token1_id = t1.id
+            WHERE sv2.address = %s
+            ''',
+            (bexchange,)
+        )
+        if curr.rowcount > 0:
+            assert curr.rowcount == 1
+
+            token0, token1 = curr.fetchone()
+            token0 = w3.toChecksumAddress(token0.tobytes())
+            token1 = w3.toChecksumAddress(token1.tobytes())
+            p = UniswapV2Pricer(w3, exchange, token0, token1)
+            return p
+
+        curr.execute(
+            '''
+            SELECT t0.address, t1.address
+            FROM shibaswap_exchanges ss
+            JOIN tokens t0 ON ss.token0_id = t0.id
+            JOIN tokens t1 ON ss.token1_id = t1.id
+            WHERE ss.address = %s
+            ''',
+            (bexchange,)
+        )
+        if curr.rowcount > 0:
+            assert curr.rowcount == 1
+
+            token0, token1 = curr.fetchone()
+            token0 = w3.toChecksumAddress(token0.tobytes())
+            token1 = w3.toChecksumAddress(token1.tobytes())
+            p = UniswapV2Pricer(w3, exchange, token0, token1)
+            return p
+
+        curr.execute(
+            '''
+            SELECT t0.address, t1.address, originalfee
+            FROM uniswap_v3_exchanges uv3
+            JOIN tokens t0 ON uv3.token0_id = t0.id
+            JOIN tokens t1 ON uv3.token1_id = t1.id
+            WHERE uv3.address = %s            
+            ''',
+            (bexchange,)
+        )
+        if curr.rowcount > 0:
+            assert curr.rowcount == 1
+            token0, token1, fee = curr.fetchone()
+            token0 = w3.toChecksumAddress(token0.tobytes())
+            token1 = w3.toChecksumAddress(token1.tobytes())
+            p = UniswapV3Pricer(w3, exchange, token0, token1, fee)
+            return p
+
+        curr.execute(
+            '''
+            SELECT EXISTS(SELECT 1 FROM balancer_exchanges WHERE address = %s)
+            ''',
+            (bexchange,)
+        )
+        (is_balancerv1,) = curr.fetchone()
+        if is_balancerv1:
+            p = BalancerPricer(w3, exchange)
+            return p
+
+        curr.execute(
+            '''
+            SELECT pool_id, pool_type
+            FROM balancer_v2_exchanges
+            WHERE address = %s
+            ''',
+            (bexchange,)
+        )
+        if curr.rowcount > 0:
+            assert curr.rowcount == 1
+            pool_id, pool_type = curr.fetchone()
+            pool_id = pool_id.tobytes()
+
+            vault = w3.eth.contract(
+                address = BALANCER_VAULT_ADDRESS,
+                abi = get_abi('balancer_v2/Vault.json'),
+            )
+
+            if pool_type in ['WeightedPool', 'WeightedPool2Tokens']:
+                return BalancerV2WeightedPoolPricer(w3, vault, exchange, pool_id)
+            elif pool_type in ['LiquidityBootstrappingPool', 'NoProtocolFeeLiquidityBootstrappingPool']:
+                return BalancerV2LiquidityBootstrappingPoolPricer(w3, vault, exchange, pool_id)
+
+        l.error(f'Could not find exchange for address {exchange}')
     return None
 
 class TokenFee(typing.NamedTuple):
@@ -1780,6 +1749,7 @@ class InferredTokenTransferFeeCalculator(BuiltinFeeTransferCalculator):
         Synchronize state of inferred transfer fee.
         """
 
+        t_start = time.time()
         # fresh, full-pull
         curr.execute(
             '''
@@ -1835,6 +1805,9 @@ class InferredTokenTransferFeeCalculator(BuiltinFeeTransferCalculator):
         
         l.debug(f'Inserted {len(self.updated)} inferred token fee records')
         self.updated.clear()
+
+        elapsed = time.time() - t_start
+        inc_measurement('inferred_fee.sync', elapsed)
 
     def out_from_transfer(self, token: str, from_: str, to_: str, amount: int) -> int:
         maybe_relayer = self.relayed_by_shooter.get((from_, to_), None)
