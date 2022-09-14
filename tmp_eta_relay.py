@@ -5,7 +5,7 @@ from backtest.utils import connect_db
 db = connect_db()
 curr = db.cursor()
 
-TARGET_PRIORITY = 29
+TARGET_PRIORITY = 49
 
 curr.execute(
     '''
@@ -30,8 +30,8 @@ while True:
     (n_blocks,) = curr.fetchone()
     last_marks.append(n_blocks)
     last_ts.append(time.time())
-    last_marks = last_marks[-100:]
-    last_ts = last_ts[-100:]
+    last_marks = last_marks[-500:]
+    last_ts = last_ts[-500:]
 
     if len(last_marks) >= 2:
         curr.execute(

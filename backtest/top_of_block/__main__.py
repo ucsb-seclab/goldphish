@@ -20,6 +20,7 @@ import backtest.top_of_block.maximal_block_value
 import backtest.top_of_block.relay
 import backtest.top_of_block.fill_arb_duration
 import backtest.top_of_block.generate_sample
+import backtest.top_of_block.fill_top_arbitrages
 
 from utils import connect_web3, setup_logging
 
@@ -46,6 +47,9 @@ def main():
     handlers[cmd] = handler
 
     cmd, handler = backtest.top_of_block.fill_arb_duration.add_args(subparser)
+    handlers[cmd] = handler
+
+    cmd, handler = backtest.top_of_block.fill_top_arbitrages.add_args(subparser)
     handlers[cmd] = handler
 
     cmd, handler = backtest.top_of_block.generate_sample.add_args(subparser)

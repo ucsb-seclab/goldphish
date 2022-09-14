@@ -1,6 +1,7 @@
 import collections
 import datetime
 import decimal
+import itertools
 import json
 import math
 import os
@@ -20,6 +21,7 @@ import logging
 import argparse
 import psycopg2
 import psycopg2.extensions
+import psycopg2.extras
 from backtest.top_of_block.constants import MIN_PROFIT_PREFILTER
 from find_circuit.find import DEFAULT_FEE_TRANSFER_CALCULATOR, BuiltinFeeTransferCalculator, FeeTransferCalculator, FoundArbitrage, PricingCircuit, detect_arbitrages_bisection
 import pricers
@@ -36,7 +38,7 @@ from pricers.uniswap_v3 import UniswapV3Pricer
 from shooter.composer import construct_arbitrage
 from shooter.encoder import serialize
 
-from utils import BALANCER_VAULT_ADDRESS, DAI_ADDRESS, TETHER_ADDRESS, USDC_ADDRESS, WBTC_ADDRESS, WETH_ADDRESS, decode_trace_calls, get_abi, parse_ganache_call_trace, pretty_print_trace
+from utils import BALANCER_VAULT_ADDRESS, DAI_ADDRESS, TETHER_ADDRESS, USDC_ADDRESS, WBTC_ADDRESS, WETH_ADDRESS, decode_trace_calls, get_abi, get_block_timestamp, parse_ganache_call_trace, pretty_print_trace
 from utils.profiling import inc_measurement, maybe_log, profile
 
 
@@ -46,6 +48,7 @@ DEBUG = False
 DEBUG_RESERVATION = 128839
 DEBUG_CANDIDATE = 1303660660
 
+RELAYER_BALANCE_WEI = 10_000 * (10 ** 18)
 
 SHOOTER_ARTIFACT_PATH = pathlib.Path(__file__).parent.parent.parent / 'artifacts' / 'contracts' / 'shooter.sol' / 'Shooter.json'
 
@@ -79,7 +82,7 @@ KNOWN_TOKENS = frozenset((
     DAI_ADDRESS,
 ))
 
-N_PORTS_PER_SLICE = 2
+N_PORTS_PER_SLICE = 20
 
 def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.Callable[[web3.Web3, argparse.Namespace], None]]:
     parser_name = 'do-relay'
@@ -91,6 +94,8 @@ def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.
 
     parser.add_argument('--id', type=int, default=0)
 
+    parser.add_argument('--top-arbs', action='store_true', help='Do the run for top arbitrages')
+
     return parser_name, relay
 
 
@@ -100,7 +105,9 @@ def relay(w3: web3.Web3, args: argparse.Namespace):
 
     if args.setup_db:
         setup_db(curr)
-        fill_queue(curr)
+        fill_relay_queue(curr)
+        fill_relay_top_arbs_queue(curr)
+        input('commit?')
         db.commit()
         return
 
@@ -112,6 +119,10 @@ def relay(w3: web3.Web3, args: argparse.Namespace):
     if args.fixup_db:
         fixup_db(curr)
         db.commit()
+        return
+
+    if args.top_arbs:
+        relay_top_arbs(w3, curr, args.id)
         return
 
     if args.worker_name is None:
@@ -344,7 +355,6 @@ def process_reservation(
             try:
                 result = auto_adapt_attempt_shoot_candidate(
                     w3_ganache,
-                    curr,
                     acct,
                     shooter_address,
                     fa,
@@ -356,7 +366,6 @@ def process_reservation(
                 l.critical(f'Problem with relaying ... trying with recompute on')
                 result = auto_adapt_attempt_shoot_candidate(
                     w3_ganache,
-                    curr,
                     acct,
                     shooter_address,
                     fa,
@@ -484,7 +493,7 @@ def fixup_db(curr: psycopg2.extensions.cursor):
         '''
         UPDATE candidate_arbitrage_reshoot_blocks
         SET claimed_on = NULL
-        WHERE completed_on IS NULL AND claimed_on IS NOT NULL AND (now()::timestamp - claimed_on) > interval '150 minutes'
+        WHERE completed_on IS NULL AND claimed_on IS NOT NULL AND (now()::timestamp - claimed_on) > interval '300 minutes'
         '''
     )
     resp = input(f'Requeued {curr.rowcount} entries, continue? type yes to continue:')
@@ -566,6 +575,45 @@ def setup_db(curr: psycopg2.extensions.cursor):
             fee_used               INTEGER NOT NULL REFERENCES inferred_token_fee_on_transfer (id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS top_candidate_arbitrage_reservations (
+            id           SERIAL PRIMARY KEY NOT NULL,
+            start_block  INTEGER NOT NULL,
+            end_block    INTEGER NOT NULL,
+            worker       TEXT,
+            progress     INTEGER,
+            claimed_on   TIMESTAMP WITHOUT TIME ZONE,
+            completed_on TIMESTAMP WITHOUT TIME ZONE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_top_candidate_arbitrage_reservations ON top_candidate_arbitrage_reservations (claimed_on);
+
+        CREATE TABLE IF NOT EXISTS top_candidate_arbitrage_campaigns (
+            id                     BIGSERIAL PRIMARY KEY NOT NULL,
+            exchanges              BYTEA[] NOT NULL,
+            directions             BYTEA[] NOT NULL,
+            start_block            INTEGER NOT NULL,
+            end_block              INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS top_candidate_arbitrage_relay_results (
+            id                     BIGSERIAL PRIMARY KEY NOT NULL,
+            campaign_id            BIGINT REFERENCES top_candidate_arbitrage_campaigns (id) CHECK ((shoot_success = true and campaign_id is not null) OR (shoot_success = false and campaign_id is null)),
+            candidate_arbitrage_id BIGINT NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
+            shoot_success          BOOLEAN NOT NULL,
+            failure_reason         TEXT,
+            gas_used               INTEGER CHECK ((shoot_success = true and gas_used is not null) OR (shoot_success = false and gas_used is null)),
+            had_fee_on_xfer_token  BOOLEAN,
+            real_profit_before_fee NUMERIC(78, 0)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_top_candidate_arbitrage_relay_results_candidate_arbitrage_id ON top_candidate_arbitrage_relay_results (candidate_arbitrage_id);
+        CREATE INDEX IF NOT EXISTS idx_top_candidate_arbitrage_relay_results_shoot_success ON top_candidate_arbitrage_relay_results (shoot_success);
+
+        CREATE TABLE IF NOT EXISTS top_candidate_arbitrage_relay_results_used_fees (
+            top_candidate_arbitrage_relay_result_id BIGINT NOT NULL REFERENCES top_candidate_arbitrage_relay_results (id) ON DELETE CASCADE,
+            fee_used                                INTEGER NOT NULL REFERENCES inferred_token_fee_on_transfer (id) ON DELETE CASCADE
+        );
+
 
         CREATE TABLE IF NOT EXISTS broken_tokens (
             token_id               INTEGER NOT NULL PRIMARY KEY REFERENCES tokens (id) ON DELETE CASCADE,
@@ -584,7 +632,17 @@ def setup_db(curr: psycopg2.extensions.cursor):
     )
     pass
 
-def fill_queue(curr: psycopg2.extensions.cursor):
+def fill_relay_top_arbs_queue(curr: psycopg2.extensions.cursor):
+    curr.execute(
+        '''
+        INSERT INTO top_candidate_arbitrage_reservations (start_block, end_block)
+        SELECT start_block, end_block FROM block_samples
+        '''
+    )
+    l.info(f'inserted {curr.rowcount} reservations for top arbitrages')
+
+
+def fill_relay_queue(curr: psycopg2.extensions.cursor):
     curr.execute(
         '''
         SELECT block_number_start, block_number_end, priority
@@ -671,15 +729,12 @@ def get_reservation(curr: psycopg2.extensions.cursor, worker_name: str) -> typin
     return id_, block_number
 
 
-_port = 0
+_port = collections.defaultdict(lambda: 0)
 def open_ganache(
         block_number: int,
         tmpdir: str,
         worker_id: int,
     ) -> typing.Tuple[subprocess.Popen, web3.Web3, LocalAccount, str]:
-    global _port
-    t_start = time.time()
-
     acct: LocalAccount = Account.from_key(bytes.fromhex('f96003b86ed95cb86eae15653bf4b0bc88691506141a1a9ae23afd383415c268'))
 
     bin_loc = '/opt/ganache-fork/src/packages/ganache/dist/node/cli.js'
@@ -687,8 +742,9 @@ def open_ganache(
 
     my_slice = worker_id
     slice_start = 10000 + my_slice * N_PORTS_PER_SLICE
-    ganache_port = slice_start + _port
-    _port = (_port + 1) % N_PORTS_PER_SLICE
+    port_slice = _port[worker_id]
+    ganache_port = slice_start + port_slice
+    _port[worker_id] = (port_slice + 1) % N_PORTS_PER_SLICE
 
     web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
     p = subprocess.Popen(
@@ -703,7 +759,7 @@ def open_ganache(
             '--miner.timestampIncrement', '1',
             # '--chain.time', str(next_timestamp * 1_000),
             # '--chain.hardfork', 'arrowGlacier',
-            '--wallet.accounts', f'{acct.key.hex()},{web3.Web3.toWei(10000, "ether")}',
+            '--wallet.accounts', f'{acct.key.hex()},{web3.Web3.toWei(100_000, "ether")}',
         ],
         stdout=subprocess.DEVNULL,
         cwd=cwd_loc,
@@ -734,7 +790,7 @@ def open_ganache(
     assert p.poll() is None
 
     for _ in range(10):
-        if w3.eth.get_balance(acct.address) == web3.Web3.toWei(1000, 'ether'):
+        if w3.eth.get_balance(acct.address) == web3.Web3.toWei(100_000, 'ether'):
             break
         time.sleep(0.01)
 
@@ -761,23 +817,25 @@ def open_ganache(
     #
     # fund the shooter with some wrapped ether
     #
-    amt_to_send = w3.toWei(1000, 'ether')
     weth: web3.contract.Contract = w3.eth.contract(
         address=WETH_ADDRESS,
         abi=get_abi('weth9/WETH9.json')['abi'],
     )
-    wrap = weth.functions.deposit().buildTransaction({'value': amt_to_send, 'from': acct.address})
+    wrap = weth.functions.deposit().buildTransaction({'value': RELAYER_BALANCE_WEI, 'from': acct.address})
     wrap_hash = w3.eth.send_transaction(wrap)
     wrap_receipt = w3.eth.wait_for_transaction_receipt(wrap_hash)
     assert wrap_receipt['status'] == 1
 
     # transfer to shooter
-    xfer = weth.functions.transfer(relayer_addr, amt_to_send).buildTransaction({'from': acct.address})
+    xfer = weth.functions.transfer(relayer_addr, RELAYER_BALANCE_WEI).buildTransaction({'from': acct.address})
     xfer_hash = w3.eth.send_transaction(xfer)
     xfer_receipt = w3.eth.wait_for_transaction_receipt(xfer_hash)
     assert xfer_receipt['status'] == 1
 
-    l.debug(f'Transferred {amt_to_send / (10 ** 18):.2f} ETH to shooter')
+    l.debug(f'Transferred {RELAYER_BALANCE_WEI / (10 ** 18):.2f} ETH to relayer')
+
+    exit_code = p.poll()
+    assert exit_code is None, f'Expected ganache to be running but it exited with code {exit_code}'
 
     return p, w3, acct, relayer_addr
 
@@ -789,6 +847,10 @@ class CandidateArbitrage(typing.NamedTuple):
     amount_in: int
     profit_before_fee: int
     block_number: int
+
+    @property
+    def campaign_key(self) -> typing.Tuple[typing.Tuple, typing.Tuple]:
+        return (tuple(self.exchanges), tuple(self.directions))
 
 
 def get_candidates_in_block(
@@ -872,7 +934,6 @@ class DiagnosisOther(typing.NamedTuple):
 
 def auto_adapt_attempt_shoot_candidate(
         w3_ganache: web3.Web3,
-        curr: psycopg2.extensions.cursor,
         account: LocalAccount,
         shooter_address: str,
         fa: FoundArbitrage,
@@ -973,8 +1034,8 @@ def auto_adapt_attempt_shoot_candidate(
                     address=WETH_ADDRESS,
                     abi=get_abi('erc20.abi.json'),
                 )
-                shooter_balance = weth.functions.balanceOf(shooter_address).call()
-                profit = shooter_balance - 1000 * (10 ** 18)
+                relayer_balance = weth.functions.balanceOf(shooter_address).call()
+                profit = relayer_balance - RELAYER_BALANCE_WEI
                 if profit < 0:
                     l.critical('------------------------')
                     l.critical(f'Profit was negative! {profit / (10 ** 18):.5f} ETH')
@@ -1026,7 +1087,7 @@ def attempt_relay_candidate(
             'chainId': 1,
             'gas': 1_000_000,
             'nonce': w3_ganache.eth.get_transaction_count(account.address),
-            'gasPrice': 500 * (10 ** 9)
+            'gasPrice': 10_000 * (10 ** 9)
         }
         signed = w3_ganache.eth.account.sign_transaction(txn, account.key)
 
@@ -1052,14 +1113,16 @@ def attempt_relay_candidate(
         'chainId': 1,
         'gas': 1_500_000,
         'nonce': w3_ganache.eth.get_transaction_count(account.address),
-        'gasPrice': 500 * (10 ** 9)
+        'gasPrice': 10_000 * (10 ** 9)
     }
     signed = w3_ganache.eth.account.sign_transaction(txn, account.key)
 
     txn_hash = w3_ganache.eth.send_raw_transaction(signed['rawTransaction'])
     
+    l.debug(f'before mine {w3_ganache.eth.block_number:,}')
     with profile('evm_mine'):
         w3_ganache.provider.make_request('evm_mine', [timestamp])
+        l.debug(f'after mine {w3_ganache.eth.block_number:,}')
         receipt = w3_ganache.eth.wait_for_transaction_receipt(txn_hash)
 
     result = w3_ganache.provider.make_request('miner_start', [])
@@ -1511,6 +1574,589 @@ def diagnose_failure(
         l.info(str(p))
 
     raise Exception('Failure to diagnose')
+
+
+class TopArbCampaign(typing.NamedTuple):
+    start_block: int
+    end_block: typing.Optional[int]
+    members: typing.List[typing.Tuple[int, AutoAdaptShootSuccess]]
+    exchanges: typing.List[str]
+    directions: typing.List[typing.Tuple[str, str]]
+
+
+def relay_top_arbs(w3: web3.Web3, curr: psycopg2.extensions.cursor, worker_id: int):
+    l.info(f'relaying top arbitrages as worker #{worker_id}')
+
+    curr.execute(
+        '''
+        CREATE TEMP TABLE active_campaigns (
+            exchanges       BYTEA[] NOT NULL,
+            directions      BYTEA[] NOT NULL,
+            block_last_seen INTEGER NOT NULL
+        );
+        '''
+    )
+
+    while True:
+        if not DEBUG: curr.connection.commit()
+
+        # assert DEBUG, f'undo changes to select'
+        curr.execute(
+            '''
+            SELECT id, start_block, end_block
+            FROM top_candidate_arbitrage_reservations
+            WHERE claimed_on IS NULL AND completed_on IS NULL
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+            '''
+        )
+        if curr.rowcount == 0:
+            l.info('out of work, done')
+            break
+
+        (reservation_id, start_block, end_block) = curr.fetchone()
+        curr.execute(
+            'UPDATE top_candidate_arbitrage_reservations SET claimed_on = now()::timestamp WHERE id = %s',
+            (reservation_id,)
+        )
+        if not DEBUG: curr.connection.commit()
+
+        l.info(f'Working on reservation id={reservation_id:,} from block {start_block:,} to {end_block:,}')
+
+        relay_top_arbs_in_range(w3, curr, reservation_id, start_block, end_block, worker_id)
+
+        curr.execute(
+            'UPDATE top_candidate_arbitrage_reservations SET completed_on = now()::timestamp WHERE id = %s',
+            (reservation_id,)
+        )
+        if not DEBUG: curr.connection.commit()
+
+
+def relay_top_arbs_in_range(
+        w3: web3.Web3,
+        curr: psycopg2.extensions.cursor,
+        reservation_id: int,
+        reservation_start_block: int,
+        reservation_end_block: int,
+        worker_id: int,
+    ):
+    rolling_window = collections.deque()
+
+    active_campaigns: typing.Dict[typing.Any, TopArbCampaign] = {}
+    curr.execute(
+        '''
+        TRUNCATE TABLE active_campaigns;
+        '''
+    )
+
+    curr.execute(
+        '''
+        SELECT MIN(block_number)
+        FROM large_candidate_arbitrages
+        WHERE block_number > %s
+        ''',
+        (reservation_start_block,)
+    )
+    (lowest_block_with_large_arb,) = curr.fetchone()
+    l.info(f'starting at block {lowest_block_with_large_arb:,}')
+
+    curr.execute('SELECT MAX(end_block) FROM block_samples')
+    (global_end_block_inclusive,) = curr.fetchone()
+
+    # go through blocks, maintaining the rolling window
+    for block_number in itertools.count(lowest_block_with_large_arb):
+        
+        #
+        # see if we can quit
+
+        # global hard stop
+        if block_number > global_end_block_inclusive:
+            l.info('Reached global end; done')
+            break
+
+        # reservation stop conditions
+        if block_number > reservation_end_block and len(active_campaigns) == 0:
+            l.info('Reached end of reservation; done')
+            break
+
+        #
+        # some setup
+        l.debug(f'Processing block {block_number:,}')
+        failed_relays: typing.List[typing.Tuple[int, str]] = []
+        timestamp_to_use = w3.eth.get_block(block_number + 1)['timestamp']
+
+        # construct the query
+        # we need to decide whether to include new campaigns as we see existing ones to completion
+        query = '''
+            SELECT ca.id, ca.exchanges, ca.directions, ca.amount_in, ca.profit_no_fee
+            FROM candidate_arbitrages ca
+            JOIN active_campaigns ac ON ac.exchanges = ca.exchanges AND ac.directions = ca.directions
+            WHERE ca.block_number = %(block_number)s
+        '''
+        if block_number <= reservation_end_block:
+            query += '''
+                UNION
+                SELECT ca.id, ca.exchanges, ca.directions, ca.amount_in, ca.profit_no_fee
+                FROM candidate_arbitrages ca
+                JOIN large_candidate_arbitrages la ON ca.id = la.candidate_arbitrage_id
+                WHERE la.block_number = %(block_number)s
+            '''        
+
+        curr.execute(
+            query,
+            {'block_number': block_number}
+        )
+
+        candidate_fas: typing.List[CandidateArbitrage] = []
+        used_keys = set()
+        for id_, bexchanges, bdirections, amount_in, profit in curr:
+            exchanges = [web3.Web3.toChecksumAddress(x.tobytes()) for x in bexchanges]
+            directions = [web3.Web3.toChecksumAddress(x.tobytes()) for x in bdirections]
+            directions = list(zip(directions, directions[1:] + [directions[0]]))
+            assert len(exchanges) == len(directions)
+            assert directions[0][0] == WETH_ADDRESS
+
+            candidate = CandidateArbitrage(
+                id_ = id_,
+                exchanges = exchanges,
+                directions = directions,
+                amount_in = int(amount_in),
+                profit_before_fee = int(profit),
+                block_number=block_number
+            )
+
+            if candidate.campaign_key in used_keys:
+                l.warning(f'skipping duplicate candidate id={id_}')
+                continue
+            used_keys.add(candidate.campaign_key)
+
+
+            candidate_fas.append(candidate)
+
+
+        #
+        # repair the rolling window, if it is needed
+        if len(candidate_fas) > 0:
+            # start by removing anything from a block more than 10 behind this one
+            while len(rolling_window) > 0 and rolling_window[0][0] < block_number - 10:
+                _, proc, tmpd, _ = rolling_window.popleft()
+                proc: subprocess.Popen
+                tmpd: tempfile.TemporaryDirectory
+                proc.kill()
+                proc.wait()
+                assert proc.poll() is not None
+                tmpd.cleanup()
+            
+            assert len(rolling_window) == 0 or rolling_window[0][0] == block_number - 10
+
+            # start filling in the window with blocks that we need
+            while len(rolling_window) < 11:
+                if len(rolling_window) == 0:
+                    needed_block = block_number - 10
+                else:
+                    needed_block = rolling_window[-1][0] + 1
+
+                tmpd = tempfile.TemporaryDirectory(dir='/mnt/goldphish/tmp')
+                proc, w3_ganache, account, relayer_address = open_ganache(needed_block, tmpd.name, worker_id * 2)
+
+                if needed_block >= w3_ganache.eth.block_number:
+                    print(subprocess.check_output(['ps', 'aux']).decode('ascii'))
+                assert w3_ganache.eth.block_number > needed_block
+                rolling_window.append((needed_block, proc, tmpd, w3_ganache))
+
+            assert set(x[0] for x in rolling_window) == set(range(block_number - 10, block_number + 1))
+
+        # remove unneeded stuff for simplification of the process below
+        simplified_window = [(bn, w3_ganache) for bn, _, _, w3_ganache in rolling_window]
+
+        pricer_cache: typing.Dict[str, BaseExchangePricer] = {}
+        completed_campaigns: typing.List[TopArbCampaign] = []
+
+        l.debug(f'Relaying {len(candidate_fas):,} arbitrages in block {block_number:,}')
+        for candidate in candidate_fas:
+            # look up what campaign this belongs to
+            campaign = active_campaigns.get(candidate.campaign_key, None)
+
+            # construct the FoundArbitrage
+            # start by creating the circuit
+            circuit = []
+            for exchange in candidate.exchanges:
+                maybe_pricer = pricer_cache.get(exchange, None)
+                if maybe_pricer is None:
+                    maybe_pricer = load_pricer_for(simplified_window[10][1], curr, exchange)
+                    assert maybe_pricer is not None, f'could not load pricer for {exchange}'
+                    pricer_cache[exchange] = maybe_pricer
+                circuit.append(maybe_pricer)
+
+            fa = FoundArbitrage(
+                amount_in   = candidate.amount_in,
+                circuit     = circuit,
+                directions  = candidate.directions,
+                pivot_token = candidate.directions[0][0],
+                profit      = candidate.profit_before_fee,
+            )
+
+            #
+            # attempt to do the relaying
+            new_campaign_or_failure_reason = relay_top_candidate(w3, curr, account, relayer_address, timestamp_to_use, simplified_window, candidate, fa, campaign, worker_id)
+            assert isinstance(new_campaign_or_failure_reason, (str, TopArbCampaign)), f'unexpected new_campaign={repr(new_campaign)}'
+
+            if isinstance(new_campaign_or_failure_reason, str):
+                failure_reason = new_campaign_or_failure_reason
+                # the campaign either didnt start or just ended
+                failed_relays.append((candidate.id_, failure_reason))
+                if campaign is not None:
+                    # the campaign just ended
+                    campaign = campaign._replace(end_block = candidate.block_number - 1)
+                    completed_campaigns.append(campaign)
+                    del active_campaigns[candidate.campaign_key]
+                    curr.execute(
+                        'DELETE FROM active_campaigns WHERE exchanges = %s AND directions = %s',
+                        (
+                            [bytes.fromhex(x[2:]) for x in candidate.exchanges],
+                            [bytes.fromhex(x[2:]) for x, _ in candidate.directions],
+                        )
+                    )
+                    assert curr.rowcount == 1
+            else:
+                # the campaign continued
+                assert isinstance(new_campaign_or_failure_reason, TopArbCampaign)
+                new_campaign = new_campaign_or_failure_reason
+
+                if campaign is None:
+                    curr.execute(
+                        'INSERT INTO active_campaigns (exchanges, directions, block_last_seen) VALUES (%s, %s, %s)',
+                        (
+                            [bytes.fromhex(x[2:]) for x in candidate.exchanges],
+                            [bytes.fromhex(x[2:]) for x, _ in candidate.directions],
+                            block_number,
+                        )
+                    )
+                    assert curr.rowcount == 1
+                else:
+                    curr.execute(
+                        'UPDATE active_campaigns SET block_last_seen = %s WHERE exchanges = %s AND directions = %s',
+                        (
+                            block_number,
+                            [bytes.fromhex(x[2:]) for x in candidate.exchanges],
+                            [bytes.fromhex(x[2:]) for x, _ in candidate.directions],
+                        )
+                    )
+                    assert curr.rowcount == 1
+                active_campaigns[candidate.campaign_key] = new_campaign
+
+        # If there's any campaign we still think is active, where an exchange was updated
+        # this block, but we didn't see a canddiate, then the campaign ended last block
+        curr.execute(
+            '''
+            DELETE
+            FROM active_campaigns ac
+            WHERE ac.block_last_seen < %(block_number)s AND EXISTS(
+                    SELECT 1
+                    FROM exchanges_updated_in_block
+                    WHERE block_number = %(block_number)s AND exchange_address = ANY(ac.exchanges)
+                )
+            RETURNING ac.exchanges, ac.directions
+            ''',
+            {
+                'block_number': block_number,
+            }
+        )
+        for bexchanges, bdirections in curr.fetchall():
+            exchanges = [web3.Web3.toChecksumAddress(x.tobytes()) for x in bexchanges]
+            directions = [web3.Web3.toChecksumAddress(x.tobytes()) for x in bdirections]
+            directions = list(zip(directions, directions[1:] + [directions[0]]))
+            campaign_key = (tuple(exchanges), tuple(directions))
+            
+            campaign = active_campaigns[campaign_key]
+            del active_campaigns[campaign_key]
+            completed_campaigns.append(campaign)
+
+        l.info(f'Have {len(active_campaigns)} top arbitrage campaigns, {len(completed_campaigns)} that terminated in block {block_number}')
+
+        # commit details of failed relays
+        psycopg2.extras.execute_batch(
+            curr,
+            '''
+            INSERT INTO top_candidate_arbitrage_relay_results (candidate_arbitrage_id, shoot_success, failure_reason)
+            VALUES (%s, false, %s)
+            ''',
+            failed_relays,
+        )
+
+        # get an ID for all fee objects
+        fee_key_to_assigned_fee_ids = {}
+        fee_to_id = {}
+        for completed_campaign in completed_campaigns:
+            for _, member in completed_campaign.members:
+                for fee in member.token_fees_used:
+                    fee_key = fee._replace(updated_on = None)
+                    if fee_key in fee_key_to_assigned_fee_ids:
+                        fee_to_id[fee] = fee_key_to_assigned_fee_ids[fee_key]
+                    else:
+                        curr.execute(
+                            '''
+                            INSERT INTO inferred_token_fee_on_transfer
+                            (token_id, fee, round_down, from_address, to_address, block_number_inferred, updated_on)
+                            SELECT id, %(fee)s, %(round_down)s, %(from_address)s, %(to_address)s, %(block_number)s, now()::timestamp
+                            FROM tokens
+                            WHERE address = %(token_address)s
+                            RETURNING id
+                            ''',
+                            {
+                                'fee':           fee.fee,
+                                'round_down':    fee.round_down,
+                                'from_address':  bytes.fromhex(fee.from_address[2:]),
+                                'to_address':    bytes.fromhex(fee.to_address[2:]),
+                                'block_number':  block_number,
+                                'token_address': bytes.fromhex(fee.token[2:])
+                            }
+                        )
+                        assert curr.rowcount == 1
+                        (fee_id,) = curr.fetchone()
+                        fee_to_id[fee] = fee_id
+                        fee_key_to_assigned_fee_ids[fee_key] = fee_id
+
+        # commit details of completed campaigns
+        for completed_campaign in completed_campaigns:
+            # get a campaign id
+            curr.execute(
+                '''
+                INSERT INTO top_candidate_arbitrage_campaigns (exchanges, directions, start_block, end_block)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                ''',
+                (
+                    [bytes.fromhex(x[2:]) for x in completed_campaign.exchanges],
+                    [bytes.fromhex(x[2:]) for x, _ in completed_campaign.directions],
+                    completed_campaign.start_block,
+                    completed_campaign.end_block,
+                )
+            )
+            assert curr.rowcount == 1
+            (campaign_id,) = curr.fetchone()
+
+            # insert each of the members
+            for candidate_id, relay_details in completed_campaign.members:
+                curr.execute(
+                    '''
+                    INSERT INTO top_candidate_arbitrage_relay_results
+                    (campaign_id, candidate_arbitrage_id, shoot_success, gas_used, had_fee_on_xfer_token, real_profit_before_fee)
+                    VALUES (%(campaign_id)s, %(candidate_id)s, true, %(gas_used)s, %(had_fee)s, %(real_profit)s)
+                    RETURNING id
+                    ''',
+                    {
+                        'campaign_id': campaign_id,
+                        'candidate_id': candidate_id,
+                        'gas_used': relay_details.gas,
+                        'had_fee': len(relay_details.token_fees_used) > 0,
+                        'real_profit': relay_details.profit_no_fee
+                    }
+                )
+                assert curr.rowcount == 1
+                (result_id,) = curr.fetchone()
+
+                psycopg2.extras.execute_batch(
+                    curr,
+                    '''
+                    INSERT INTO top_candidate_arbitrage_relay_results_used_fees (top_candidate_arbitrage_relay_result_id, fee_used)
+                    VALUES (%s, %s)
+                    ''',
+                    [(result_id, fee_to_id[fee]) for fee in relay_details.token_fees_used]
+                )
+
+        # update progress
+        curr.execute(
+            'UPDATE top_candidate_arbitrage_reservations SET progress = %s WHERE id = %s',
+            (block_number, reservation_id)
+        )
+        if not DEBUG: curr.connection.commit()
+
+    # work done, close rolling window
+    while len(rolling_window) > 0:
+        _, proc, tmpd, _ = rolling_window.popleft()
+        proc: subprocess.Popen
+        tmpd: tempfile.TemporaryDirectory
+        proc.kill()
+        proc.wait()
+        assert proc.poll() is not None
+        tmpd.cleanup()
+
+
+def relay_top_candidate(
+        w3: web3.Web3,
+        curr: psycopg2.extensions.cursor,
+        account: LocalAccount,
+        relayer_address: str,
+        timestamp_to_use: int,
+        w3_ganaches: typing.List[typing.Tuple[int, web3.Web3]],
+        candidate: CandidateArbitrage,
+        fa: FoundArbitrage,
+        maybe_campaign: typing.Optional[TopArbCampaign],
+        worker_id: int,
+    ) -> typing.Union[TopArbCampaign, str]:
+    l.debug(f'block is {w3_ganaches[10][1].eth.block_number}')
+    fee_calculator = InferredTokenTransferFeeCalculator()
+
+    assert w3_ganaches[10][1].eth.block_number > candidate.block_number
+    assert w3_ganaches[10][0] == candidate.block_number, f'incorrect block number in ganaches list'
+
+    # attempt relay
+    try:
+        result = auto_adapt_attempt_shoot_candidate(
+            w3_ganaches[10][1],
+            account,
+            relayer_address,
+            fa,
+            fee_calculator,
+            timestamp=timestamp_to_use,
+            must_recompute = False,
+        )
+    except NotEnoughLiquidityException:
+        l.critical(f'Problem with relaying ... trying with recompute on')
+        result = auto_adapt_attempt_shoot_candidate(
+            w3_ganaches[10][1],
+            account,
+            relayer_address,
+            fa,
+            fee_calculator,
+            timestamp=timestamp_to_use,
+            must_recompute = True,
+        )
+
+    if not isinstance(result, AutoAdaptShootSuccess):
+        # failed, return None indicating that campaign is over
+        if isinstance(result, DiagnosisBrokenToken):
+            assert result.token_address not in KNOWN_TOKENS, f'Token {result.token_address} should not be banned ever'
+            l.debug(f'Candidate {candidate.id_} used a broken token: {result.token_address}')
+            return f'Broken token: {result.token_address}'
+        elif isinstance(result, DiagnosisBadExchange):
+            l.debug(f'Candidate {candidate.id_} used a bad exchange: {result.exchange}')
+            return f'Bad exchange: {result.exchange}'
+        elif isinstance(result, DiagnosisOther):
+            l.debug(f'Candidate {candidate.id_} had undiagnosed failure')
+            return f'Other failure'
+        elif isinstance(result, DiagnosisNoArbitrageOnFeeApplied):
+            l.debug(f'Candidate {candidate.id_} had no arbitrage after applying fee')
+            return f'No arbitrage after fee'
+        elif isinstance(result, DiagnosisExchangeInterference):
+            l.debug(f'Candidate {candidate.id_} could not be relayed because of exchange interference')
+            return f'token-exchange interference'
+        elif isinstance(result, DiagnosisIncompatibleToken):
+            l.debug(f'Candidate {candidate.id_} used an incompatible token: {result.token_address}')
+            return f'incompatible token {result.token_address}'
+        else:
+            raise Exception(f'Not sure what this is: {result}')
+    else:
+        # success
+        l.debug(f'Candidate {candidate.id_} relay success')
+        if maybe_campaign is not None:
+            # campaign is ongonig, simply append and return
+            return maybe_campaign._replace(members = maybe_campaign.members + [(candidate.id_, result)])
+        # campaign is not ongoing, we need to reach backward
+        l.debug(f'Reaching backward!')
+
+        in_progress_campaign = TopArbCampaign(
+            start_block = candidate.block_number,
+            end_block = candidate.block_number,
+            members = [(candidate.id_, result)],
+            exchanges = candidate.exchanges,
+            directions = candidate.directions
+        )
+
+        last_backward_block = candidate.block_number
+        while True:
+            curr.execute(
+                '''
+                SELECT ca.id, ca.block_number, ca.amount_in, ca.profit_no_fee
+                FROM (
+                    SELECT block_number
+                    FROM exchanges_updated_in_block
+                    WHERE exchange_address = ANY(%(exchanges)s) AND block_number < %(block_number)s
+                    ORDER BY block_number DESC
+                    LIMIT 1
+                ) eub
+                LEFT JOIN candidate_arbitrages ca
+                    ON ca.block_number = eub.block_number AND
+                       ca.exchanges = %(exchanges)s AND
+                       ca.directions = %(directions)s
+                LIMIT 1
+                ''',
+                {
+                    'exchanges': [bytes.fromhex(x[2:]) for x in candidate.exchanges],
+                    'directions': [bytes.fromhex(x[2:]) for x, _ in candidate.directions],
+                    'block_number': last_backward_block
+                }
+            )
+            older_id, older_block_number, older_amount_in, older_profit = curr.fetchone()
+
+            if older_id is None:
+                # nothing older available
+                return in_progress_campaign
+
+            older_amount_in = int(older_amount_in)
+            older_profit = int(older_profit)
+
+            blocks_ago = candidate.block_number - older_block_number
+            l.info(f'Found prior candidate at {older_block_number:,} ({blocks_ago:,} behind) makes {older_profit / (10 ** 18):.4f} ETH')
+
+            # find the ganache service if open
+            if blocks_ago <= 10:
+                proc = None
+                tmpd = None
+                w3_ganache_past = w3_ganaches[10 - blocks_ago][1]
+                assert w3_ganaches[10 - blocks_ago][0] == older_block_number
+            else:
+                tmpd = tempfile.TemporaryDirectory(dir='/mnt/goldphish/tmp')
+                proc, w3_ganache_past, _, _ = open_ganache(older_block_number, tmpd.name, worker_id * 2 + 1)
+
+            older_fa = FoundArbitrage(
+                amount_in = older_amount_in,
+                circuit = [load_pricer_for(w3_ganache_past, curr, x) for x in candidate.exchanges],
+                directions = fa.directions,
+                pivot_token = fa.pivot_token,
+                profit = older_profit,
+            )
+            older_timestamp = get_block_timestamp(w3, older_block_number + 1)
+
+            # attempt relay
+            l.debug(f'at block {w3_ganache_past.eth.block_number}')
+            try:
+                older_result = auto_adapt_attempt_shoot_candidate(
+                    w3_ganache_past,
+                    account,
+                    relayer_address,
+                    older_fa,
+                    fee_calculator,
+                    timestamp=older_timestamp,
+                    must_recompute = len(result.token_fees_used) > 0,
+                )
+            except NotEnoughLiquidityException:
+                l.critical(f'Problem with relaying ... trying with recompute on')
+                older_result = auto_adapt_attempt_shoot_candidate(
+                    w3_ganaches[10][1],
+                    account,
+                    relayer_address,
+                    fa,
+                    fee_calculator,
+                    timestamp=older_timestamp,
+                    must_recompute = True,
+                )
+
+            if proc is not None:
+                proc.kill()
+                proc.wait()
+                tmpd.cleanup()
+
+            if not isinstance(older_result, AutoAdaptShootSuccess):
+                # failed, campaign starts there
+                l.debug(F'Prior arbitrage id={older_id} failed')
+                return in_progress_campaign
+            else:
+                l.debug(f'Prior arbitrage id={older_id} success')
+                in_progress_campaign = in_progress_campaign._replace(members = [(older_id, older_result)] + in_progress_campaign.members)
+                in_progress_campaign = in_progress_campaign._replace(start_block = older_block_number)
+                last_backward_block = older_block_number
 
 
 def load_pricer_for(
