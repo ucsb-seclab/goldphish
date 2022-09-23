@@ -880,7 +880,7 @@ class UniswapV3Pricer(BaseExchangePricer):
 
 
         block_num = receipts[0]['blockNumber']
-        assert self.last_block_observed is None or self.last_block_observed < block_num
+        # assert self.last_block_observed is None or self.last_block_observed < block_num
         self.last_block_observed = block_num
 
         received_log = False
@@ -902,6 +902,7 @@ class UniswapV3Pricer(BaseExchangePricer):
                 )
                 self.liquidity_cache = liquidity
 
+                # NOTE: not important to force load, not used for pricing purposes
                 if self.known_token0_balance is not None:
                     self.known_token0_balance += swap['args']['amount0']
                 if self.known_token1_balance is not None:
@@ -912,6 +913,7 @@ class UniswapV3Pricer(BaseExchangePricer):
                     event = generic_uv3.events.Burn().processLog(log)
                     amount = -event['args']['amount']
 
+                    # NOTE: not important to force load, not used for pricing purposes
                     if self.known_token0_balance is not None:
                         self.known_token0_balance -= event['args']['amount0']
                     if self.known_token1_balance is not None:

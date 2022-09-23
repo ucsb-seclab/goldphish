@@ -131,7 +131,7 @@ class UniswapV2Pricer(BaseExchangePricer):
         denominator = (bal1 - amount_out) * 997
         return (numerator // denominator) + 1
 
-    def get_value_locked(self, token_address: str, block_identifier: int) -> int:
+    def get_value_locked(self, token_address: str, block_identifier: int, **_) -> int:
         bal0, bal1 = self.get_balances(block_identifier)
         if token_address == self.token0:
             return bal0
@@ -143,7 +143,7 @@ class UniswapV2Pricer(BaseExchangePricer):
     def get_token_weight(self, token_address: str, block_identifier: int) -> decimal.Decimal:
         return decimal.Decimal('0.5')
 
-    def observe_block(self, receipts: typing.List[web3.types.LogReceipt]) -> BlockObservationResult:
+    def observe_block(self, receipts: typing.List[web3.types.LogReceipt], **_) -> BlockObservationResult:
         """
         Observe the logs emitted in a block and update internal state appropriately.
         NOTE: receipts _must_ be in sorted order of increasing log index

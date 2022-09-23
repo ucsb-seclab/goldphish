@@ -26,6 +26,246 @@ setup_logging()
 l = logging.getLogger(__name__)
 
 w3 = connect_web3()
+db = connect_db()
+
+curr = db.cursor()
+
+curr.execute('SELECT address FROM balancer_v2_exchanges ORDER BY RANDOM() LIMIT 100')
+
+for (baddr,) in curr.fetchall():
+    address = w3.toChecksumAddress(baddr.tobytes())
+    contract: web3.contract.Contract = w3.eth.contract(
+        address=address,
+        abi = get_abi('balancer_v2/LiquidityBootstrappingPool.json'),
+    )
+
+sel = contract.functions.getSwapFeePercentage().selector
+print('getSwapFeePercentage', contract.functions.getSwapFeePercentage().call(block_identifier='latest'))
+print(sel)
+
+txn = {
+    'from': w3.toChecksumAddress(b'\x00'*20),
+    'to': contract.address,
+    'data': sel # + (bytes.fromhex(token[2:])).rjust(32, b'\x00').hex()
+}
+resp = w3.provider.make_request('debug_traceCall', [txn, "latest", {"enableMemory": True}])
+
+with open('trace.txt', mode='w') as fout:
+    for sl in resp['result']['structLogs']:
+        fout.write(str(sl) + '\n')
+
+
+exit()
+
+curr.execute('SELECT address FROM balancer_exchanges ORDER BY RANDOM() LIMIT 100')
+
+for (baddr,) in curr.fetchall():
+    address = w3.toChecksumAddress(baddr.tobytes())
+    contract: web3.contract.Contract = w3.eth.contract(
+        address=address,
+        abi = get_abi('balancer_v1/bpool.abi.json'),
+    )
+
+    for token in contract.functions.getCurrentTokens().call(block_identifier='latest')[:1]:
+        slot_base = w3.keccak(bytes.fromhex(token[2:]).rjust(32, b'\x00') + b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0a')
+        slot = int.to_bytes(int.from_bytes(slot_base, byteorder='big', signed=False) + 0x2, length=32, byteorder='big', signed=False)
+        
+        bbal = w3.eth.get_storage_at(contract.address, slot.hex(), 'latest')
+        weight = int.from_bytes(bbal, byteorder='big', signed=False)
+
+        got_weight = contract.functions.getDenormalizedWeight(token).call(block_identifier='latest')
+        assert weight == got_weight
+
+sel = contract.functions.getDenormalizedWeight(token).selector
+print(sel)
+
+txn = {
+    'from': w3.toChecksumAddress(b'\x00'*20),
+    'to': contract.address,
+    'data': sel + (bytes.fromhex(token[2:])).rjust(32, b'\x00').hex()
+}
+resp = w3.provider.make_request('debug_traceCall', [txn, "latest", {"enableMemory": True}])
+
+with open('trace.txt', mode='w') as fout:
+    for sl in resp['result']['structLogs']:
+        fout.write(str(sl) + '\n')
+
+
+exit()
+
+for (baddr,) in curr.fetchall():
+    address = w3.toChecksumAddress(baddr.tobytes())
+    contract: web3.contract.Contract = w3.eth.contract(
+        address=address,
+        abi = get_abi('balancer_v1/bpool.abi.json'),
+    )
+
+    for token in contract.functions.getCurrentTokens().call(block_identifier='latest')[:1]:
+        slot_base = w3.keccak(bytes.fromhex(token[2:]).rjust(32, b'\x00') + b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0a')
+        slot = int.to_bytes(int.from_bytes(slot_base, byteorder='big', signed=False) + 0x3, length=32, byteorder='big', signed=False)
+        
+        bbal = w3.eth.get_storage_at(contract.address, slot.hex(), 'latest')
+        balance = int.from_bytes(bbal, byteorder='big', signed=False)
+
+        got_balance = contract.functions.getBalance(token).call(block_identifier='latest')
+        assert balance == got_balance
+
+sel = contract.functions.getBalance(token).selector
+print(sel)
+
+txn = {
+    'from': w3.toChecksumAddress(b'\x00'*20),
+    'to': contract.address,
+    'data': sel + (bytes.fromhex(token[2:])).rjust(32, b'\x00').hex()
+}
+resp = w3.provider.make_request('debug_traceCall', [txn, "latest", {"enableMemory": True}])
+
+with open('trace.txt', mode='w') as fout:
+    for sl in resp['result']['structLogs']:
+        fout.write(str(sl) + '\n')
+
+
+
+exit()
+
+for (baddr,) in curr.fetchall():
+    address = w3.toChecksumAddress(baddr.tobytes())
+    contract: web3.contract.Contract = w3.eth.contract(
+        address=address,
+        abi = get_abi('balancer_v1/bpool.abi.json'),
+    )
+
+    bpublic_swap = w3.eth.get_storage_at(contract.address, '0x6', 'latest')
+    public_swap = (int.from_bytes(bpublic_swap, byteorder='big', signed=False) >> 0xa0) != 0
+
+    got_public_swap = contract.functions.isPublicSwap().call(block_identifier='latest')
+    if got_public_swap == False:
+        print('got false!!!')
+    assert got_public_swap == public_swap
+
+sel = contract.functions.isPublicSwap().selector
+print(sel)
+
+txn = {
+    'from': w3.toChecksumAddress(b'\x00'*20),
+    'to': contract.address,
+    'data': sel
+}
+resp = w3.provider.make_request('debug_traceCall', [txn, "latest", {"enableMemory": True}])
+
+with open('trace.txt', mode='w') as fout:
+    for sl in resp['result']['structLogs']:
+        fout.write(str(sl) + '\n')
+
+
+exit()
+curr.execute('SELECT address FROM balancer_exchanges ORDER BY RANDOM() LIMIT 100')
+
+for (baddr,) in curr.fetchall():
+    address = w3.toChecksumAddress(baddr.tobytes())
+    contract: web3.contract.Contract = w3.eth.contract(
+        address=address,
+        abi = get_abi('balancer_v1/bpool.abi.json'),
+    )
+
+    bswap_fee = w3.eth.get_storage_at(contract.address, '0x7', 'latest')
+    swap_fee = int.from_bytes(bswap_fee, byteorder='big', signed=False)
+    print('swap_fee?', swap_fee)
+    
+    got_swap_fee = contract.functions.getSwapFee().call(block_identifier='latest')
+    print('swap fee ', got_swap_fee)
+
+    assert swap_fee == got_swap_fee
+
+sel = contract.functions.getSwapFee().selector
+print(sel)
+
+txn = {
+    'from': w3.toChecksumAddress(b'\x00'*20),
+    'to': contract.address,
+    'data': sel
+}
+resp = w3.provider.make_request('debug_traceCall', [txn, "latest", {"enableMemory": True}])
+
+with open('trace.txt', mode='w') as fout:
+    for sl in resp['result']['structLogs']:
+        fout.write(str(sl) + '\n')
+
+
+exit()
+
+for (baddr,) in curr.fetchall():
+    address = w3.toChecksumAddress(baddr.tobytes())
+    contract: web3.contract.Contract = w3.eth.contract(
+        address=address,
+        abi = get_abi('balancer_v1/bpool.abi.json'),
+    )
+
+    bfinalized = w3.eth.get_storage_at(contract.address, '0x8', 'latest')
+    print(bfinalized)
+    finalized = bfinalized[-1] != 0
+
+    got_finalized = contract.functions.isFinalized().call(block_identifier='latest')
+    assert finalized == got_finalized, f'{finalized} != {got_finalized}'
+
+sel = contract.functions.isFinalized().selector
+print(sel)
+
+txn = {
+    'from': w3.toChecksumAddress(b'\x00'*20),
+    'to': contract.address,
+    'data': sel
+}
+resp = w3.provider.make_request('debug_traceCall', [txn, "latest", {"enableMemory": True}])
+
+with open('trace.txt', mode='w') as fout:
+    for sl in resp['result']['structLogs']:
+        fout.write(str(sl) + '\n')
+
+exit()
+
+for (baddr,) in curr.fetchall():
+    address = w3.toChecksumAddress(baddr.tobytes())
+    contract: web3.contract.Contract = w3.eth.contract(
+        address=address,
+        abi = get_abi('balancer_v1/bpool.abi.json'),
+    )
+
+    bn_tokens = w3.eth.get_storage_at(contract.address, '0x9', 'latest')
+    n_tokens = int.from_bytes(bn_tokens, byteorder='big', signed=False)
+    print('n_tokens=', n_tokens)
+    base = int.from_bytes(bytes.fromhex('6e1540171b6c0c960b71a7020d9f60077f6af931a8bbf590da0223dacf75c7af'), byteorder='big', signed=False)
+
+    tokens = []
+
+    for i in range(n_tokens):
+        token_slot = int.to_bytes(base + i, length=32, byteorder='big', signed=False)
+        hex_token_slot = '0x' + token_slot.hex()
+        btoken = w3.eth.get_storage_at(contract.address, hex_token_slot, 'latest')
+        assert btoken[0:12] == b'\x00'*12
+        token = w3.toChecksumAddress(btoken[12:])
+        tokens.append(token)
+        print('token', token)
+    
+    got = contract.functions.getCurrentTokens().call(block_identifier='latest')
+    assert set(got) == set(tokens)
+
+
+# sel = contract.functions.getCurrentTokens().selector
+# print(sel)
+
+# txn = {
+#     'from': w3.toChecksumAddress(b'\x00'*20),
+#     'to': contract.address,
+#     'data': sel
+# }
+# resp = w3.provider.make_request('debug_traceCall', [txn, "latest", {"enableMemory": True}])
+
+# with open('trace.txt', mode='w') as fout:
+#     for sl in resp['result']['structLogs']:
+#         fout.write(str(sl) + '\n')
+
+exit()
 
 p1 = UniswapV2Pricer(
     w3,

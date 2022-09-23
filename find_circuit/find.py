@@ -81,8 +81,8 @@ class PricingCircuit:
 
     def copy(self) -> 'PricingCircuit':
         return PricingCircuit(
-            self.circuit,
-            self.directions
+            self.circuit.copy(),
+            self.directions.copy()
         )
 
     def sample(

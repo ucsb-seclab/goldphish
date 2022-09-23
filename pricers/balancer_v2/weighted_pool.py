@@ -177,7 +177,7 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
 
         return decimal.Decimal(norm) / decimal.Decimal(ONE)
 
-    def observe_block(self, logs: typing.List[web3.types.LogReceipt]) -> BlockObservationResult:
+    def observe_block(self, logs: typing.List[web3.types.LogReceipt], force_load: bool = False) -> BlockObservationResult:
         tokens_modified = set()
 
         for log in logs:
@@ -200,6 +200,11 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
                     token_out  = parsed['args']['tokenOut']
                     amount_in  = parsed['args']['amountIn']
                     amount_out = parsed['args']['amountOut']
+
+                    if force_load and token_in not in self._balance_cache:
+                        self.get_balance(token_in, block_number - 1)
+                    if force_load and token_out not in self._balance_cache:
+                        self.get_balance(token_out, block_number - 1)
 
                     if token_in in self._balance_cache:
                         self._balance_cache[token_in] += amount_in
@@ -236,6 +241,9 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
                     for t, b_delta in zip(parsed['args']['tokens'], parsed['args']['deltas']):
                         if self.tokens is not None:
                             assert t in self.tokens
+
+                        if force_load and t not in self._balance_cache:
+                            self.get_balance(t, block_number - 1)
 
                         if t in self._balance_cache:
                             self._balance_cache[t] += b_delta

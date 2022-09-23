@@ -21,6 +21,7 @@ import backtest.top_of_block.relay
 import backtest.top_of_block.fill_arb_duration
 import backtest.top_of_block.generate_sample
 import backtest.top_of_block.fill_top_arbitrages
+import backtest.top_of_block.fill_closure
 
 from utils import connect_web3, setup_logging
 
@@ -29,6 +30,7 @@ l = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
+    parser.add_argument('-v', '--verbose', action='store_true')
 
     subparser = parser.add_subparsers(help='subcommand', dest='subcommand')
     
@@ -58,13 +60,16 @@ def main():
     cmd, handler = backtest.top_of_block.relay.add_args(subparser)
     handlers[cmd] = handler
 
+    cmd, handler = backtest.top_of_block.fill_closure.add_args(subparser)
+    handlers[cmd] = handler
+
     args = parser.parse_args()
 
     if args.worker_name is None:
         args.worker_name = socket.gethostname()
 
     job_name = 'top_block_' + args.subcommand
-    setup_logging(job_name, suppress=['shooter.deploy'], worker_name = args.worker_name)
+    setup_logging(job_name, suppress=['shooter.deploy'], worker_name = args.worker_name, stdout_level= logging.DEBUG if args.verbose else logging.INFO)
 
     l.info('Booting up...')
 

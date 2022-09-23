@@ -42,6 +42,8 @@ LOG_JOIN_TOPIC = event_abi_to_log_topic(_base_balancer.events.LOG_JOIN().abi)
 LOG_EXIT_TOPIC = event_abi_to_log_topic(_base_balancer.events.LOG_EXIT().abi)
 LOG_SWAP_TOPIC = event_abi_to_log_topic(_base_balancer.events.LOG_SWAP().abi)
 
+TOKEN_BASE_SLOT = int.from_bytes(bytes.fromhex('6e1540171b6c0c960b71a7020d9f60077f6af931a8bbf590da0223dacf75c7af'), byteorder='big', signed=False)
+
 class NotFinalizedException(Exception):
 
     def __init__(self, *args: object) -> None:
@@ -65,7 +67,6 @@ class BalancerPricer(BaseExchangePricer):
     finalized: typing.Optional[bool]
     tokens: typing.Optional[typing.Set[str]]
     address: str
-    contract: web3.contract.Contract
     swap_fee: typing.Optional[int]
     token_denorms: typing.Dict[str, int]
 
@@ -76,10 +77,6 @@ class BalancerPricer(BaseExchangePricer):
     def __init__(self, w3: web3.Web3, address: str) -> None:
         self.address = address
         self.w3 = w3
-        self.contract: web3.contract.Contract = w3.eth.contract(
-            address=address,
-            abi = get_abi('balancer_v1/bpool.abi.json'),
-        )
 
         self.finalized = None
         self.tokens = None
@@ -91,20 +88,42 @@ class BalancerPricer(BaseExchangePricer):
     def get_tokens(self, block_identifier: int) -> typing.Set[str]:
         if self.tokens is None:
             # no cache, get the list of tokens
-            ts = self.contract.functions.getCurrentTokens().call(block_identifier=block_identifier)
-            self.tokens = set(ts)
+            bn_tokens = self.w3.eth.get_storage_at(self.address, '0x9', block_identifier)
+            n_tokens = int.from_bytes(bn_tokens, byteorder='big', signed=False)
+
+            tokens = set()
+
+            for i in range(n_tokens):
+                token_slot = int.to_bytes(TOKEN_BASE_SLOT + i, length=32, byteorder='big', signed=False)
+                hex_token_slot = '0x' + token_slot.hex()
+                btoken = self.w3.eth.get_storage_at(self.address, hex_token_slot, block_identifier).rjust(32, b'\x00')
+                assert btoken[0:12] == b'\x00'*12
+
+                token = self.w3.toChecksumAddress(btoken[12:])
+                tokens.add(token)
+
+            self.tokens = tokens
         return self.tokens
 
     def get_finalized(self, block_identifier: int) -> bool:
         if self.finalized is None:
-            f = self.contract.functions.isFinalized().call(block_identifier=block_identifier)
-            self.finalized = f
+            bfinalized = self.w3.eth.get_storage_at(self.address, '0x8', block_identifier)
+            self.finalized = bfinalized[-1] != 0
         return self.finalized
 
     def get_balance(self, address: str, block_identifier: int) -> int:
         assert address in self.tokens
         if address not in self._balance_cache:
-            self._balance_cache[address] = self.contract.functions.getBalance(address).call(block_identifier=block_identifier)
+            slot_base = self.w3.keccak(
+                bytes.fromhex(address[2:]).rjust(32, b'\x00') +
+                b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0a'
+            )
+            slot = int.to_bytes(int.from_bytes(slot_base, byteorder='big', signed=False) + 0x3, length=32, byteorder='big', signed=False)
+
+            bbal = self.w3.eth.get_storage_at(self.address, slot.hex(), block_identifier)
+            balance = int.from_bytes(bbal, byteorder='big', signed=False)
+
+            self._balance_cache[address] = balance
         return self._balance_cache[address]
 
     def get_public_swap(self, block_identifier: int) -> bool:
@@ -113,19 +132,28 @@ class BalancerPricer(BaseExchangePricer):
                 # finalized implies _publicSwap
                 self._public_swap = True
             else:
-                self._public_swap = self.contract.functions.isPublicSwap().call(block_identifier=block_identifier)
+                bpublic_swap = self.w3.eth.get_storage_at(self.address, '0x6', block_identifier)
+                self._public_swap = (int.from_bytes(bpublic_swap, byteorder='big', signed=False) >> 0xa0) != 0
         return self._public_swap
 
     def get_swap_fee(self, block_identifier: int) -> int:
         if self.swap_fee is None:
-            swap_fee = self.contract.functions.getSwapFee().call(block_identifier=block_identifier)
-            self.swap_fee = swap_fee
+            bswap_fee = self.w3.eth.get_storage_at(self.address, '0x7', block_identifier)
+            self.swap_fee = int.from_bytes(bswap_fee, byteorder='big', signed=False)
         return self.swap_fee
 
     def get_denorm_weight(self, address: str, block_identifier: int) -> int:
         if address not in self.token_denorms:
-            denorm = self.contract.functions.getDenormalizedWeight(address).call(block_identifier=block_identifier)
-            self.token_denorms[address] = denorm
+            slot_base = self.w3.keccak(
+                bytes.fromhex(address[2:]).rjust(32, b'\x00') +
+                b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0a'
+            )
+            slot = int.to_bytes(int.from_bytes(slot_base, byteorder='big', signed=False) + 0x2, length=32, byteorder='big', signed=False)
+
+            bweight = self.w3.eth.get_storage_at(self.address, slot.hex(), block_identifier)
+            weight = int.from_bytes(bweight, byteorder='big', signed=False)
+
+            self.token_denorms[address] = weight
         return self.token_denorms[address]
 
     def token_out_for_exact_in(self, token_in: str, token_out: str, token_amount_in: int, block_identifier: int, **_):
@@ -227,9 +255,14 @@ class BalancerPricer(BaseExchangePricer):
 
         return decimal.Decimal(self.get_denorm_weight(token_address, block_identifier)) / decimal.Decimal(_tot_weight)
 
-    def observe_block(self, logs: typing.List[web3.types.LogReceipt]) -> BlockObservationResult:
+    def observe_block(self, logs: typing.List[web3.types.LogReceipt], force_load: bool = False) -> BlockObservationResult:
         just_finalized = False
         tokens_modified = set()
+
+        if len(logs) == 0:
+            return
+
+        block_number = logs[0]['blockNumber']
 
         # LOG_JOIN, LOG_EXIT, LOG_SWAP
         for log in logs:
@@ -237,9 +270,12 @@ class BalancerPricer(BaseExchangePricer):
 
                 # add liquidity
                 if log['topics'][0] == LOG_JOIN_TOPIC:
-                    parsed = self.contract.events.LOG_JOIN().processLog(log)
+                    parsed = _base_balancer.events.LOG_JOIN().processLog(log)
                     token = parsed['args']['tokenIn']
                     amount = parsed['args']['tokenAmountIn']
+
+                    if force_load and token not in self._balance_cache:
+                        self.get_balance(token, block_number - 1)
 
                     if token in self._balance_cache:
                         self._balance_cache[token] += amount
@@ -248,9 +284,12 @@ class BalancerPricer(BaseExchangePricer):
 
                 # remove liquidity
                 elif log['topics'][0] == LOG_EXIT_TOPIC:
-                    parsed = self.contract.events.LOG_EXIT().processLog(log)
+                    parsed = _base_balancer.events.LOG_EXIT().processLog(log)
                     token = parsed['args']['tokenOut']
                     amount = parsed['args']['tokenAmountOut']
+
+                    if force_load and token not in self._balance_cache:
+                        self.get_balance(token, block_number - 1)
 
                     if token in self._balance_cache:
                         old_bal = self._balance_cache[token]
@@ -261,11 +300,16 @@ class BalancerPricer(BaseExchangePricer):
 
                 # perform a swap
                 elif log['topics'][0] == LOG_SWAP_TOPIC:
-                    parsed = self.contract.events.LOG_SWAP().processLog(log)
+                    parsed = _base_balancer.events.LOG_SWAP().processLog(log)
                     token_in = parsed['args']['tokenIn']
                     token_out = parsed['args']['tokenOut']
                     amount_in = parsed['args']['tokenAmountIn']
                     amount_out = parsed['args']['tokenAmountOut']
+
+                    if force_load and token_in not in self._balance_cache:
+                        self.get_balance(token_in, block_number - 1)
+                    if force_load and token_out not in self._balance_cache:
+                        self.get_balance(token_out, block_number - 1)
 
                     if token_in in self._balance_cache:
                         self._balance_cache[token_in] += amount_in
@@ -281,6 +325,9 @@ class BalancerPricer(BaseExchangePricer):
                 elif log['topics'][0] == GULP_TOPIC:
                     payload = bytes.fromhex(log['data'][136+2:])
                     token_address = web3.Web3.toChecksumAddress(payload[12:32])
+
+                    if force_load:
+                        raise Exception('cannot force load on GULP')
 
                     if token_address in self._balance_cache:
                         # this cache is invalidated, unfortunately we don't know what balance is now
@@ -323,11 +370,11 @@ class BalancerPricer(BaseExchangePricer):
                 elif log['topics'][0] == FINALIZE_TOPIC:
                     # these are now immutable
                     if self.tokens is None:
-                        ts = self.contract.functions.getCurrentTokens().call(block_identifier=log['blockNumber'])
-                        self.tokens = set(ts)
+                        self.tokens = None
+                        self.get_tokens(block_identifier=log['blockNumber'])
                     if self.swap_fee is None:
-                        swap_fee = self.contract.functions.getSwapFee().call(block_identifier=log['blockNumber'])
-                        self.swap_fee = swap_fee
+                        self.swap_fee = None
+                        self.get_swap_fee(block_identifier=log['blockNumber'])
 
                     self.finalized = True
                     self._public_swap = True
