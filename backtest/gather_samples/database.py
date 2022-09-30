@@ -251,3 +251,60 @@ def _insert_arb(w3: web3.Web3, curr: psycopg2.extensions.cursor, arb: Arbitrage,
                 )
     return arbitrage_id
 
+class InternalValueTransfer(typing.NamedTuple):
+    block_number: int
+    txn_hash: bytes
+    from_address: str
+    to_address: str
+    value: int
+
+
+def lookup_value_xfers_in_block(
+        w3: web3.Web3,
+        my_curr: psycopg2.extensions.cursor,
+        mainnet_curr: psycopg2.extensions.cursor,
+        block_number: int
+    ) -> typing.List[InternalValueTransfer]:
+    if 15_005_545 <= block_number <= 15_111_876:
+        # query from my db
+        my_curr.execute(
+            'SELECT txn_hash, from_address, to_address, value FROM internal_eth_xfers WHERE block_number = %s',
+            (block_number,)
+        )
+        return [
+            InternalValueTransfer(
+                block_number,
+                txn_hash.tobytes(),
+                w3.toChecksumAddress(from_address.tobytes()),
+                w3.toChecksumAddress(to_address.tobytes()),
+                int(value),
+            )
+            for txn_hash, from_address, to_address, value
+            in my_curr
+        ]
+    
+    # query from mainnet db
+    mainnet_curr.execute('SELECT EXISTS(SELECT FROM blocks WHERE block_number = %s)', (block_number,))
+    (has_block,) = mainnet_curr.fetchone()
+    
+    assert has_block, f'Did not find block {block_number:,}'
+    mainnet_curr.execute(
+        '''
+        SELECT transaction_hash, sender, receiver, value
+        FROM traces
+        WHERE block_number = %s and value > 0 and transaction_hash is not null
+        ''',
+        (block_number,)
+    )
+    print(f'queried block {block_number}')
+    return [
+        InternalValueTransfer(
+            block_number,
+            bytes.fromhex(txn_hash[2:]),
+            w3.toChecksumAddress(from_address),
+            w3.toChecksumAddress(to_address),
+            int(value),
+        )
+        for txn_hash, from_address, to_address, value
+        in mainnet_curr
+    ]

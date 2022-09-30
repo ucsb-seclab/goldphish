@@ -9,15 +9,18 @@ import typing
 import web3
 import web3.types
 import web3._utils.filters
+import psycopg2
 import psycopg2.extensions
 from backtest.gather_samples.analyses import get_arbitrage_if_exists
-from backtest.gather_samples.database import insert_arbs, setup_db
+from backtest.gather_samples.database import InternalValueTransfer, insert_arbs, lookup_value_xfers_in_block, setup_db
 
 from backtest.utils import ERC20_TRANSFER_TOPIC_HEX, ERC20_TRANSFER_TOPIC, CancellationToken, connect_db
 from utils import setup_logging, erc20
 from utils.throttler import BlockThrottle
 
 l = logging.getLogger(__name__)
+
+DEBUG = True
 
 def main():
     parser = argparse.ArgumentParser()
@@ -35,6 +38,20 @@ def main():
 
         db = connect_db()
         curr = db.cursor()
+
+        pg_host = os.getenv('MAINNET_PSQL_HOST', '128.111.49.111')
+        pg_port = int(os.getenv('MAINNET_PSQL_PORT', '5432'))
+        pg_pass = os.getenv('MAINNET_PSQL_PASS')
+        db_mainnet = psycopg2.connect(
+            host = pg_host,
+            port = pg_port,
+            user = 'p_nack',
+            password = pg_pass,
+            database = 'mainnet',
+        )
+        db_mainnet.autocommit = False
+        l.debug(f'connected to mainnet postgresql')
+        curr_mainnet = db_mainnet.cursor()
 
         setup_db(curr)
         curr.execute('SELECT MIN(start_block), MAX(end_block) FROM block_samples')
@@ -56,24 +73,41 @@ def main():
             l.error(f'Could not connect to web3')
             exit(1)
 
-        # # debug a transaction
-        # txn_hash = '0x4c4fd405de8f88d33570b2a27013e95f8ab8a5394cfe4a5fd9efea0120434f6f'
-        # btxn_hash = bytes.fromhex(txn_hash[2:])
-        # receipt = w3.eth.get_transaction_receipt(txn_hash)
-        # txns = []
-        # for r in receipt['logs']:
-        #     print(r)
-        #     if r['topics'][0] == ERC20_TRANSFER_TOPIC:
-        #         txns.append(erc20.events.Transfer().processLog(r))
+        # debug a transaction
+        txn_hash = '0xb2bb7225ebb2eec229df41f0d6f16613ac1ca683c48b1df7768d0340459a5081'
+        btxn_hash = bytes.fromhex(txn_hash[2:])
+        receipt = w3.eth.get_transaction_receipt(txn_hash)
+        print('to', receipt['to'])
+        xfers = lookup_value_xfers_in_block(w3, curr, curr_mainnet, receipt['blockNumber'])
+        xfers = list(filter(lambda x: x.txn_hash == btxn_hash, xfers))
+        txns = []
+        for r in receipt['logs']:
+            if r['topics'][0] == ERC20_TRANSFER_TOPIC:
+                txns.append(erc20.events.Transfer().processLog(r))
 
-        # print(txns)
-        # get_arbitrage_if_exists(
-        #     w3,
-        #     bytes.fromhex('4c4fd405de8f88d33570b2a27013e95f8ab8a5394cfe4a5fd9efea0120434f6f'),
-        #     txns,
-        # )
+        for xfer in xfers:
+            print(xfer.from_address, '->', xfer.to_address, xfer.value)
 
-        # return
+        ret = get_arbitrage_if_exists(
+            w3,
+            btxn_hash,
+            txns,
+            xfers
+        )
+        print()
+        print('REPORT')
+        print(f'Profit ......... {ret.only_cycle.profit_amount / (10 ** 18)} ETH')
+        print(f'Profit token ... {ret.only_cycle.profit_token}')
+        print(f'Profit taker ... {ret.only_cycle.profit_taker}')
+        print()
+        for cycle_exchange in ret.only_cycle.cycle:
+            print(f'{cycle_exchange.token_in} -> {cycle_exchange.token_out}')
+            for item in cycle_exchange.items:
+                print(f'    {item.address}: {item.amount_in} -> {item.amount_out}')
+        print()
+        print(ret)
+
+        return
 
 
         l.debug(f'Connected to web3, chainId={w3.eth.chain_id}')
@@ -88,7 +122,7 @@ def main():
 
             try:
                 with maybe_rez as (reservation_start, reservation_end):
-                    process_reservation(w3, curr, reservation_start, reservation_end, cancellation_token)
+                    process_reservation(w3, curr, curr_mainnet, reservation_start, reservation_end, cancellation_token)
             except ReservationCancelRequestedException:
                 pass
     except Exception:
@@ -122,7 +156,8 @@ class ReservationContextManager:
                 (self.id,)
             )
             assert self.curr.rowcount == 1
-            self.curr.connection.commit()
+            if not DEBUG:
+                self.curr.connection.commit()
         elif exc_type == ReservationCancelRequestedException:
             exc_value = typing.cast(ReservationCancelRequestedException, exc_value)
             if exc_value.remaining_start_block == self.start_block:
@@ -156,7 +191,8 @@ class ReservationContextManager:
                 assert self.curr.rowcount == 1
                 (new_reservation_id,) = self.curr.fetchone()
                 l.debug(f'split remaining work of reservation id={self.id} into id={new_reservation_id}')
-            self.curr.connection.commit()
+            if not DEBUG:
+                self.curr.connection.commit()
 
 BATCH_SIZE_BLOCKS = 1_000
 def setup_reservations(curr: psycopg2.extensions.cursor, start_block: int, end_block_inclusive: int):
@@ -244,11 +280,12 @@ def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_bloc
     Returns None when there are no more groups to process.
     """
     curr.execute('BEGIN TRANSACTION')
+    assert DEBUG == True
     curr.execute(
         '''
             SELECT id, from_block, to_block_exclusive
             FROM gather_sample_arbitrages_reservations
-            WHERE started_on IS NULL
+            WHERE from_block <= 12169953 AND 12169953 < to_block_exclusive -- started_on IS NULL
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         '''
@@ -265,7 +302,8 @@ def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_bloc
         reservation_id, reservation_start, reservation_end = maybe_row[0]
         curr.execute('UPDATE gather_sample_arbitrages_reservations SET started_on = now()::timestamp WHERE id = %s', (reservation_id,))
         assert curr.rowcount == 1
-        curr.connection.commit()
+        if not DEBUG:
+            curr.connection.commit()
         l.debug(f'working on reservation id={reservation_id} start={reservation_start:,} to {reservation_end:,}')
         return ReservationContextManager(
             reservation_id,
@@ -275,7 +313,8 @@ def get_reservation(curr: psycopg2.extensions.cursor, start_block: int, end_bloc
         )
     else:
         # release locks
-        curr.connection.commit()
+        if not DEBUG:
+            curr.connection.commit()
         l.info('work done')
         return None
 
@@ -291,6 +330,7 @@ class ReservationCancelRequestedException(Exception):
 def process_reservation(
         w3: web3.Web3,
         curr: psycopg2.extensions.cursor,
+        curr_mainnet: psycopg2.extensions.cursor,
         reservation_start: int,
         reservation_end_exclusive: int,
         cancellation_token: CancellationToken
@@ -320,8 +360,9 @@ def process_reservation(
         logs = f.get_all_entries()
         throttler.observe(len(logs))
 
-        process_batch(w3, curr, logs)
-        curr.connection.commit()
+        process_batch(w3, curr, curr_mainnet, logs)
+        if not DEBUG:
+            curr.connection.commit()
 
         this_block_start = this_end_block_inclusive + 1
 
@@ -329,23 +370,42 @@ def process_reservation(
 def process_batch(
         w3: web3.Web3,
         curr: psycopg2.extensions.cursor,
+        curr_mainnet: psycopg2.extensions.cursor,
         logs: typing.List[web3.types.LogReceipt]
     ):
+    # find all blocks present
+    all_blocks = set(x['blockNumber'] for x in logs)
+    l.debug(f'Have {len(all_blocks)} blocks in batch')
+    
+    # get all internal ethereum value transfers in block
+    all_xfers: typing.List[InternalValueTransfer] = []
+    for block_number in sorted(all_blocks):
+        all_xfers.extend(lookup_value_xfers_in_block(w3, curr, curr_mainnet, block_number))
+    l.debug(f'Have {len(all_xfers)} internal transfers in this block')
+
     # gather logs into per-transaction
-    tx_to_logs = collections.defaultdict(lambda: [])
+    tx_to_logs = collections.defaultdict(lambda: ([], []))
     for log in logs:
-        tx_to_logs[bytes(log['transactionHash'])].append(log)
+        tx_to_logs[bytes(log['transactionHash'])][0].append(log)
+    for xfer in all_xfers:
+        tx_to_logs[xfer.txn_hash][0].append(log)
 
     # ensure logs are sorted properly
     for tx_hash in tx_to_logs.keys():
-        tx_to_logs[tx_hash] = sorted(
-            tx_to_logs[tx_hash],
-            key = lambda x: (x['blockNumber'], x['logIndex']),
+        tx_to_logs[tx_hash] = (
+            sorted(
+                tx_to_logs[tx_hash][0],
+                key = lambda x: (x['blockNumber'], x['logIndex']),
+            ),
+            sorted(
+                tx_to_logs[tx_hash][1],
+                key = lambda x: (x.from_address, x.to_address, x.value),
+            )
         )
 
     # drop transactions with transfer logs that don't parse
     tx_to_parsed_txns = {}
-    for tx_hash, logs in tx_to_logs.items():
+    for tx_hash, (logs, internal_xfers) in tx_to_logs.items():
         broken = False
         parsed_txns = []
         for log in logs:
@@ -358,26 +418,36 @@ def process_batch(
                 break
         if not broken:
             if len(parsed_txns) >= 3:
-                tx_to_parsed_txns[tx_hash] = parsed_txns
+                tx_to_parsed_txns[tx_hash] = (parsed_txns, internal_xfers)
 
     l.debug(f'Have {len(tx_to_parsed_txns)} transactions to investigate')
 
     # Process each transaction
     arbs = []
     processed_already = set()
-    for tx_hash, txns in tx_to_parsed_txns.items():
+    for tx_hash, (txns, internal_xfers) in tx_to_parsed_txns.items():
         assert tx_hash not in processed_already
         processed_already.add(tx_hash)
-        if len(txns) >= 3:
+        if len(txns) + len(internal_xfers) >= 3:
             arb = get_arbitrage_if_exists(
-                w3, tx_hash, txns
+                w3, tx_hash, txns, internal_xfers
             )
+            if DEBUG:
+                old_arb = get_arbitrage_if_exists(
+                    w3, tx_hash, txns, []
+                )
+                if old_arb != arb:
+                    l.critical('Found difference')
+                    l.critical(f'block_number .... {block_number:,}')
+                    l.critical(f'txn_hash ........ {tx_hash.hex()}')
+                    exit()
             if arb is not None:
                 arbs.append(arb)
     
     insert_arbs(w3, curr, arbs)
 
-    curr.connection.commit()
+    if not DEBUG:
+        curr.connection.commit()
 
 
 if __name__ == '__main__':

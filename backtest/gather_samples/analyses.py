@@ -4,24 +4,29 @@ import web3.types
 import typing
 import networkx as nx
 import logging
+from backtest.gather_samples.database import InternalValueTransfer
 
 from backtest.gather_samples.models import Arbitrage, ArbitrageCycle, ArbitrageCycleExchange, ArbitrageCycleExchangeItem
+from utils import WETH_ADDRESS
 
 l = logging.getLogger(__name__)
 
+MAGIC_STRING_ETH = 'ETH_ETH_ETH_ETH_ETH_ETH_ETH_ETH_ETH_ETH'
 
 def get_arbitrage_if_exists(
         w3: web3.Web3,
         tx_hash: bytes,
         txns: typing.List,
+        internal_xfers: typing.List[InternalValueTransfer]
     ):
     full_txn = w3.eth.get_transaction_receipt('0x' + tx_hash.hex())
-    return get_arbitrage_from_receipt_if_exists(full_txn, txns)
+    return get_arbitrage_from_receipt_if_exists(full_txn, txns, internal_xfers)
 
 
 def get_arbitrage_from_receipt_if_exists(
         full_txn: web3.types.TxReceipt,
         txns: typing.List,
+        internal_xfers: typing.List[InternalValueTransfer]
     ):
     addr_to_movements = collections.defaultdict(lambda: {'in': [], 'out': []})
     for txn in txns:
@@ -30,8 +35,13 @@ def get_arbitrage_from_receipt_if_exists(
         addr_to_movements[to_addr]['in'].append(txn)
         addr_to_movements[from_addr]['out'].append(txn)
 
+    for xfer in internal_xfers:
+        addr_to_movements[xfer.to_address]['in'].append(xfer)
+        addr_to_movements[xfer.from_address]['out'].append(xfer)
+
     potential_exchanges = set()
     for addr in addr_to_movements:
+        addr: str
         ins  = addr_to_movements[addr]['in']
         outs = addr_to_movements[addr]['out']
         if len(ins) == 0 or len(outs) == 0:
@@ -42,8 +52,17 @@ def get_arbitrage_from_receipt_if_exists(
         if addr == full_txn['from']:
             continue
 
-        in_coins  = set(x['address'] for x in ins)
-        out_coins = set(x['address'] for x in outs)
+        # make sure that the relayer 'to' address is not marked as an exchange
+        if addr == full_txn['to']:
+            continue
+
+        # zero address is not an exchange
+        if addr.startswith('0x0000000000000000000000'):
+            continue
+
+        # collapse to WETH for simplicity here
+        in_coins  = set((WETH_ADDRESS if isinstance(x, InternalValueTransfer) else x['address']) for x in ins)
+        out_coins = set((WETH_ADDRESS if isinstance(x, InternalValueTransfer) else x['address']) for x in outs)
         if len(in_coins) == 1 and len(out_coins) == 1 and in_coins != out_coins:
             # one token in, another token out
             potential_exchanges.add(addr)
@@ -52,15 +71,15 @@ def get_arbitrage_from_receipt_if_exists(
         # not enough exchanges to make a cycle
         return None
 
-    l.debug(f'possible arbitrage 0x{full_txn["transactionHash"].hex()}')
+    l.debug(f'possible arbitrage {full_txn["transactionHash"].hex()}')
 
     # Build the digraph of this exchange
     g = nx.DiGraph()
     for addr in potential_exchanges:
         ins  = addr_to_movements[addr]['in']
         outs = addr_to_movements[addr]['out']
-        in_coins  = set(x['address'] for x in ins)
-        out_coins = set(x['address'] for x in outs)
+        in_coins  = set((WETH_ADDRESS if isinstance(x, InternalValueTransfer) else x['address']) for x in ins)
+        out_coins = set((WETH_ADDRESS if isinstance(x, InternalValueTransfer) else x['address']) for x in outs)
         assert len(in_coins) == 1 and len(out_coins) == 1
         
         coin_in = next(in_coins.__iter__())
@@ -69,8 +88,14 @@ def get_arbitrage_from_receipt_if_exists(
         in_log = next(ins.__iter__())
         out_log = next(outs.__iter__())
 
-        coin_in_amt = in_log['args']['value']
-        coin_out_amt = out_log['args']['value']
+        coin_in_amt = sum(
+            in_log.value if isinstance(in_log, InternalValueTransfer) else in_log['args']['value']
+            for in_log in ins
+        )
+        coin_out_amt = sum(
+            out_log.value if isinstance(out_log, InternalValueTransfer) else out_log['args']['value']
+            for out_log in outs
+        )
 
         item = (
             ArbitrageCycleExchangeItem(
@@ -78,8 +103,8 @@ def get_arbitrage_from_receipt_if_exists(
                 amount_in=coin_in_amt,
                 amount_out=coin_out_amt,
             ),
-            in_log,
-            out_log,
+            ins,
+            outs,
         )
 
         if not g.has_edge(coin_in, coin_out):
@@ -160,20 +185,35 @@ def get_arbitrage_from_receipt_if_exists(
         for u, v in zip(first_cycle, first_cycle[1:] + [first_cycle[0]]):
             exchange = g[u][v]['exchange']
             assert isinstance(exchange, ArbitrageCycleExchange)
-            for _, in_log, out_log in exchange.items:
-                addr_to_movements_in_cycle[in_log['args']['from']]['outs'].add(in_log)
-                addr_to_movements_in_cycle[in_log['args']['to']]['ins'].add(in_log)
-                addr_to_movements_in_cycle[out_log['args']['from']]['outs'].add(out_log)
-                addr_to_movements_in_cycle[out_log['args']['to']]['ins'].add(out_log)
+            for _, in_logs, out_logs in exchange.items:
+                for in_log in in_logs:
+                    if isinstance(in_log, InternalValueTransfer):
+                        addr_to_movements_in_cycle[in_log.from_address]['outs'].add(in_log)
+                        addr_to_movements_in_cycle[in_log.to_address]['ins'].add(in_log)
+                    else:
+                        addr_to_movements_in_cycle[in_log['args']['from']]['outs'].add(in_log)
+                        addr_to_movements_in_cycle[in_log['args']['to']]['ins'].add(in_log)
+                for out_log in out_logs:
+                    if isinstance(out_log, InternalValueTransfer):
+                        addr_to_movements_in_cycle[out_log.from_address]['outs'].add(out_log)
+                        addr_to_movements_in_cycle[out_log.to_address]['ins'].add(out_log)
+                    else:
+                        addr_to_movements_in_cycle[out_log['args']['from']]['outs'].add(out_log)
+                        addr_to_movements_in_cycle[out_log['args']['to']]['ins'].add(out_log)
 
         # maps (account address) -> (token address) |-> (net movement, int)
         token_movement_sums = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
         for addr, movements in addr_to_movements_in_cycle.items():
             for in_xfer in movements['ins']:
-                token_movement_sums[addr][in_xfer['address']] += in_xfer['args']['value']
+                if isinstance(in_xfer, InternalValueTransfer):
+                    token_movement_sums[addr][WETH_ADDRESS] += in_xfer.value
+                else:
+                    token_movement_sums[addr][in_xfer['address']] += in_xfer['args']['value']
             for out_xfer in movements['outs']:
-                token_movement_sums[addr][out_xfer['address']] -= out_xfer['args']['value']
-
+                if isinstance(out_xfer, InternalValueTransfer):
+                    token_movement_sums[addr][WETH_ADDRESS] -= out_xfer.value
+                else:
+                    token_movement_sums[addr][out_xfer['address']] -= out_xfer['args']['value']
 
         #
         # Find the addresses which hold condition (a)
@@ -181,8 +221,8 @@ def get_arbitrage_from_receipt_if_exists(
         addrs_condition_a: typing.List[typing.Tuple[str, str, int]] = []
         addrs_condition_a_with_profit = []
         for account_addr, token_movements in token_movement_sums.items():
-            tokens_in = set(x['address'] for x in addr_to_movements_in_cycle[account_addr]['ins'])
-            tokens_out = set(x['address'] for x in addr_to_movements_in_cycle[account_addr]['outs'])
+            tokens_in = set((WETH_ADDRESS if isinstance(x, InternalValueTransfer) else x['address']) for x in addr_to_movements_in_cycle[account_addr]['ins'])
+            tokens_out = set((WETH_ADDRESS if isinstance(x, InternalValueTransfer) else x['address']) for x in addr_to_movements_in_cycle[account_addr]['outs'])
 
             both_in_and_out = tokens_in.intersection(tokens_out)
             if len(both_in_and_out) > 0:
