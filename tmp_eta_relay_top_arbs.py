@@ -20,10 +20,12 @@ curr.execute(
     CREATE TEMP TABLE tmp_count_by_block AS
     SELECT block_number, count(*)::integer as cnt
     FROM large_candidate_arbitrages
-    GROUP BY block_number
+    GROUP BY block_number;
+
+    CREATE INDEX tmp_cbb_bn_idx ON tmp_count_by_block (block_number);
     '''
 )
-print(f'Have {curr.rowcount:,} unique blocks to process')
+# print(f'Have {curr.rowcount:,} unique blocks to process')
 
 last_marks = []
 last_ts = []

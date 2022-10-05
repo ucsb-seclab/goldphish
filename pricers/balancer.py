@@ -165,8 +165,12 @@ class BalancerPricer(BaseExchangePricer):
 
         _tokens = self.get_tokens(block_identifier)
 
-        assert token_in in _tokens
-        assert token_out in _tokens
+        if token_in not in _tokens:
+            l.warning(f'Token not available: {self.address} {token_in}')
+            return 0, 0.0
+        elif token_out not in _tokens:
+            l.warning(f'Token not available: {self.address} {token_out}')
+            return 0, 0.0
 
         token_weight_in  = self.get_denorm_weight(token_in,  block_identifier)
         token_weight_out = self.get_denorm_weight(token_out, block_identifier)
@@ -259,14 +263,11 @@ class BalancerPricer(BaseExchangePricer):
         just_finalized = False
         tokens_modified = set()
 
-        if len(logs) == 0:
-            return
-
-        block_number = logs[0]['blockNumber']
 
         # LOG_JOIN, LOG_EXIT, LOG_SWAP
         for log in logs:
             if log['address'] == self.address and len(log['topics']) > 0:
+                block_number = log['blockNumber']
 
                 # add liquidity
                 if log['topics'][0] == LOG_JOIN_TOPIC:
@@ -274,6 +275,8 @@ class BalancerPricer(BaseExchangePricer):
                     token = parsed['args']['tokenIn']
                     amount = parsed['args']['tokenAmountIn']
 
+                    if force_load and self.tokens is None:
+                        self.get_tokens(block_number - 1)
                     if force_load and token not in self._balance_cache:
                         self.get_balance(token, block_number - 1)
 
@@ -288,6 +291,8 @@ class BalancerPricer(BaseExchangePricer):
                     token = parsed['args']['tokenOut']
                     amount = parsed['args']['tokenAmountOut']
 
+                    if force_load and self.tokens is None:
+                        self.get_tokens(block_number - 1)
                     if force_load and token not in self._balance_cache:
                         self.get_balance(token, block_number - 1)
 
@@ -305,6 +310,9 @@ class BalancerPricer(BaseExchangePricer):
                     token_out = parsed['args']['tokenOut']
                     amount_in = parsed['args']['tokenAmountIn']
                     amount_out = parsed['args']['tokenAmountOut']
+
+                    if force_load and self.tokens is None:
+                        self.get_tokens(block_number - 1)
 
                     if force_load and token_in not in self._balance_cache:
                         self.get_balance(token_in, block_number - 1)
@@ -596,5 +604,8 @@ class BalancerPricer(BaseExchangePricer):
         return BalancerPricer(
             self.w3, self.address
         )
+
+    def __str__(self) -> str:
+        return f'<BalancerPricer {self.address} tokens={self.tokens}>'
 
 MAX_IN_RATIO = BalancerPricer.BONE // 2

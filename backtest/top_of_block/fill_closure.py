@@ -1,6 +1,8 @@
 import collections
+import datetime
 import itertools
 import random
+import time
 import web3
 import web3._utils.filters
 import web3.contract
@@ -14,11 +16,12 @@ from backtest.top_of_block.relay import InferredTokenTransferFeeCalculator, load
 
 from backtest.utils import connect_db
 from find_circuit.find import PricingCircuit, detect_arbitrages_bisection
-from pricers.base import BaseExchangePricer
+from pricers.base import BaseExchangePricer, NotEnoughLiquidityException
 from utils import BALANCER_VAULT_ADDRESS, get_block_timestamp
 
 l = logging.getLogger(__name__)
 
+DEBUG = False
 
 def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.Callable[[web3.Web3, argparse.Namespace], None]]:
     parser_name = 'fill-closure'
@@ -39,30 +42,41 @@ def fill_closure(w3: web3.Web3, args: argparse.Namespace):
     db = connect_db()
     curr = db.cursor()
 
-    # pick a random campaign
-    l.info(f'Picking random campaign...')
-    curr.execute('SELECT MIN(id), MAX(id) FROM top_candidate_arbitrage_campaigns')
-    min_id, max_id = curr.fetchone()
+    if args.setup_db:
+        setup_db(curr)
+        db.commit()
+        l.info('Setup db')
+        return
 
-    l.debug(f'IDs range from {min_id:,} to {max_id,}')
+    l.info(f'Filling closure...')
 
-    r = random.Random(10)
-    while True:
-        while True:
-            trying_id = r.randint(min_id, max_id)
-            if trying_id != 57_253:
-                continue
-            curr.execute(
-                'SELECT EXISTS(SELECT 1 FROM top_candidate_arbitrage_campaigns WHERE id = %s)',
-                (trying_id,)
-            )
-            (exists_,) = curr.fetchone()
-            if exists_:
-                break
+    curr.execute(
+        '''
+        SELECT id
+        FROM top_candidate_arbitrage_campaigns tcac
+        WHERE NOT EXISTS(SELECT FROM top_candidate_arbitrage_campaign_terminations WHERE tcac.id = campaign_id)
+        '''
+    )
+    n_to_check = curr.rowcount
+    l.info(f'Have {n_to_check:,} top arbitrage campaigns to check for terminating transaction')
 
-        l.info(f'Checking campaign id={trying_id:,}')
-
-        check_campaign_termination(w3, curr, trying_id)
+    t_start = time.time()
+    t_last_update = t_start
+    for i, (id_,) in enumerate(curr.fetchall()):
+        if time.time() > t_last_update + 10:
+            # do an update
+            t_last_update = time.time()
+            elapsed = t_last_update - t_start
+            nps = i / elapsed
+            remain = n_to_check - i
+            eta_s = remain / nps
+            eta = datetime.timedelta(seconds=eta_s)
+            l.info(f'{i:,} of {n_to_check:,} ({i / n_to_check * 100:.2f}%) ETA {eta}')
+            if not DEBUG:
+                db.commit()
+        check_campaign_termination(w3, curr, id_)
+    if not DEBUG:
+        db.commit()
 
 
 def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, id_: int):
@@ -71,19 +85,20 @@ def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, 
     #
     curr.execute(
         '''
-        SELECT exchanges, directions
+        SELECT exchanges, directions, start_block, end_block
         FROM top_candidate_arbitrage_campaigns
         WHERE id = %s
         ''',
         (id_,)
     )
     assert curr.rowcount == 1
-    bexchanges, bdirections = curr.fetchone()
+    bexchanges, bdirections, start_block, end_block = curr.fetchone()
+    assert start_block <= end_block
     exchanges = [w3.toChecksumAddress(e.tobytes()) for e in bexchanges]
     directions = [w3.toChecksumAddress(t.tobytes()) for t in bdirections]
     directions = list(zip(directions, directions[1:] + [directions[0]]))
 
-    l.debug(f'investigating campaign id={id_}')
+    l.debug(f'investigating campaign id={id_} starts at {start_block:,} and ends at {end_block:,} (total {end_block - start_block:,} blocks)')
 
     curr.execute(
         '''
@@ -114,51 +129,19 @@ def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, 
     
     l.debug(f'Max profit was on block {max_profit_block:,}: {max_profit / (10 ** 18):.3f} ETH')
 
+    terminal_threshold = min(10 ** 18, max_profit // 2)
+    l.debug(f'Terminal threshold: {terminal_threshold / (10 ** 18):.3f} ETH')
+
     # see at which block it drops below 50%
     idx_last_in_campaign = idx_max_profit
     for i, (block_number, profit) in enumerate(block_with_profit[idx_max_profit+1:]):
-        pct_diff = (profit - max_profit) / (max_profit) * 100.0
-        if pct_diff <= -50:
+        if profit <= terminal_threshold:
             terminal_block = block_number
             break
         else:
             idx_last_in_campaign = i + idx_max_profit + 1
     else:
-        # terminates at next update, find that
-        max_member_block = max(bn for bn, _ in block_with_profit)
-        l.debug(f'Terminates at next update')
-        curr.execute(
-            '''
-            SELECT block_number
-            FROM exchanges_updated_in_block
-            WHERE block_number > %(block_number)s AND exchange_address = ANY(%(exchanges)s)
-            ORDER BY block_number ASC
-            LIMIT 1
-            ''',
-            {
-                'block_number': max_member_block,
-                'exchanges': bexchanges,
-            }
-        )
-        assert curr.rowcount == 1
-        (maybe_terminal_block,) = curr.fetchone()
-
-        # now we need to see if the campaign ended due to a failed candidate arbitrage,
-        # indicating that something in the circuit broke
-        curr.execute(
-            '''
-            SELECT id
-            FROM candidate_arbitrages
-            WHERE exchanges = %s AND directions = %s AND %s <= block_number AND block_number <= %s
-            ORDER BY block_number ASC
-            ''',
-            (bexchanges, bdirections, max_member_block + 1, maybe_terminal_block)
-        )
-        l.debug(f'Had {curr.rowcount} interceding cadidates')
-        if curr.rowcount == 0:
-            terminal_block = maybe_terminal_block
-        else:
-            pass            
+        terminal_block = end_block + 1
             
 
     l.debug(f'Effectively terminates at block {terminal_block:,}')
@@ -207,7 +190,7 @@ def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, 
         fee_calculator.propose(token_address, from_address, to_address, fee, round_down)
 
     # go through each transaction and see if we can find where the arbitrage goes away
-    
+
     # detect arbitrages at the start
     pricers: typing.List[BaseExchangePricer] = []
     for exchange in exchanges:
@@ -219,40 +202,27 @@ def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, 
         directions.copy()
     )
 
-    terminal_block += 2
-    timestamp_to_use = get_block_timestamp(w3, terminal_block - 1)
+    timestamp_to_use = get_block_timestamp(w3, terminal_block)
 
-    maybe_fa = detect_arbitrages_bisection(
-        pc.copy(),
-        terminal_block - 1,
-        timestamp = timestamp_to_use,
-        try_all_directions = False,
-        fee_transfer_calculator = fee_calculator
-    )
-    print('new profit', maybe_fa[0].profit / (10 ** 18), f'at {terminal_block:,}')
-    exit()
+    # # was there a candidate in that terminal block? TODO remove
+    # curr.execute(
+    #     'SELECT COUNT(*) FROM candidate_arbitrages WHERE exchanges = %s AND directions = %s AND block_number = %s',
+    #     (
+    #         bexchanges,
+    #         bdirections,
+    #         terminal_block,
+    #     )
+    # )
+    # print(f'Have {curr.fetchone()[0]} candidates in {terminal_block:,}')
 
-    timestamp_to_use = get_block_timestamp(w3, terminal_block - 1)
-
-    maybe_fa = detect_arbitrages_bisection(
-        pc.copy(),
-        terminal_block - 1,
-        timestamp = timestamp_to_use,
-        try_all_directions = False,
-        fee_transfer_calculator = fee_calculator
-    )
-
-    assert len(maybe_fa) > 0
-
-    (fa,) = maybe_fa
-
-    pct_diff = (fa.profit - max_profit) / max_profit * 100
-    
-    if abs(pct_diff) > 10:
-        l.critical(f'Unexpected change in profit: {pct_diff:.3f}%')
-        raise Exception('unexpected change in profit')
-
-    l.debug(f'Percent diff from max just before: {pct_diff:.3f}%')
+    # maybe_fa = detect_arbitrages_bisection(
+    #     pc.copy(),
+    #     terminal_block + 2,
+    #     try_all_directions=False,
+    #     fee_transfer_calculator = fee_calculator
+    # )
+    # print(f'maybe_fa profit: {maybe_fa[0].profit / (10 ** 18):.4f} ETH')
+    # exit()
 
     # gather logs by transaction index, in order of transaction occurrence in the block,
     # and apply them one by one so that we can see where it disappeared
@@ -260,26 +230,15 @@ def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, 
     for log in relevant_logs:
         logs_by_idx[log['transactionIndex']].append(log)
     
-
-    for d in directions:
-        print(d)
-
     found_threshold_txn = None
 
     for txn_idx, logs in sorted(logs_by_idx.items(), key=lambda x: x[0]):
         txn_hash = logs[0]['transactionHash']
         l.debug(f'Applying transaction index #{txn_idx}: {txn_hash.hex()}')
 
-        for pricer, (t1, t2) in zip(pricers, directions):
-            t1_before = pricer._balance_cache.get(t1, None)
-            t2_before = pricer._balance_cache.get(t2, None)
+        for pricer in pricers:
             pricer.observe_block(logs, force_load = True)
-            t1_after = pricer._balance_cache.get(t1, None)
-            t2_after = pricer._balance_cache.get(t2, None)
-            print('t1', t1)
-            print('t2', t2)
-            print(f't1_before == t1_after????', t1_before, t1_after, t1_before == t1_after)
-            print(f't2_before == t2_after????', t2_before, t2_after, t2_before == t2_after)
+
 
         maybe_fa = detect_arbitrages_bisection(
             pc.copy(),
@@ -298,10 +257,34 @@ def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, 
         pct_diff = (new_fa.profit - max_profit) / max_profit * 100
         l.debug(f'New profit before fee: {new_fa.profit / (10 ** 18):.8f} ETH ({pct_diff:.3f}%)')
 
-        if pct_diff <= -50:
+        if new_fa.profit < terminal_threshold:
             found_threshold_txn = txn_hash
             break
 
-    assert found_threshold_txn is not None
+    if found_threshold_txn is None:
+        l.critical(f'Could not find threshold transaction for campaign id={id_:,}')
+        for pricer in pricers:
+            l.critical(str(pricer))
+    curr.execute(
+        '''
+        INSERT INTO top_candidate_arbitrage_campaign_terminations (campaign_id, terminating_transaction)
+        VALUES (%s, %s)
+        ''',
+        (
+            id_,
+            bytes(found_threshold_txn) if found_threshold_txn is not None else None
+        )
+    )
 
-    l.debug(f'Threshold transaction: {found_threshold_txn.hex()}')
+    if found_threshold_txn:
+        l.debug(f'Threshold transaction: {found_threshold_txn.hex()}')
+
+def setup_db(curr: psycopg2.extensions.cursor):
+    curr.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS top_candidate_arbitrage_campaign_terminations (
+            campaign_id INTEGER PRIMARY KEY NOT NULL REFERENCES top_candidate_arbitrage_campaigns (id) ON DELETE CASCADE,
+            terminating_transaction BYTEA
+        );
+        '''
+    )

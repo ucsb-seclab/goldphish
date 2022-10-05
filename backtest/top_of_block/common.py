@@ -269,8 +269,19 @@ class WrappedFoundArbitrage:
     def tokens(self) -> typing.Set[str]:
         return self.fa.tokens
 
+warned = False
 
-def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor, tmpdir: str) -> PricerPool:
+def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor, tmpdir: str, ___limit_to_balancer: bool = False) -> PricerPool:
+    global warned
+    if ___limit_to_balancer and not warned:
+        warned = True
+        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
+        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
+        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
+        l.critical('If you do not know what this message is something went wrong')
+        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
+        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
+        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
     #
     # load known pricer pool
     #
@@ -283,6 +294,7 @@ def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor, tmpdir: str) -> P
             (SELECT COUNT(*) FROM uniswap_v2_exchanges) + 
             (SELECT COUNT(*) FROM uniswap_v3_exchanges) + 
             (SELECT COUNT(*) FROM sushiv2_swap_exchanges) + 
+            (SELECT COUNT(*) FROM shibaswap_exchanges) + 
             (SELECT COUNT(*) FROM balancer_exchanges) + 
             (SELECT COUNT(*) FROM balancer_v2_exchanges)
         '''
@@ -304,78 +316,80 @@ def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor, tmpdir: str) -> P
             last_report = now
             elapsed = now - t_start
             nps = n_loaded / elapsed
-            remain = n_exchanges - n_loaded
-            eta_sec = remain / nps
-            eta = datetime.timedelta(seconds=eta_sec)
-            l.info(f'Loaded {n_loaded:,} of {n_exchanges:,} ({n_loaded / n_exchanges * 100:.2f}%) ETA {eta}')
+            if nps > 0:
+                remain = n_exchanges - n_loaded
+                eta_sec = remain / nps
+                eta = datetime.timedelta(seconds=eta_sec)
+                l.info(f'Loaded {n_loaded:,} of {n_exchanges:,} ({n_loaded / n_exchanges * 100:.2f}%) ETA {eta}')
 
-    l.debug('Loading uniswap v2 ...')
+    if not ___limit_to_balancer:
+        l.debug('Loading uniswap v2 ...')
 
-    curr.execute(
-        '''
-        SELECT uv2.address, uv2.origin_block, t0.address, t1.address
-        FROM uniswap_v2_exchanges uv2
-        JOIN tokens t0 ON uv2.token0_id = t0.id
-        JOIN tokens t1 ON uv2.token1_id = t1.id
-        '''
-    )
-    for n_loaded, (address, origin_block, token0, token1) in zip(itertools.count(n_loaded), curr):
-        address = w3.toChecksumAddress(address.tobytes())
-        token0 = w3.toChecksumAddress(token0.tobytes())
-        token1 = w3.toChecksumAddress(token1.tobytes())
-        pool.add_uniswap_v2(address, token0, token1, origin_block)
-        report_progress()
+        curr.execute(
+            '''
+            SELECT uv2.address, uv2.origin_block, t0.address, t1.address
+            FROM uniswap_v2_exchanges uv2
+            JOIN tokens t0 ON uv2.token0_id = t0.id
+            JOIN tokens t1 ON uv2.token1_id = t1.id
+            '''
+        )
+        for n_loaded, (address, origin_block, token0, token1) in zip(itertools.count(n_loaded), curr):
+            address = w3.toChecksumAddress(address.tobytes())
+            token0 = w3.toChecksumAddress(token0.tobytes())
+            token1 = w3.toChecksumAddress(token1.tobytes())
+            pool.add_uniswap_v2(address, token0, token1, origin_block)
+            report_progress()
 
-    l.debug(f'Loading uniswap v3 ...')
+        l.debug(f'Loading uniswap v3 ...')
 
-    curr.execute(
-        '''
-        SELECT uv3.address, uv3.origin_block, uv3.originalfee, t0.address, t1.address
-        FROM uniswap_v3_exchanges uv3
-        JOIN tokens t0 ON uv3.token0_id = t0.id
-        JOIN tokens t1 ON uv3.token1_id = t1.id
-        '''
-    )
-    for n_loaded, (address, origin_block, fee, token0, token1) in zip(itertools.count(n_loaded), curr):
-        address = w3.toChecksumAddress(address.tobytes())
-        token0 = w3.toChecksumAddress(token0.tobytes())
-        token1 = w3.toChecksumAddress(token1.tobytes())
-        pool.add_uniswap_v3(address, token0, token1, fee, origin_block)
-        report_progress()
+        curr.execute(
+            '''
+            SELECT uv3.address, uv3.origin_block, uv3.originalfee, t0.address, t1.address
+            FROM uniswap_v3_exchanges uv3
+            JOIN tokens t0 ON uv3.token0_id = t0.id
+            JOIN tokens t1 ON uv3.token1_id = t1.id
+            '''
+        )
+        for n_loaded, (address, origin_block, fee, token0, token1) in zip(itertools.count(n_loaded), curr):
+            address = w3.toChecksumAddress(address.tobytes())
+            token0 = w3.toChecksumAddress(token0.tobytes())
+            token1 = w3.toChecksumAddress(token1.tobytes())
+            pool.add_uniswap_v3(address, token0, token1, fee, origin_block)
+            report_progress()
 
-    l.debug('Loading sushiswap v2 ...')
+        l.debug('Loading sushiswap v2 ...')
 
-    curr.execute(
-        '''
-        SELECT sv2.address, sv2.origin_block, t0.address, t1.address
-        FROM sushiv2_swap_exchanges sv2
-        JOIN tokens t0 ON sv2.token0_id = t0.id
-        JOIN tokens t1 ON sv2.token1_id = t1.id
-        '''
-    )
-    for n_loaded, (address, origin_block, token0, token1) in zip(itertools.count(n_loaded), curr):
-        address = w3.toChecksumAddress(address.tobytes())
-        token0 = w3.toChecksumAddress(token0.tobytes())
-        token1 = w3.toChecksumAddress(token1.tobytes())
-        pool.add_sushiswap_v2(address, token0, token1, origin_block)
-        report_progress()
+        curr.execute(
+            '''
+            SELECT sv2.address, sv2.origin_block, t0.address, t1.address
+            FROM sushiv2_swap_exchanges sv2
+            JOIN tokens t0 ON sv2.token0_id = t0.id
+            JOIN tokens t1 ON sv2.token1_id = t1.id
+            '''
+        )
+        for n_loaded, (address, origin_block, token0, token1) in zip(itertools.count(n_loaded), curr):
+            address = w3.toChecksumAddress(address.tobytes())
+            token0 = w3.toChecksumAddress(token0.tobytes())
+            token1 = w3.toChecksumAddress(token1.tobytes())
+            pool.add_sushiswap_v2(address, token0, token1, origin_block)
+            report_progress()
 
-    l.debug('Loading shibaswap ...')
+        l.debug('Loading shibaswap ...')
 
-    curr.execute(
-        '''
-        SELECT ss.address, ss.origin_block, t0.address, t1.address
-        FROM shibaswap_exchanges ss
-        JOIN tokens t0 ON ss.token0_id = t0.id
-        JOIN tokens t1 ON ss.token1_id = t1.id
-        '''
-    )
-    for n_loaded, (address, origin_block, token0, token1) in zip(itertools.count(n_loaded), curr):
-        address = w3.toChecksumAddress(address.tobytes())
-        token0 = w3.toChecksumAddress(token0.tobytes())
-        token1 = w3.toChecksumAddress(token1.tobytes())
-        pool.add_shibaswap(address, token0, token1, origin_block)
-        report_progress()
+        curr.execute(
+            '''
+            SELECT ss.address, ss.origin_block, t0.address, t1.address
+            FROM shibaswap_exchanges ss
+            JOIN tokens t0 ON ss.token0_id = t0.id
+            JOIN tokens t1 ON ss.token1_id = t1.id
+            '''
+        )
+        for n_loaded, (address, origin_block, token0, token1) in zip(itertools.count(n_loaded), curr):
+            address = w3.toChecksumAddress(address.tobytes())
+            token0 = w3.toChecksumAddress(token0.tobytes())
+            token1 = w3.toChecksumAddress(token1.tobytes())
+            pool.add_shibaswap(address, token0, token1, origin_block)
+            report_progress()
 
     l.debug('Loading Balancer v1 ...')
 

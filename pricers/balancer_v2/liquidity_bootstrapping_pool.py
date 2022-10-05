@@ -302,6 +302,7 @@ class BalancerV2LiquidityBootstrappingPoolPricer(BaseExchangePricer):
         gradual_weight_update_scheduled = False
 
         for log in logs:
+            block_number = log['blockNumber']
 
             if log['address'] == self.address:
                 if log['topics'][0] == SWAP_FEE_CHANGED_TOPIC:
@@ -369,7 +370,6 @@ class BalancerV2LiquidityBootstrappingPoolPricer(BaseExchangePricer):
                     self.tokens = tuple()
 
                 elif log['topics'][0] == TOKENS_REGISTERED_TOPIC and log['topics'][1] == self.pool_id:
-                    print(f'txn {log["transactionHash"].hex()}')
                     parsed = _vault.events.TokensRegistered().processLog(log)
 
                     if self.tokens is not None:

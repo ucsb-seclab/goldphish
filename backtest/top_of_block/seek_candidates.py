@@ -21,6 +21,7 @@ from backtest.top_of_block.constants import MIN_PROFIT_PREFILTER
 from backtest.utils import connect_db
 import pricers
 import find_circuit
+import find_circuit.monitor
 from pricers.pricer_pool import PricerPool
 from utils import get_block_timestamp
 import utils.profiling
@@ -33,6 +34,7 @@ LOG_BATCH_SIZE = 100
 DEBUG = False
 
 TMP_REMOVE_ME_FOR_FIXUP_ONLY = True
+find_circuit.monitor.TMP_FIXUP_REMOVE_ME = TMP_REMOVE_ME_FOR_FIXUP_ONLY
 
 def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.Callable[[web3.Web3, argparse.Namespace], None]]:
     parser_name = 'seek-candidates'
@@ -289,24 +291,27 @@ def fixup_reservations(curr: psycopg2.extensions.cursor):
         curr.connection.rollback() # unnecessary but do it anyway
         return
 
-    if time.time() < 1659889982.4060774 + 80 * 60:
+    if True:
+        assert time.time() < 1664678911.4355166 + 60 * 30
         l.warning('Breaking down reservations!!')
 
-        min_res_size = LOG_BATCH_SIZE // 2
+        min_res_size = LOG_BATCH_SIZE // 8
 
         curr.execute(
             '''
             SELECT id, block_number_start, block_number_end, priority
             FROM candidate_arbitrage_reservations
-            WHERE completed_on IS NULL and claimed_on IS NULL and (block_number_end - block_number_start + 1) > %s AND priority < 100
+            WHERE completed_on IS NULL and claimed_on IS NULL
             ''',
-            (min_res_size * 2,),
         )
 
-        n_closed = curr.rowcount
-        l.debug(f'halving {n_closed:,} reservations')
         input('continue?')
+        n_halved = 0
         for id_, block_number_start, block_number_end, priority in list(curr):
+            if (block_number_end - block_number_start) < min_res_size * 2:
+                continue
+
+            n_halved += 1
             midpoint = (block_number_end + block_number_start) // 2
             assert block_number_start < midpoint < block_number_end
             # break in half
@@ -331,19 +336,156 @@ def fixup_reservations(curr: psycopg2.extensions.cursor):
                 (id_,)
             )
 
+        input(f'HALVED {n_halved} reservations, ENTER to continue')
+        curr.connection.commit()
+
         return
 
+
+    if False:
+        # merge small reservations back into big ones
+        l.info('locking table...')
+        curr.execute('LOCK TABLE candidate_arbitrage_reservations;')
+        l.info('table locked...')
+
+        curr.execute(
+            '''
+            SELECT count(*)
+            FROM candidate_arbitrage_reservations car1
+            LEFT JOIN candidate_arbitrage_reservations car2 ON car1.block_number_end = car2.block_number_start - 1
+            WHERE car2.id is null
+            '''
+        )
+        (n_odd_out,) = curr.fetchone()
+        assert n_odd_out == 1, f'Expected 1 odd out but got {n_odd_out:,}'
+
+        curr.execute(
+            '''
+            SELECT id
+            FROM candidate_arbitrage_reservations
+            WHERE claimed_on IS NULL and (block_number_end - block_number_start + 1) < 200
+            '''
+        )
+        l.debug(f'Have {curr.rowcount:,} merge candidates')
+        mergeable = 0
+        for id_ in curr.fetchall():
+            curr.execute(
+                '''
+                SELECT block_number_start, block_number_end, priority
+                FROM candidate_arbitrage_reservations
+                WHERE id = %s
+                ''',
+                (id_,)
+            )
+            start_block, end_block, priority = curr.fetchone()
+            # attempt merge backward
+            curr.execute(
+                '''
+                SELECT id, claimed_on, priority
+                FROM candidate_arbitrage_reservations
+                WHERE block_number_end = %s
+                ''',
+                (start_block - 1,)
+            )
+            assert curr.rowcount == 1
+            other_id, claimed_on, other_priority = curr.fetchone()
+            assert other_priority is not None
+            if claimed_on is None and other_priority == priority:
+                mergeable += 1
+                curr.execute(
+                    '''
+                    UPDATE candidate_arbitrage_reservations
+                    SET block_number_end = %s
+                    WHERE id = %s
+                    ''',
+                    (end_block, other_id)
+                )
+                assert curr.rowcount == 1
+                curr.execute(
+                    '''
+                    DELETE FROM candidate_arbitrage_reservations
+                    WHERE id = %s
+                    ''',
+                    (id_,)
+                )
+                assert curr.rowcount == 1
+            else:
+                curr.execute(
+                    '''
+                    SELECT id, claimed_on, priority
+                    FROM candidate_arbitrage_reservations
+                    WHERE block_number_start = %s
+                    ''',
+                    (end_block + 1,)
+                )
+                assert curr.rowcount == 1
+                other_id, claimed_on, other_priority = curr.fetchone()
+                assert other_priority is not None
+                if claimed_on is None and other_priority == priority:
+                    mergeable += 1
+                    curr.execute(
+                        '''
+                        UPDATE candidate_arbitrage_reservations
+                        SET block_number_start = %s
+                        WHERE id = %s
+                        ''',
+                        (start_block, other_id)
+                    )
+                    assert curr.rowcount == 1
+                    curr.execute(
+                        '''
+                        DELETE FROM candidate_arbitrage_reservations
+                        WHERE id = %s
+                        ''',
+                        (id_,)
+                    )
+                    assert curr.rowcount == 1
+            # sanity check
+            curr.execute(
+                '''
+                SELECT count(*)
+                FROM candidate_arbitrage_reservations car1
+                LEFT JOIN candidate_arbitrage_reservations car2 ON car1.block_number_end = car2.block_number_start - 1
+                WHERE car2.id is null
+                '''
+            )
+            (n_odd_out,) = curr.fetchone()
+            assert n_odd_out == 1, f'Expected 1 odd out but got {n_odd_out:,} after {id_}'
+
+
+        l.debug(f'Have {mergeable:,} mergeable reservations')
+
+        # sanity check
+        curr.execute(
+            '''
+            SELECT count(*)
+            FROM candidate_arbitrage_reservations car1
+            LEFT JOIN candidate_arbitrage_reservations car2 ON car1.block_number_end = car2.block_number_start - 1
+            WHERE car2.id is null
+            '''
+        )
+        (n_odd_out,) = curr.fetchone()
+        assert n_odd_out == 1, f'Expected 1 odd out but got {n_odd_out:,}'
+
+        input('ENTER to continue')
+        curr.connection.commit()
+
+    l.info('locking table...')
+    curr.execute('LOCK TABLE candidate_arbitrage_reservations;')
+    l.info('table locked...')
+
+    # assert time.time() < 1664559330.1173232 + 60 * 30, f'fix the time marks'
 
     # count in-progress arbitrages
     curr.execute(
         '''
         SELECT COUNT(*)
         FROM candidate_arbitrage_reservations
-        WHERE claimed_on IS NOT NULL AND completed_on IS NULL
+        WHERE claimed_on IS NOT NULL AND completed_on IS NULL;
         '''
     )
     (n_in_progress,) = curr.fetchone()
-    l.debug(f'Have {n_in_progress:,} in-progress reservations')
+    l.debug(f'Have {n_in_progress:,} old in-progress reservations')
 
     # sanity check
     curr.execute('SELECT COUNT(*) FROM candidate_arbitrage_reservations WHERE progress < block_number_start OR progress > block_number_end')
@@ -355,7 +497,8 @@ def fixup_reservations(curr: psycopg2.extensions.cursor):
         '''
         UPDATE candidate_arbitrage_reservations
         SET completed_on = now()::timestamp
-        WHERE progress = block_number_end AND claimed_on IS NOT NULL AND completed_on IS NULL
+        WHERE
+            progress = block_number_end AND claimed_on IS NOT NULL AND completed_on IS NULL
         RETURNING id
         '''
     )
@@ -411,6 +554,10 @@ def fixup_reservations(curr: psycopg2.extensions.cursor):
     l.debug(f'Force re-opened {n_force_opened} arbitrage search reservations')
 
     assert n_force_opened + n_new_reservations + n_force_closed == n_in_progress, f'expected {n_new_reservations + n_force_closed} == {n_in_progress}'
+
+    input('ENTER to commit')
+
+    curr.connection.commit()
 
 
 def get_reservation(curr: psycopg2.extensions.cursor, worker_name: str) -> typing.Optional[typing.Tuple[int, int, int]]:
@@ -578,5 +725,5 @@ def process_candidates(
     if n_ignored > 0:
         l.debug(f'Ignored {n_ignored} arbitrages due to not meeting profit threshold in block {block_number:,}')
     if n_found > 0:
-        l.debug(f'Found {n_found} candidate arbitrages in block {block_number:,}')
+        l.info(f'Found {n_found} candidate arbitrages in block {block_number:,}')
 

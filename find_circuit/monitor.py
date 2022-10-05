@@ -36,6 +36,7 @@ THRESHOLDS = {
 }
 
 
+TMP_FIXUP_REMOVE_ME = False
 
 def profitable_circuits(
         modified_pairs_last_block: typing.Dict[typing.Tuple[str, str], typing.List[str]],
@@ -57,6 +58,11 @@ def profitable_circuits(
                 # if there's no Balancer (v1 or v2) in the circuit, don't bother
                 has_balancer = any(isinstance(x, (BalancerPricer, BalancerV2WeightedPoolPricer, BalancerV2LiquidityBootstrappingPoolPricer)) for x in item._circuit)
                 if not has_balancer:
+                    continue
+                
+                # if the middle exchange updated anyway on this direction, ignore
+                assert len(item.circuit) == 3
+                if item.circuit[1].address in modified_pairs_last_block.get(item.directions[1], []):
                     continue
 
             # generate a unique key for this circuit to ensure we don't have to explore it more than once
@@ -128,52 +134,58 @@ def _propose_circuits_pair(
 
             tokens = pool.get_tokens_for(other_exchange)
             if WETH_ADDRESS in tokens:
-                pricer_2 = pool.get_pricer_for(other_exchange)
-                # we made a 2-length circuit
-                if not meets_thresholds(pricer_2, block_number):
+                if not TMP_FIXUP_REMOVE_ME:
+                    pricer_2 = pool.get_pricer_for(other_exchange)
+                    # we made a 2-length circuit
+                    if not meets_thresholds(pricer_2, block_number):
+                        continue
+
+                    yield PricingCircuit(
+                        [
+                            pricer_1,
+                            pricer_2,
+                        ],
+                        [
+                            (WETH_ADDRESS, other_token),
+                            (other_token, WETH_ADDRESS),
+                        ]
+                    )
+
+            for other_token2 in tokens.difference([WETH_ADDRESS, other_token]):
+                # construct 3-length circuit
+                if TMP_FIXUP_REMOVE_ME and WETH_ADDRESS not in tokens:
                     continue
 
-                yield PricingCircuit(
-                    [
-                        pricer_1,
-                        pricer_2,
-                    ],
-                    [
-                        (WETH_ADDRESS, other_token),
-                        (other_token, WETH_ADDRESS),
-                    ]
-                )
-            else:
-                for other_token2 in tokens.difference([WETH_ADDRESS, other_token]):
-                    # construct 3-length circuit
+                # find the remaining leg
+                for last_exchange in pool.get_exchanges_for_pair(WETH_ADDRESS, other_token2, block_number):
+                    if last_exchange in [address, other_exchange]:
+                        continue
 
-                    # find the remaining leg
-                    for last_exchange in pool.get_exchanges_for_pair(WETH_ADDRESS, other_token2, block_number):
-                        if last_exchange in [address, other_exchange]:
-                            continue
+                    pricer_2 = pool.get_pricer_for(other_exchange)
+                    if not meets_thresholds(pricer_2, block_number):
+                        continue
 
-                        pricer_2 = pool.get_pricer_for(other_exchange)
-                        if not meets_thresholds(pricer_2, block_number):
-                            continue
+                    pricer_3 = pool.get_pricer_for(last_exchange)
+                    if not meets_thresholds(pricer_3, block_number):
+                        continue
 
-                        pricer_3 = pool.get_pricer_for(last_exchange)
-                        if not meets_thresholds(pricer_3, block_number):
-                            continue
-
-                        assert len(set([address, other_exchange, last_exchange])) == 3, 'should not have duplicates'
-                        yield PricingCircuit(
-                            [
-                                pricer_1,
-                                pricer_2,
-                                pricer_3,
-                            ],
-                            [
-                                (WETH_ADDRESS, other_token),
-                                (other_token, other_token2),
-                                (other_token2, WETH_ADDRESS),
-                            ],
-                        )
+                    assert len(set([address, other_exchange, last_exchange])) == 3, 'should not have duplicates'
+                    yield PricingCircuit(
+                        [
+                            pricer_1,
+                            pricer_2,
+                            pricer_3,
+                        ],
+                        [
+                            (WETH_ADDRESS, other_token),
+                            (other_token, other_token2),
+                            (other_token2, WETH_ADDRESS),
+                        ],
+                    )
     else:
+        if TMP_FIXUP_REMOVE_ME:
+            return
+
         pricer_2 = pool.get_pricer_for(address)
         if not meets_thresholds(pricer_2, block_number):
             return

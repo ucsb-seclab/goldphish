@@ -181,6 +181,7 @@ class BalancerV2WeightedPoolPricer(BaseExchangePricer):
         tokens_modified = set()
 
         for log in logs:
+            block_number = log['blockNumber']
 
             if log['address'] == self.address:
                 if log['topics'][0] == SWAP_FEE_CHANGED_TOPIC:

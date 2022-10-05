@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# utility for spawning a whole bunch of relayers
 START=$1
 END=$2
 
@@ -11,4 +10,5 @@ then
     PREFIX="$PREFIX-";
 fi;
 
+# seq $1 $2 | parallel --halt now,fail=1 --nice -10 -j "$(($2 - $1 + 1))" --ungroup python3 -m backtest.top_of_block --worker-name "${PREFIX}relayer-{}" do-arb-duration --fill-modified --id {} --n-workers  "$(($2 - $1 + 1))"
 seq $1 $2 | parallel --halt now,fail=1 --nice -10 -j "$(($2 - $1 + 1))" --ungroup python3 -m backtest.top_of_block --worker-name "${PREFIX}relayer-{}" do-arb-duration --id {} --n-workers  "$(($2 - $1 + 1))"

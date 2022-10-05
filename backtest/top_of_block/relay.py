@@ -20,6 +20,7 @@ import web3._utils.filters
 import typing
 import logging
 import argparse
+import networkx as nx
 import psycopg2
 import psycopg2.extensions
 import psycopg2.extras
@@ -118,123 +119,8 @@ def relay(w3: web3.Web3, args: argparse.Namespace):
     
     if args.fixup_db:
         if args.top_arbs:
-            # assert time.time() < 1663802371.017083 + 60 * 60 * 24 * 2
-
-            # curr.execute('CREATE TEMP TABLE balancer_campaigns (campaign_id INTEGER NOT NULL)')
-
-            # curr.execute(
-            #     '''
-            #     INSERT INTO balancer_campaigns (campaign_id)
-            #     SELECT tcarr.id
-            #     FROM top_candidate_arbitrage_campaigns tcac
-            #     WHERE (
-            #             EXISTS(SELECT 1 FROM balancer_exchanges WHERE address = ANY(exchanges)) OR
-            #             EXISTS(SELECT 1 FROM balancer_v2_exchanges WHERE address = ANY(exchanges))
-            #         )
-            #     ''',
-            # )
-            # l.info(f'Have {curr.rowcount:,} balancer campaigns, deleting...')
-
-            # curr.execute('DELETE FROM top_candidate_arbitrage_campaigns tcac WHERE EXISTS(SELECT 1 FROM balancer_campaigns bc WHERE campaign_id = tcac.id)')
-            # l.info(f'Deleted {curr.rowcount:,} balancer campaigns')
-
-            # input('ENTER to Continue')
-
-
-            # curr.execute('delete from top_candidate_arbitrage_relay_results where reservation_id = 1034')
-            # l.info(f'Deleted {curr.rowcount:,} relay results from broken reservation')
-
-            # curr.execute('delete from top_candidate_arbitrage_campaigns where reservation_id = 1034')
-            # l.info(f'Deleted {curr.rowcount:,} campaigns from broken reservation')
-
-            # input('ENTER to continue')
-
-            # # requeue everything
-            # curr.execute('UPDATE top_candidate_arbitrage_reservations SET progress = NULL, claimed_on = NULL, completed_on = NULL, worker = NULL')
-            # l.info(f'Requeued {curr.rowcount} reservations')
-
-            # input('ENTER to continue')
-
-            # db.commit()
-
-
-            # exit()
-            # assert args.id >= 0
-            # assert args.id < args.n_workers
-
-            # # answer = input('DELETING BALANCER CAMPAIGN DETAILS, Continue? (type yes) ')
-            # # if answer.lower().strip() != 'yes':
-            # #     print('bye')
-            # #     exit()
-
-            # curr.execute('CREATE TEMP TABLE balancer_results (result_id INTEGER NOT NULL)')
-
-            # curr.execute('SELECT start_block, end_block FROM block_samples ORDER BY start_block ASC')
-            # samples = curr.fetchall()
-            # t_start = time.time()
-            # for i, (start_block, end_block) in enumerate(samples):
-            #     if i % args.n_workers != args.id:
-            #         continue
-            #     midpoint = (start_block + end_block) // 2
-            #     curr.execute(
-            #         '''
-            #         INSERT INTO balancer_results (result_id)
-            #         SELECT tcarr.id
-            #         FROM top_candidate_arbitrage_relay_results tcarr
-            #         JOIN candidate_arbitrages ca ON ca.id = tcarr.candidate_arbitrage_id
-            #         WHERE %s <= ca.block_number AND ca.block_number <= %s AND
-            #             (
-            #                 EXISTS(SELECT 1 FROM balancer_exchanges WHERE address = ANY(ca.exchanges)) OR
-            #                 EXISTS(SELECT 1 FROM balancer_v2_exchanges WHERE address = ANY(ca.exchanges))
-            #             )
-            #         ''',
-            #         (start_block, midpoint)
-            #     )
-            #     l.debug(f'part 1 done')
-            #     curr.execute(
-            #         '''
-            #         INSERT INTO balancer_results (result_id)
-            #         SELECT tcarr.id
-            #         FROM top_candidate_arbitrage_relay_results tcarr
-            #         JOIN candidate_arbitrages ca ON ca.id = tcarr.candidate_arbitrage_id
-            #         WHERE (EXISTS(SELECT 1 FROM balancer_exchanges WHERE address = ANY(ca.exchanges)) OR
-            #             EXISTS(SELECT 1 FROM balancer_v2_exchanges WHERE address = ANY(ca.exchanges)))
-            #             AND %s <= ca.block_number AND ca.block_number <= %s
-            #         ''',
-            #         (midpoint + 1, end_block)
-            #     )
-            #     l.debug(f'part 2 done')
-            #     if i > 0:
-            #         elapsed = time.time() - t_start
-            #         nps = (i + 1) / elapsed
-            #         remain = len(samples) - i - 1
-            #         eta_seconds = remain / nps
-            #         eta = datetime.timedelta(seconds=eta_seconds)
-            #         l.info(f'Have {curr.rowcount} balancer relay results from {start_block:,} to {end_block:,} (ETA={eta})')
-
-            # curr.execute(
-            #     '''
-            #     CREATE TEMP TABLE IF NOT EXISTS balancer_campaigns AS
-            #     SELECT DISTINCT campaign_id
-            #     FROM balancer_results br
-            #     JOIN top_candidate_arbitrage_relay_results tcarr ON tcarr.id = br.result_id
-            #     '''
-            # )
-            # l.debug(f'Have {curr.rowcount} balancer campaigns')
-
-            # curr.execute('DELETE FROM top_candidate_arbitrage_relay_results tcarr WHERE EXISTS(SELECT 1 FROM balancer_results br WHERE result_id = tcarr.id)')
-            # l.debug(f'Deleted {curr.rowcount} relay entries')
-
-            # # curr.execute(
-            # #     '''
-            # #     DELETE FROM top_candidate_arbitrage_campaigns tcac WHERE EXISTS(SELECT 1 FROM balancer_campaigns WHERE campaign_id = tcac.id)
-            # #     '''
-            # # )
-            # # l.debug(f'Deleted {curr.rowcount} campaign entries')
-
-            # db.commit()
-            # return
-            splitup_work_top_arbs(curr)
+            dedupe_top_arbs(curr)
+            # splitup_work_top_arbs(curr)
         else:
             fixup_db(curr)
         db.commit()
@@ -257,12 +143,14 @@ def relay(w3: web3.Web3, args: argparse.Namespace):
     def reconnect_db(_):
         nonlocal db
         nonlocal curr
+        nonlocal w3
         db = connect_db()
         curr = db.cursor()
+        w3 = connect_web3()
 
     @backoff.on_exception(
         backoff.expo,
-        (psycopg2.OperationalError, OSError),
+        (psycopg2.OperationalError, OSError, asyncio.exceptions.TimeoutError),
         max_time = 10 * 60,
         factor = 4,
         on_backoff = reconnect_db,
@@ -309,8 +197,7 @@ def process_reservation(
         tmpdir: str,
         worker_id: int,
     ):
-    if not DEBUG:
-        fee_calculator.sync(curr, block_number)
+    fee_calculator.sync(curr, block_number)
 
     timestamp_to_use = w3.eth.get_block(block_number + 1)['timestamp']
 
@@ -651,7 +538,7 @@ def fixup_db(curr: psycopg2.extensions.cursor):
         '''
         UPDATE candidate_arbitrage_reshoot_blocks
         SET claimed_on = NULL
-        WHERE completed_on IS NULL AND claimed_on IS NOT NULL AND (now()::timestamp - claimed_on) > interval '300 minutes'
+        WHERE completed_on IS NULL AND claimed_on IS NOT NULL AND (now()::timestamp - claimed_on) > interval '100 minutes'
         '''
     )
     resp = input(f'Requeued {curr.rowcount} entries, continue? type yes to continue:')
@@ -751,7 +638,8 @@ def setup_db(curr: psycopg2.extensions.cursor):
             exchanges              BYTEA[] NOT NULL,
             directions             BYTEA[] NOT NULL,
             start_block            INTEGER NOT NULL,
-            end_block              INTEGER NOT NULL
+            end_block              INTEGER NOT NULL,
+            terminated             BOOLEAN DEFAULT TRUE
         );
 
         CREATE TABLE IF NOT EXISTS top_candidate_arbitrage_relay_results (
@@ -884,7 +772,7 @@ def get_reservation(curr: psycopg2.extensions.cursor, worker_name: str) -> typin
     if not DEBUG:
         curr.connection.commit()
 
-    l.info(f'Processing reservation id={id_:,} block_number={block_number})')
+    l.info(f'Processing reservation id={id_:,} block_number={block_number:,}')
 
     return id_, block_number
 
@@ -1024,8 +912,13 @@ def get_candidates_in_block(
         curr.execute(
             '''
             SELECT id, exchanges, directions, amount_in, profit_no_fee
-            FROM candidate_arbitrages
-            WHERE block_number = %s
+            FROM candidate_arbitrages ca
+            WHERE block_number = %s AND
+                NOT EXISTS(
+                    SELECT 1
+                    FROM candidate_arbitrage_relay_results carr
+                    WHERE carr.candidate_arbitrage_id = ca.id
+                )
             ''',
             (block_number,)
         )
@@ -1280,10 +1173,8 @@ def attempt_relay_candidate(
 
     txn_hash = w3_ganache.eth.send_raw_transaction(signed['rawTransaction'])
     
-    l.debug(f'before mine {w3_ganache.eth.block_number:,}')
     with profile('evm_mine'):
         w3_ganache.provider.make_request('evm_mine', [timestamp])
-        l.debug(f'after mine {w3_ganache.eth.block_number:,}')
         receipt = w3_ganache.eth.wait_for_transaction_receipt(txn_hash)
 
     result = w3_ganache.provider.make_request('miner_start', [])
@@ -1740,6 +1631,7 @@ class TopArbCampaign(typing.NamedTuple):
     members: typing.List[typing.Tuple[int, AutoAdaptShootSuccess]]
     exchanges: typing.List[str]
     directions: typing.List[typing.Tuple[str, str]]
+    terminated: bool
 
 
 def relay_top_arbs(w3: web3.Web3, curr: psycopg2.extensions.cursor, worker_id: int):
@@ -1858,11 +1750,21 @@ def relay_top_arbs_in_range(
         rolling_window.append((needed_block, proc, tmpd, w3_ganache))
 
 
+    curr.execute(
+        '''
+        SELECT candidate_arbitrage_id
+        FROM top_candidate_arbitrage_relay_results
+        WHERE reservation_id = %(reservation_id)s
+        ''',
+        {
+            'reservation_id': reservation_id,
+        }
+    )
+    already_relayed_ids = set(x for (x,) in curr)
+
+
     # go through blocks, maintaining the rolling window
     for block_number in itertools.count(lowest_block_with_large_arb):
-        #
-        # see if we can quit
-
         # global hard stop
         if block_number > global_end_block_inclusive:
             l.info('Reached global end; done')
@@ -1872,6 +1774,9 @@ def relay_top_arbs_in_range(
         if block_number > reservation_end_block and len(active_campaigns) == 0:
             l.info('Reached end of reservation; done')
             break
+
+        # secondary reservation stop condition -- we went way too far
+        assert block_number <= reservation_end_block + 100
 
         #
         # some setup
@@ -1894,7 +1799,7 @@ def relay_top_arbs_in_range(
                 FROM candidate_arbitrages ca
                 JOIN large_candidate_arbitrages la ON ca.id = la.candidate_arbitrage_id
                 WHERE la.block_number = %(block_number)s
-            '''        
+            '''
 
         curr.execute(
             query,
@@ -1903,7 +1808,10 @@ def relay_top_arbs_in_range(
 
         candidate_fas: typing.List[CandidateArbitrage] = []
         used_keys = set()
-        for id_, bexchanges, bdirections, amount_in, profit in curr:
+        for id_, bexchanges, bdirections, amount_in, profit in curr.fetchall():
+            if id_ in already_relayed_ids:
+                continue
+
             exchanges = [web3.Web3.toChecksumAddress(x.tobytes()) for x in bexchanges]
             directions = [web3.Web3.toChecksumAddress(x.tobytes()) for x in bdirections]
             directions = list(zip(directions, directions[1:] + [directions[0]]))
@@ -2007,7 +1915,7 @@ def relay_top_arbs_in_range(
                 failed_relays.append((candidate.id_, failure_reason))
                 if campaign is not None:
                     # the campaign just ended
-                    campaign = campaign._replace(end_block = candidate.block_number - 1)
+                    campaign = campaign._replace(end_block = candidate.block_number - 1, terminated = True)
                     completed_campaigns.append(campaign)
                     del active_campaigns[candidate.campaign_key]
                     curr.execute(
@@ -2068,7 +1976,6 @@ def relay_top_arbs_in_range(
 
             balv1_updates = updated_exchanges.intersection(monitored_exchanges).intersection(balv1_exchanges)
             balv2_updates = updated_exchanges.intersection(monitored_exchanges).intersection(balv2_exchanges)
-
 
             if len(balv1_updates) > 0 or len(balv2_updates) > 0:
                 # get all block logs
@@ -2135,6 +2042,7 @@ def relay_top_arbs_in_range(
                 )
             )
             assert curr.rowcount == 1
+            campaign = campaign._replace(terminated = True)
             completed_campaigns.append(campaign)
 
         l.info(f'Have {len(active_campaigns)} top arbitrage campaigns, {len(completed_campaigns)} that terminated in block {block_number}')
@@ -2148,6 +2056,17 @@ def relay_top_arbs_in_range(
             ''',
             [(reservation_id, a, b) for a, b in failed_relays],
         )
+
+        if block_number >= reservation_end_block + 100 and len(active_campaigns) > 0:
+            l.warning(f'Force-closing {len(active_campaigns):,} active campaigns at 100 blocks beyond end of reservation ({block_number:,})')
+            # we're at the end here, force-close everything active and mark as non-terminated
+            for campaign in active_campaigns.values():
+                assert campaign.terminated == False
+                completed_campaigns.append(campaign)
+            
+            active_campaigns.clear()
+            curr.execute('TRUNCATE TABLE active_campaigns')
+
 
         # get an ID for all fee objects
         fee_key_to_assigned_fee_ids = {}
@@ -2187,8 +2106,8 @@ def relay_top_arbs_in_range(
             # get a campaign id
             curr.execute(
                 '''
-                INSERT INTO top_candidate_arbitrage_campaigns (reservation_id, exchanges, directions, start_block, end_block)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO top_candidate_arbitrage_campaigns (reservation_id, exchanges, directions, start_block, end_block, terminated)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
                 ''',
                 (
@@ -2197,6 +2116,7 @@ def relay_top_arbs_in_range(
                     [bytes.fromhex(x[2:]) for x, _ in completed_campaign.directions],
                     completed_campaign.start_block,
                     completed_campaign.end_block,
+                    completed_campaign.terminated
                 )
             )
             assert curr.rowcount == 1
@@ -2325,7 +2245,8 @@ def relay_top_candidate(
             end_block = candidate.block_number,
             members = [(candidate.id_, result)],
             exchanges = candidate.exchanges,
-            directions = candidate.directions
+            directions = candidate.directions,
+            terminated = False
         )
 
         last_backward_block = candidate.block_number
@@ -2363,6 +2284,11 @@ def relay_top_candidate(
 
             blocks_ago = candidate.block_number - older_block_number
             l.debug(f'Found prior candidate at {older_block_number:,} ({blocks_ago:,} behind) makes {older_profit / (10 ** 18):.4f} ETH')
+
+            if blocks_ago > 1_000:
+                l.critical(f'Reached back too far ({blocks_ago:,} blocks), ending here')
+                return in_progress_campaign
+
 
             proc = None
             tmpd = None
@@ -2426,6 +2352,118 @@ def relay_top_candidate(
                 in_progress_campaign = in_progress_campaign._replace(members = [(older_id, older_result)] + in_progress_campaign.members)
                 in_progress_campaign = in_progress_campaign._replace(start_block = older_block_number)
                 last_backward_block = older_block_number
+
+
+def dedupe_top_arbs(curr: psycopg2.extensions.cursor):
+    curr.execute(
+        'SELECT COUNT(*) FROM top_candidate_arbitrage_campaigns'
+    )
+    (n_top_campaigns,) = curr.fetchone()
+
+    # # just do a poly(n) comparison, it's rather small iirc
+
+    # campaigns_by_key = collections.defaultdict(lambda: [])
+
+    # curr.execute(
+    #     '''
+    #     SELECT id, start_block, end_block, exchanges, directions
+    #     FROM top_candidate_arbitrage_campaigns
+    #     '''
+    # )
+    # for id_, start_block, end_block, exchanges, directions in curr:
+    #     exchanges = tuple((e.tobytes() for e in exchanges))
+    #     directions = tuple((d.tobytes() for d in directions))
+    #     k = (exchanges, directions)
+
+    #     campaigns_by_key[k].append((id_, start_block, end_block))
+
+    # l.info(f'Have {len(campaigns_by_key):,} sorts of campaign to look through')
+
+    # for (exchanges, directions), campaigns in campaigns_by_key.items():
+
+    #     # build a conflict graph
+    #     g = nx.Graph()
+
+    #     for id1, start_block1, end_block1 in campaigns:
+    #         for id2, start_block2
+
+
+    curr.execute(
+        '''
+        SELECT tcac1.id, tcac1.start_block, tcac1.end_block, tcac2.id, tcac2.start_block, tcac2.end_block
+        FROM top_candidate_arbitrage_campaigns tcac1
+        JOIN top_candidate_arbitrage_campaigns tcac2 ON
+            tcac1.id < tcac2.id AND
+            tcac1.exchanges = tcac2.exchanges AND
+            tcac1.directions = tcac2.directions AND
+            int8range(tcac1.start_block, tcac1.end_block) && int8range(tcac2.start_block, tcac2.end_block)
+        '''
+    )
+    l.info(f'Have {curr.rowcount:,} conflicting campaigns ({curr.rowcount / n_top_campaigns * 100:.2f}%), de-conflicting...')
+
+    # build a conflict graph
+    g = nx.Graph()
+
+    for id1, start_block1, end_block1, id2, start_block2, end_block2 in curr:
+        if id1 not in g.nodes:
+            g.add_node(id1, start_block=start_block1, end_block=end_block1)
+        if id2 not in g.nodes:
+            g.add_node(id2, start_block=start_block2, end_block=end_block2)
+
+        g.add_edge(id1, id2)
+
+    components: typing.Set[int] = list(nx.connected_components(g))
+    l.info(f'Have {len(components)} conflict clusters')
+
+    for c in components:
+        # there should be one campaign that covers all others...
+        min_block = min(g.nodes[x]['start_block'] for x in c)
+        max_block = max(g.nodes[x]['end_block'] for x in c)
+
+        # see if there's one that meets crieteria
+        for id_ in c:
+            if g.nodes[id_]['start_block'] == min_block and g.nodes[id_]['end_block'] == max_block:
+                break
+        else:
+            curr.execute(
+                '''
+                SELECT start_block
+                FROM block_samples
+                WHERE %s <= start_block and start_block <= %s
+                ORDER BY start_block ASC
+                ''',
+                (min_block, max_block)
+            )
+            for (s,) in curr:
+                print(f'boundary: {s:,}')
+
+            intervals = [(g.nodes[x]['start_block'], g.nodes[x]['end_block'], x) for x in c]
+            intervals = sorted(intervals)
+            for s, e, i in intervals:
+                print(s, e, i)
+            import pdb; pdb.set_trace()
+
+        # # ensure they all overlap, otherwise this is awkawrd ...
+        # for id1 in c:
+        #     for id2 in c:
+        #         if id1 > id2:
+        #             continue
+                
+        #         dat1 = g.nodes[id1]
+        #         dat2 = g.nodes[id2]
+
+        #         if dat2['start_block'] <= dat1['start_block'] <= dat2['end_block']:
+        #             continue
+        #         if dat2['start_block'] <= dat1['end_block'] <= dat2['end_block']:
+        #             continue
+        #         if dat1['start_block'] <= dat2['end_block'] <= dat1['end_block']:
+        #             continue
+
+        #         import pdb; pdb.set_trace()
+
+    # l.info(f'Removing {len(to_rm):,} campaigns...')
+
+    exit()
 
 
 def load_pricer_for(
@@ -2666,15 +2704,65 @@ class InferredTokenTransferFeeCalculator(BuiltinFeeTransferCalculator):
 
         t_start = time.time()
         # fresh, full-pull
-        curr.execute(
-            '''
-            SELECT inf.id, t.address, fee, round_down, from_address, to_address, block_number_inferred, updated_on
-            FROM inferred_token_fee_on_transfer inf
-            JOIN tokens t ON t.id = inf.token_id
-            WHERE updated_on > %s
-            ''',
-            (self.last_updated,)
-        )
+        l.debug(f'Syncing to block {suggested_block_number:,}')
+        if (datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc) - self.last_updated).days > 100:
+            # initial update
+            curr.execute(
+                '''
+                WITH all_fees as (
+                    SELECT DISTINCT token_id, from_address, to_address
+                    FROM inferred_token_fee_on_transfer
+                ),
+                closest_fees as (
+                    SELECT
+                    (
+                        SELECT MAX(block_number_inferred)
+                        FROM inferred_token_fee_on_transfer f
+                        WHERE f.token_id = af.token_id AND f.from_address = af.from_address AND f.to_address = af.to_address AND block_number_inferred <= %(block_number)s
+                    ) closest_lower_block,
+                    (
+                        SELECT MIN(block_number_inferred)
+                        FROM inferred_token_fee_on_transfer f
+                        WHERE f.token_id = af.token_id AND f.from_address = af.from_address AND f.to_address = af.to_address AND block_number_inferred >= %(block_number)s
+                    ) closest_upper_block,
+                    *
+                    FROM all_fees af
+                ),
+                closest_block as (
+                    SELECT
+                        CASE
+                            WHEN cf.closest_lower_block IS NULL THEN cf.closest_upper_block
+                            WHEN cf.closest_upper_block IS NULL THEN cf.closest_lower_block
+                            WHEN (cf.closest_upper_block - %(block_number)s) < (%(block_number)s - cf.closest_lower_block) THEN cf.closest_upper_block
+                            ELSE cf.closest_lower_block
+                        END AS closest_block,
+                        cf.token_id,
+                        cf.from_address,
+                        cf.to_address
+                    FROM closest_fees cf
+                )
+                SELECT inf.id, t.address, fee, round_down, inf.from_address, inf.to_address, block_number_inferred, updated_on
+                FROM closest_block cb
+                JOIN inferred_token_fee_on_transfer inf ON cb.closest_block = inf.block_number_inferred
+                JOIN tokens t ON t.id = inf.token_id
+                WHERE updated_on > %(last_updated)s
+                ''',
+                {
+                    'block_number': suggested_block_number,
+                    'last_updated': self.last_updated,
+                }
+            )
+        else:
+            curr.execute(
+                '''
+                SELECT inf.id, t.address, fee, round_down, from_address, to_address, block_number_inferred, updated_on
+                FROM inferred_token_fee_on_transfer inf
+                JOIN tokens t ON t.id = inf.token_id
+                WHERE updated_on > %s
+                ''',
+                (self.last_updated,)
+            )
+        l.debug(f'Loading {curr.rowcount} rows from sync')
         for id_, baddr, fee, round_down, bfrom, bto, block_number, updated_on in curr:
             t = TokenFee(
                 id_          = id_,
@@ -2723,6 +2811,8 @@ class InferredTokenTransferFeeCalculator(BuiltinFeeTransferCalculator):
 
         elapsed = time.time() - t_start
         inc_measurement('inferred_fee.sync', elapsed)
+
+        self.last_updated = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
 
     def out_from_transfer(self, token: str, from_: str, to_: str, amount: int) -> int:
         maybe_relayer = self.relayed_by_shooter.get((from_, to_), None)

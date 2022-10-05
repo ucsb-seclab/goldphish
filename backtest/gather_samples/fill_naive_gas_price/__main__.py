@@ -50,7 +50,6 @@ def main():
 
     l.info('Starting naive gas price estimation...')
 
-    gen_false_positives(curr)
     estimate_gas(curr, args.id, args.n_workers)
 
     
@@ -73,103 +72,11 @@ def setup_db(curr: psycopg2.extensions.cursor):
     )
 
 
-def gen_false_positives(curr: psycopg2.extensions.cursor):
-    """
-    Build temp table 'tmp_false_positives'
-    """
-    t_start = time.time()
-
-    curr.execute(
-        '''
-        CREATE TEMP TABLE tmp_false_positives (
-            sample_arbitrage_id INTEGER NOT NULL,
-            reason TEXT NOT NULL
-        );
-
-        CREATE INDEX idx_tmp_false_positives_id ON tmp_false_positives (sample_arbitrage_id);
-        '''
-    )
-
-    # remove tokenlon
-    curr.execute(
-        '''
-        INSERT INTO tmp_false_positives (sample_arbitrage_id, reason)
-        SELECT id, 'tokenlon'
-        FROM sample_arbitrages
-        WHERE encode(shooter, 'hex') = '03f34be1bf910116595db1b11e9d1b2ca5d59659'
-        '''
-    )
-    assert curr.rowcount > 0
-    print(f'Labeled {curr.rowcount:,} samples as false-positive due to tokenlon')
-
-    # remove CoW Swap
-    curr.execute(
-        '''
-        INSERT INTO tmp_false_positives (sample_arbitrage_id, reason)
-        SELECT id, 'CoW Swap'
-        FROM sample_arbitrages
-        WHERE encode(shooter, 'hex') = '9008d19f58aabd9ed0d60971565aa8510560ab41' OR encode(shooter, 'hex') = '3328f5f2cecaf00a2443082b657cedeaf70bfaef'
-        '''
-    )
-    assert curr.rowcount > 0
-    print(f'Labeled {curr.rowcount:,} samples as false-positive due to CoW Swap')
-
-    # remove null address
-
-    # find null exchange id
-    curr.execute('SELECT id FROM sample_arbitrage_exchanges WHERE address = %s', (b'\x00' * 20,))
-    assert curr.rowcount <= 1
-    if curr.rowcount == 1:
-        (zero_addr_exchange_id,) = curr.fetchone()
-        print(f'Removing null exchange (id={zero_addr_exchange_id})')
-
-        curr.execute(
-            '''
-            INSERT INTO tmp_false_positives (sample_arbitrage_id, reason)
-            SELECT sa.id, 'null address'
-            FROM sample_arbitrages sa
-            WHERE EXISTS(
-                SELECT 1
-                FROM sample_arbitrage_cycles sac
-                JOIN sample_arbitrage_cycle_exchanges sace ON sace.cycle_id = sac.id
-                JOIN sample_arbitrage_cycle_exchange_items sacei ON sacei.cycle_exchange_id = sace.id
-                WHERE sac.sample_arbitrage_id = sa.id AND sacei.exchange_id = %s
-            )
-            ''',
-            (zero_addr_exchange_id,)
-        )
-        print(f'Labeled {curr.rowcount:,} arbitrages as false-positive due to null address')
-    else:
-        print('did not find zero address in exchanges')
-
-
-    curr.execute('SELECT COUNT(distinct sample_arbitrage_id) FROM tmp_false_positives')
-    (n_fp,) = curr.fetchone()
-
-    curr.execute('SELECT COUNT(*) FROM sample_arbitrages')
-    (tot_arbs,) = curr.fetchone()
-
-    print(f'Have {n_fp:,} sample arbitrages labeled as false-positive ({n_fp / tot_arbs * 100:.2f}%)')
-
-    # generate tables with false-positives removed
-    curr.execute(
-        '''
-        CREATE TEMP TABLE sample_arbitrages_no_fp
-        AS SELECT *
-        FROM sample_arbitrages sa
-        WHERE NOT EXISTS(SELECT 1 FROM tmp_false_positives WHERE sa.id = sample_arbitrage_id);
-        '''
-    )
-    assert curr.rowcount == tot_arbs - n_fp
-    curr.execute('CREATE INDEX idx_sample_arbitrages_no_fp_id ON sample_arbitrages_no_fp (id);')
-    curr.execute('CREATE INDEX idx_sample_arbitrages_no_fp_bn ON sample_arbitrages_no_fp (block_number);')
-
-    print(f'Took {time.time() - t_start:.1f} seconds to generate false-positive report')
-    print()
-
 def estimate_gas(curr: psycopg2.extensions.cursor, id_: int, n_workers: int):
+    curr.execute('SET max_parallel_workers_per_gather = 0;')
+
     w3 = connect_web3()
-    curr.execute('SELECT MIN(block_number), MAX(block_number) FROM sample_arbitrages')
+    curr.execute('SELECT MIN(block_number), MAX(block_number) FROM sample_arbitrages_no_fp')
     curr2 = curr.connection.cursor()
     min_block, max_block = curr.fetchone()
 
@@ -226,7 +133,7 @@ def estimate_gas(curr: psycopg2.extensions.cursor, id_: int, n_workers: int):
         WHERE all_known = true AND n_exchanges <= 3
         ORDER BY block_number ASC
         ''',
-        (slice_start - (slice_width + 2), slice_end_exclusive),
+        (slice_start - (ROLLING_WINDOW_SIZE_BLOCKS + 2), slice_end_exclusive),
     )
 
     niches_updated = set()

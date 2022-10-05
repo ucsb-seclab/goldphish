@@ -1,5 +1,4 @@
-import argparse
-import itertools
+import datetime
 import json
 import logging
 import os
@@ -9,8 +8,8 @@ import time
 import psycopg2
 import psycopg2.extensions
 import psycopg2.extras
+import urllib3
 
-import web3
 from backtest.utils import connect_db
 
 from utils import setup_logging
@@ -49,29 +48,15 @@ def main():
         '''
     )
 
-    l.info('starting parse')
-    with open(fname) as fin:
-        parsed = json.load(fin)
+    curr.execute('SELECT MAX(end_block) FROM block_samples')
+    (end_block,) = curr.fetchone()
+    l.debug(f'End block is {end_block:,}')
+    curr.execute('SELECT MAX(block_number) FROM flashbots_transactions')
+    (end_flashbots_block,) = curr.fetchone()
+    l.debug(f'End flashbots block: {end_flashbots_block:,}')
 
-    rows = []
-    for block in parsed:
-        for transaction in block['transactions']:
-            btxn_hash = bytes.fromhex(transaction['transaction_hash'][2:])
-            rows.append(
-                (
-                    transaction['block_number'],
-                    btxn_hash,
-                    transaction['tx_index'],
-                    transaction['bundle_type'],
-                    transaction['bundle_index'],
-                    transaction['gas_used'],
-                    int(transaction['gas_price']),
-                    transaction['coinbase_transfer'],
-                    int(transaction['total_miner_reward'])
-                ),
-            )
+    pool = urllib3.PoolManager()
 
-    l.info('executing statements')
     curr.execute(
         '''
         PREPARE stmt AS INSERT INTO flashbots_transactions
@@ -79,10 +64,81 @@ def main():
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         '''
     )
-    psycopg2.extras.execute_batch(curr, "EXECUTE stmt (%s, %s, %s, %s, %s, %s, %s, %s, %s)", rows)
-    curr.execute("DEALLOCATE stmt")
+
+    t_start = time.time()
+    t_last_update = time.time()
+    for batch_start in range(end_flashbots_block + 1, end_block + 1, 10_000):
+        if t_last_update + 30 < time.time():
+            t_last_update = time.time()
+            elapsed = t_last_update - t_start
+            blocks_processed = batch_start - (end_flashbots_block + 1)
+            nps = blocks_processed / elapsed
+            remain = end_block - batch_start
+            eta_s = remain / nps
+            eta = datetime.timedelta(seconds=eta_s)
+            print(f'Processing {batch_start:,} ({(batch_start - end_flashbots_block) / (end_block - end_flashbots_block):.2f}%) ETA {eta}')
+
+        resp = pool.urlopen('GET', f'https://blocks.flashbots.net/v1/blocks?before={batch_start + 10_000}&limit={10_000}')
+        blob = json.loads(resp.data.decode('utf8'))
+        rows = []
+        for block in blob['blocks']:
+            for transaction in block['transactions']:
+                btxn_hash = bytes.fromhex(transaction['transaction_hash'][2:])
+                if transaction.get('is_megabundle') == True:
+                    bundle_type = 'megabundle'
+                else:
+                    bundle_type = transaction['bundle_type']
+                rows.append(
+                    (
+                        transaction['block_number'],
+                        btxn_hash,
+                        transaction['tx_index'],
+                        bundle_type,
+                        transaction['bundle_index'],
+                        transaction['gas_used'],
+                        int(transaction['gas_price']),
+                        transaction['coinbase_transfer'],
+                        int(transaction['total_miner_reward'])
+                    ),
+                )
+        
+        psycopg2.extras.execute_batch(curr, "EXECUTE stmt (%s, %s, %s, %s, %s, %s, %s, %s, %s)", rows)
     curr.connection.commit()
-    l.info('done')
+
+    # l.info('starting parse')
+    # with open(fname) as fin:
+    #     parsed = json.load(fin)
+
+    # rows = []
+    # for block in parsed:
+    #     for transaction in block['transactions']:
+    #         btxn_hash = bytes.fromhex(transaction['transaction_hash'][2:])
+    #         rows.append(
+    #             (
+    #                 transaction['block_number'],
+    #                 btxn_hash,
+    #                 transaction['tx_index'],
+    #                 transaction['bundle_type'],
+    #                 transaction['bundle_index'],
+    #                 transaction['gas_used'],
+    #                 int(transaction['gas_price']),
+    #                 transaction['coinbase_transfer'],
+    #                 int(transaction['total_miner_reward'])
+    #             ),
+    #         )
+
+    # l.info('executing statements')
+    # curr.execute(
+    #     '''
+    #     PREPARE stmt AS INSERT INTO flashbots_transactions
+    #     (block_number, transaction_hash, tx_index, bundle_type, bundle_index, gas_used, gas_price, coinbase_transfer, total_miner_reward)
+    #     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    #     '''
+    # )
+    # psycopg2.extras.execute_batch(curr, "EXECUTE stmt (%s, %s, %s, %s, %s, %s, %s, %s, %s)", rows)
+    # curr.execute("DEALLOCATE stmt")
+    # curr.connection.commit()
+    # l.info('done')
 
 
 if __name__ == '__main__':

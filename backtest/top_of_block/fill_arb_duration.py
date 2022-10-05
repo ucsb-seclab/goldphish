@@ -4,19 +4,23 @@ find_arb_termination.py
 Finds out when each arbitrage opportunity closed, and why.
 """
 import asyncio
+import backoff
 import collections
 import datetime
 import os
+import subprocess
 import asyncpg
 import itertools
 import tempfile
 import time
+from backtest.gather_samples.tokens import get_token
 from backtest.top_of_block.relay import AutoAdaptShootSuccess, InferredTokenTransferFeeCalculator, auto_adapt_attempt_shoot_candidate, load_pricer_for, open_ganache
 from backtest.utils import connect_db
 from backtest.top_of_block.common import load_pool
 from backtest.top_of_block.seek_candidates import get_relevant_logs
 import argparse
 import psycopg2.extensions
+import psycopg2.extras
 import typing
 import numpy as np
 import logging
@@ -31,6 +35,8 @@ import web3._utils.filters
 
 
 l = logging.getLogger(__name__)
+
+DEBUG = False
 
 class CandidateArbitrageCampaign(typing.NamedTuple):
     arbs: typing.List[typing.Tuple[int, int]]
@@ -64,10 +70,27 @@ def do_fill_duration(w3: web3.Web3, args: argparse.Namespace):
         db.commit()
         return
 
-
     if args.fill_modified:
+        # curr.execute(
+        #     '''
+        #     SELECT COUNT(*)
+        #     FROM (
+        #         SELECT distinct block_number
+        #         FROM exchanges_updated_in_block eub
+        #         WHERE EXISTS(SELECT FROM balancer_exchanges be WHERE be.address = eub.exchange_address) OR
+        #             EXISTS(SELECT FROM balancer_v2_exchanges be WHERE be.address = eub.exchange_address)
+        #     ) a
+        #     '''
+        # )
+        # (n_blocks_balancer_update,) = curr.fetchone()
+
+        # curr.execute('SELECT MIN(start_block), MAX(end_block) FROM block_samples')
+        # start_block, end_block = curr.fetchone()
+
+        # l.info(f'Have {n_blocks_balancer_update:,} blocks with a Balancer update ({n_blocks_balancer_update / (end_block - start_block + 1) * 100:.2f}%)')
+        # exit()
         assert args.id >= 0 and args.n_workers > 0 and args.id < args.n_workers
-        fill_modified_exchanges(w3,args, db, curr)
+        fill_modified_exchanges(w3,args, curr)
         return
 
     # curr.execute(
@@ -93,6 +116,20 @@ def do_fill_duration(w3: web3.Web3, args: argparse.Namespace):
 
     gas_oracle_pts = get_gas_oracle(curr, min_block, max_block)
     origin_blocks = get_exchange_origin_blocks(curr)
+
+    curr.execute(
+        '''
+        SELECT priority
+        FROM candidate_arbitrage_reshoot_blocks
+        WHERE completed_on IS NULL
+        ORDER BY priority ASC
+        LIMIT 1
+        '''
+    )
+    (priority_in_progress,) = curr.fetchone()
+    priority_completed_up_to = priority_in_progress - 1
+
+    assert priority_completed_up_to >= args.id, f'Only completed up to priority = {priority_completed_up_to}'
 
     # go by reservation order
     curr.execute(
@@ -185,10 +222,54 @@ def process_sample(
     # keeps a running record of ongoing arbitrages by niche
     running_arbitrages: typing.Dict[typing.Any, CandidateArbitrageCampaign] = {}
 
-    exchanges_updated_since_start = set()
-    
-    def flush_arbitrage(exchanges, directions, niche, gas_price_group):
+    exchanges_updated_since_start: typing.Set[typing.Union[bytes, typing.Tuple[bytes, bytes, bytes]]] = set()
 
+    tmpdir: tempfile.TemporaryDirectory = None
+    proc: subprocess.Popen = None
+    w3_ganache = None
+    acct = None
+    shooter_address = None
+
+    def reopen_ganache(*_):
+        nonlocal tmpdir
+        nonlocal proc
+        nonlocal w3_ganache
+        nonlocal acct
+        nonlocal shooter_address
+
+        if proc is not None:
+            proc.kill()
+            proc.wait()
+            tmpdir.cleanup()
+
+        tmpdir = tempfile.TemporaryDirectory(dir='/mnt/goldphish/tmp')
+        proc, w3_ganache, acct, shooter_address = open_ganache(start_block - 1, tmpdir.name, worker_id)
+    reopen_ganache()
+
+    @backoff.on_exception(
+        backoff.expo,
+        asyncio.exceptions.TimeoutError,
+        max_time = 10 * 60,
+        factor = 4,
+        on_backoff = reopen_ganache,
+    )
+    def relay_with_retry(arb, prior_timestamp):
+        result = auto_adapt_attempt_shoot_candidate(
+            w3_ganache,
+            acct,
+            shooter_address,
+            arb,
+            InferredTokenTransferFeeCalculator(),
+            prior_timestamp,
+            must_recompute = False,
+        )
+        return result
+
+    def flush_arbitrage(exchanges, directions, niche, gas_price_group):
+        """
+        Close the running arbitrage described by the given parameters, and
+        insert the details into the database.
+        """
         maybe_running_arb = running_arbitrages.get((exchanges, directions, niche, gas_price_group), None)
         if maybe_running_arb is None:
             return
@@ -233,6 +314,10 @@ def process_sample(
                 flush_arbitrage(e, d, n, i)
 
     def push_running_arbitrage(exchanges, directions, niche, gas_price_group, block_number: int, profit: int, arb_id: int):
+        """
+        Mark an arbitrage as running on the given block. If it is already known to be running,
+        updates the running record.
+        """
         k = (exchanges, directions, niche, gas_price_group)
         if k not in running_arbitrages:
             running_arbitrages[k] = CandidateArbitrageCampaign(
@@ -255,43 +340,86 @@ def process_sample(
     relay_cache = {}
 
     def requires_lookback(exchanges, directions, niche, gas_price_group) -> bool:
+        """
+        Find out if the given circuit requires looking backward to see if it was ongoing from a
+        prior reservation.
+        """
         k_minor = (exchanges, directions)
         k = (exchanges, directions, niche, gas_price_group)
         if k_minor in does_not_need_lookback or k in does_not_need_lookback:
             return False
 
-        if len(exchanges_updated_since_start.intersection(exchanges)) > 0:
+        two_tuple_directions = list(zip(directions, list(directions[1:]) + [directions[0]]))
+
+        has_updated_since_start = exchanges_updated_since_start.intersection(exchanges)
+        if not has_updated_since_start:
+            # attempt to check for Balancer updates
+            for e, d in zip(exchanges, two_tuple_directions):
+                balancer_key = (e, *sorted(d))
+                if balancer_key in exchanges_updated_since_start:
+                    has_updated_since_start = True
+                    break
+
+        if has_updated_since_start:
+            # NOTE: we check before calling that this is not pre-existing
+
             # this updated since we started the scan, if it isn't already in the pre existing
             # arbitrage set then it doesn't need lookback, its definitely fresh
             does_not_need_lookback.add(k_minor)
             return False
 
         # find the most recent prior block where this was updated
-        curr2.execute(
-            '''
-            SELECT block_number
-            FROM exchanges_updated_in_block
-            WHERE block_number < %s AND exchange_address = ANY (%s)
-            ORDER BY block_number DESC
-            LIMIT 1
-            ''',
-            (start_block, list(exchanges))
-        )
-        if curr2.rowcount < 1:
-            # if not updated in prior block then this is fresh
-            does_not_need_lookback.add(k_minor)
-            return False
+        exchanges_and_tokens = []
+        for e, d in zip(exchanges, two_tuple_directions):
+            t1, t2 = sorted(d)
+            t1_id = get_token(w3, curr2, t1, start_block).id
+            t2_id = get_token(w3, curr2, t2, start_block).id
+            exchanges_and_tokens.append((e, t1_id, t2_id))
 
-        assert curr2.rowcount == 1
-        (most_recent_prior_updated_block,) = curr2.fetchone()
+        # t_start_exec = time.time()
+        # l.debug(f'query starting....')
+        # psycopg2.extras.execute_values(
+        #     curr2,
+        #     f'''
+        #     WITH exchange_directions AS (
+        #         SELECT *
+        #         FROM (VALUES %s) AS x(exchange, token1, token2)
+        #     )
+        #     SELECT eub.block_number
+        #     FROM (SELECT * FROM exchanges_updated_in_block WHERE block_number < {start_block}) eub
+        #     JOIN exchange_directions ed ON ed.exchange = eub.exchange_address
+        #     LEFT JOIN (SELECT * FROM balancer_tokens_updated_in_block WHERE block_number < {start_block}) bub ON
+        #         bub.block_number = eub.block_number AND
+        #         bub.exchange_address = eub.exchange_address
+        #     WHERE
+        #         (
+        #             bub.exchange_address IS NULL OR
+        #             (
+        #                 bub.token1_id = ed.token1 AND
+        #                 bub.token2_id = ed.token2
+        #             )
+        #         )
+        #     ORDER BY eub.block_number DESC
+        #     LIMIT 1
+        #     ''',
+        #     exchanges_and_tokens
+        # )
+        # l.debug(f'Took {time.time() - t_start_exec:.2f} seconds to query')
+        # if curr2.rowcount < 1:
+        #     # if not updated ever in prior block then this is fresh
+        #     does_not_need_lookback.add(k_minor)
+        #     return False
 
-        # if this is prior to origin of any exchanges, then no arbitrage here
+        # assert curr2.rowcount == 1
+        # (most_recent_prior_updated_block,) = curr2.fetchone()
+
+        # check exchange origins
         for e in exchanges:
-            if origin_blocks[e] > most_recent_prior_updated_block:
+            if origin_blocks[e] >= start_block:
                 does_not_need_lookback.add(k_minor)
                 return False
 
-        # detect arbitrages here
+        # detect arbitrages right before start of slot
         circuit = []
         for exc in exchanges:
             exc = w3.toChecksumAddress(exc)
@@ -302,10 +430,10 @@ def process_sample(
 
         pc = PricingCircuit(circuit, directions)
 
-        prior_timestamp = get_block_timestamp(w3, most_recent_prior_updated_block + 1)
+        prior_timestamp = get_block_timestamp(w3, start_block)
         maybe_arb = detect_arbitrages_bisection(
             pc,
-            most_recent_prior_updated_block,
+            start_block - 1,
             prior_timestamp,
             try_all_directions = False,
         )
@@ -329,7 +457,7 @@ def process_sample(
             blocks = gas_oracle_pts[niche_sz][0]
             pts = gas_oracle_pts[niche_sz][1][gas_price_group]
 
-        most_generous_gas_price = int(np.interp(most_recent_prior_updated_block, blocks, pts))
+        most_generous_gas_price = int(np.interp(start_block - 1, blocks, pts))
         generous_gas_usage = 100_000
         if arb.profit < most_generous_gas_price * generous_gas_usage:
             l.debug(f'Does not meet generous params')
@@ -341,22 +469,10 @@ def process_sample(
             result = maybe_cached_result
         else:
             # attempt to relay the arbitrage
-            with tempfile.TemporaryDirectory(dir='/mnt/goldphish/tmp') as tmpdir:
-                proc, w3_ganache, acct, shooter_address = open_ganache(most_recent_prior_updated_block, tmpdir, worker_id)
 
-                result = auto_adapt_attempt_shoot_candidate(
-                    w3_ganache,
-                    curr2,
-                    acct,
-                    shooter_address,
-                    arb,
-                    InferredTokenTransferFeeCalculator(),
-                    prior_timestamp,
-                    must_recompute = False,
-                )
+            # automatically snapshots and reverts ganache so dont worry abt it
+            result = relay_with_retry(arb, prior_timestamp)
 
-                proc.kill()
-                proc.wait()
             relay_cache[(exchanges, tuple(directions))] = result
 
         if not isinstance(result, AutoAdaptShootSuccess):
@@ -371,7 +487,7 @@ def process_sample(
         # this was pre-existing, compare the exact prior predicted gas price
         blocks = gas_oracle_pts[niche][0]
         pts = gas_oracle_pts[niche][1][gas_price_group]
-        prior_gas_price = int(np.interp(most_recent_prior_updated_block, blocks, pts))
+        prior_gas_price = int(np.interp(start_block - 1, blocks, pts))
         prior_profit = result.profit_no_fee - result.gas * prior_gas_price
         if prior_profit < 0:
             does_not_need_lookback.add(k)
@@ -420,7 +536,7 @@ def process_sample(
             FROM candidate_arbitrages ca
             JOIN candidate_arbitrage_relay_results carr ON carr.candidate_arbitrage_id = ca.id
             where block_number = %s
-            ORDER BY ca.id ASC
+            ORDER BY block_number, ca.id ASC
             ''',
             (block_number,),
         )
@@ -449,9 +565,9 @@ def process_sample(
             if not shoot_success:
                 flush_all_arbitrages(k_minor)
                 does_not_need_lookback.add(k_minor)
-                for (e, d, n, i) in list(running_pre_existing):
-                    if e == exchanges and d == directions:
-                        running_pre_existing.remove((e, d, n, i))
+                for (e, directions, n, i) in list(running_pre_existing):
+                    if e == exchanges and directions == directions:
+                        running_pre_existing.remove((e, directions, n, i))
                 continue
 
             for is_flashbots in [True, False]:
@@ -530,45 +646,97 @@ def process_sample(
             all_tracked_exchanges.update(exchanges)
 
         l.debug(f'Have {len(all_tracked_exchanges):,} exchanges involved in running arbitrages in block {block_number}')
+        t_query_start = time.time()
         curr2.execute(
             '''
-            SELECT exchange_address
-            FROM exchanges_updated_in_block
-            WHERE block_number = %s AND exchange_address = ANY (%s)
+            SELECT eub.exchange_address, t1.address, t2.address
+            FROM (SELECT * FROM exchanges_updated_in_block WHERE block_number = %(block_number)s) eub
+            LEFT JOIN (SELECT * FROM balancer_tokens_updated_in_block x WHERE x.block_number = %(block_number)s) bub ON
+                bub.block_number = eub.block_number AND
+                bub.exchange_address = eub.exchange_address
+            LEFT JOIN tokens t1 ON t1.id = bub.token1_id
+            LEFT JOIN tokens t2 ON t2.id = bub.token1_id
+            WHERE eub.exchange_address = ANY (%(exchanges)s)
             ''',
-            (block_number, list(all_tracked_exchanges))
+            {
+                'block_number': block_number,
+                'exchanges': list(all_tracked_exchanges)
+            }
         )
-        l.debug(f'Of all exchanges, {curr2.rowcount} updated this block')
+        l.debug(f'Of all exchanges, {curr2.rowcount} updated this block (query took {time.time() - t_query_start:.2f} s)')
 
-        updated_exchanges = set(x.tobytes() for (x,) in curr2)
+        updated_exchanges = set()
+        for updated_exchange_addr, t1_addr, t2_addr in curr2:
+            if t1_addr is not None:
+                assert t2_addr is not None
+                updated_exchanges.add((updated_exchange_addr.tobytes(), t1_addr.tobytes(), t2_addr.tobytes()))
+            else:
+                updated_exchanges.add(updated_exchange_addr.tobytes())
+
         exchanges_updated_since_start.update(updated_exchanges)
 
         # flush running arbitrages that state-updated this block but didnt show profit
-        for (exchanges, d, n, i), arb in list(running_arbitrages.items()):
-            if len(updated_exchanges.intersection(exchanges)) > 0 and arb.block_number_end != block_number:
-                flush_arbitrage(exchanges, d, n, i)
+        for (exchanges, directions, n, i), arb in list(running_arbitrages.items()):
+            if arb.block_number_end == block_number:
+                # we saw an update this block, don't worry about it
+                continue
+
+            # check for uniswap-based (2-pair) updates
+            no_longer_running = len(updated_exchanges.intersection(exchanges)) > 0
+            if not no_longer_running:
+                # check for balancer-based(3-pair)
+                two_tuple_directions = list(zip(directions, list(directions[1:]) + [directions[0]]))
+                for e, d in zip(exchanges, two_tuple_directions):
+                    balancer_key = (e, *sorted(d))
+                    if balancer_key in updated_exchanges:
+                        no_longer_running = True
+
+            if no_longer_running:
+                flush_arbitrage(exchanges, directions, n, i)
+
 
         # unmark mark pre-existing arbitrages that didn't show a profitable arbitrage in this block
         n_pre_existing_closed = 0
         for k in list(running_pre_existing):
-            exchanges, _, _, _ = k
-            if len(updated_exchanges.intersection(exchanges)) > 0 and k not in still_running_pre_existing_this_block:
+            if k in still_running_pre_existing_this_block:
+                # ignore, we saw an update...
+                continue
+            exchanges, directions, _, _ = k
+
+            # check for uniswap-based (2-pair) updates
+            no_longer_running = len(updated_exchanges.intersection(exchanges)) > 0
+            if not no_longer_running:
+                # check for balancer-based(3-pair)
+                two_tuple_directions = list(zip(directions, list(directions[1:]) + [directions[0]]))
+                for e, d in zip(exchanges, two_tuple_directions):
+                    balancer_key = (e, *sorted(d))
+                    if balancer_key in updated_exchanges:
+                        no_longer_running = True
+
+            if no_longer_running:
                 # this is no longer running
                 running_pre_existing.remove(k)
                 does_not_need_lookback.add(k)
                 n_pre_existing_closed += 1
+
         l.debug(f'Had {n_pre_existing_closed} pre-existing arbitrages closed this block')
+        l.debug(f'Have {len(running_pre_existing)} pre-existing arbitrages still running')
         l.debug(f'At block {block_number} have {len(running_arbitrages)} running arbitrage-gas pricer combinations')
 
-        # increment end block for everything else
+        # advance end block for everything else
         for k, r in list(running_arbitrages.items()):
             running_arbitrages[k] = r._replace(block_number_end=block_number)
 
-        curr2.connection.commit()
+        if not DEBUG:
+            curr2.connection.commit()
+
+    proc.kill()
+    proc.wait()
+    tmpdir.cleanup()
 
 
 
-def fill_modified_exchanges(w3: web3.Web3, args: argparse.Namespace, db: psycopg2.extensions.connection, curr: psycopg2.extensions.cursor):
+def fill_modified_exchanges(w3: web3.Web3, args: argparse.Namespace, curr: psycopg2.extensions.cursor):
     curr.execute('SELECT MIN(start_block), MAX(end_block) FROM block_samples')
     min_block, max_block = curr.fetchone()
 
@@ -578,8 +746,9 @@ def fill_modified_exchanges(w3: web3.Web3, args: argparse.Namespace, db: psycopg
     BATCH_SIZE = 200
 
     with tempfile.TemporaryDirectory(dir='/mnt/goldphish/tmp') as tmpdir:
-        pool = load_pool(w3, curr, tmpdir)
+        pool = load_pool(w3, curr, tmpdir, ___limit_to_balancer = True)
         pool.warm(our_slice_start - 1)
+        l.info(f'Warmed pool, starting....')
 
         t_start = time.time()
         t_last_update = time.time()
@@ -607,25 +776,66 @@ def fill_modified_exchanges(w3: web3.Web3, args: argparse.Namespace, db: psycopg
             logs = get_relevant_logs(w3, pool, batch_start, batch_end)
 
             for block_number, block_logs in logs:
+                n_balancer_updates = 0
                 update = pool.observe_block(block_number, block_logs)
+                reverse_update = collections.defaultdict(lambda: []) # lazy-filled later
                 updated_exchanges = set().union(*update.values())
-                # l.debug(f'block {block_number:,} has {len(updated_exchanges):,} updated exchanges')
 
                 for updated in sorted(updated_exchanges):
                     assert len(updated) == 42
 
-                    curr.execute(
-                        '''
-                        INSERT INTO exchanges_updated_in_block (block_number, exchange_address)
-                        VALUES (%s, %s)
-                        ''',
-                        (
-                            block_number,
-                            bytes.fromhex(updated[2:]),
-                        )
-                    )
+                    if updated in pool._balancer_v1_pools or updated in pool._balancer_v2_pools:
+                        # we need to insert also the specific token pairs that were updated here
+                        if len(reverse_update) == 0:
+                            # lazy-fill the reverse map from address to updated tokens
+                            for pair, addresses in update.items():
+                                for address in addresses:
+                                    reverse_update[address].append(pair)
+                        
+                        inserted_pairs = set()
+                        for pair in reverse_update[updated]:
+                            b1, b2 = (bytes.fromhex(pair[0][2:]), bytes.fromhex(pair[1][2:]))
+                            if b1 > b2:
+                                pair = (pair[1], pair[0])
 
-    db.commit()
+                            # avoid inserting dupes
+                            if pair in inserted_pairs:
+                                continue
+                            inserted_pairs.add(pair)
+
+                            t1_id = get_token(w3, curr, pair[0], block_number).id
+                            t2_id = get_token(w3, curr, pair[1], block_number).id
+
+                            curr.execute(
+                                '''
+                                INSERT INTO balancer_tokens_updated_in_block (block_number, exchange_address, token1_id, token2_id)
+                                VALUES (%(block_number)s, %(exchange_address)s, %(t1_id)s, %(t1_id)s)
+                                ''',
+                                {
+                                    'block_number':     block_number,
+                                    'exchange_address': bytes.fromhex(updated[2:]),
+                                    't1_id': t1_id,
+                                    't2_id': t2_id,
+                                }
+                            )
+                            assert curr.rowcount == 1, f'Potentially did not find one of tokens {pair}'
+                            n_balancer_updates += 1
+
+                    # curr.execute(
+                    #     '''
+                    #     INSERT INTO exchanges_updated_in_block (block_number, exchange_address)
+                    #     VALUES (%s, %s)
+                    #     ''',
+                    #     (
+                    #         block_number,
+                    #         bytes.fromhex(updated[2:]),
+                    #     )
+                    # )
+                if n_balancer_updates > 0:
+                    l.debug(f'block {block_number:,} had {n_balancer_updates:,} balancer token updates inserted')
+
+    if not DEBUG:
+        curr.connection.commit()
     l.info('Done')
 
 
@@ -642,6 +852,16 @@ def setup_db(
 
         CREATE INDEX IF NOT EXISTS idx_exchanges_updated_in_block_block_number ON exchanges_updated_in_block (block_number);
         CREATE INDEX IF NOT EXISTS idx_exchanges_updated_in_block_exchange_address ON exchanges_updated_in_block USING HASH (exchange_address);
+
+        CREATE TABLE IF NOT EXISTS balancer_tokens_updated_in_block (
+            block_number     INTEGER NOT NULL,
+            exchange_address BYTEA NOT NULL,
+            token1_id        INTEGER NOT NULL REFERENCES tokens (id),
+            token2_id        INTEGER NOT NULL REFERENCES tokens (id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_balancer_tokens_updated_bn ON balancer_tokens_updated_in_block (block_number);
+        CREATE INDEX IF NOT EXISTS idx_balancer_tokens_updated_ea ON balancer_tokens_updated_in_block USING HASH (exchange_address);
 
         CREATE TABLE IF NOT EXISTS candidate_arbitrage_campaigns (
             id                       SERIAL NOT NULL PRIMARY KEY,
@@ -674,4 +894,3 @@ def setup_db(
 #     else:
 #         l.info(f'using default start block {default:,}')
 #         return default
-

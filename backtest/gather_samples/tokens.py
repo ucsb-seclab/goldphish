@@ -78,6 +78,9 @@ def get_token(
         token_address: str,
         block_identifier: int
     ) -> Token:
+    if isinstance(token_address, bytes):
+        assert len(token_address) == 20
+        token_address = w3.toChecksumAddress(token_address)
     if token_address not in _token_cache:
         assert web3.Web3.isChecksumAddress(token_address)
 
@@ -89,12 +92,13 @@ def get_token(
             ''',
             (token_address_bytes,),
         )
+        # assert curr.rowcount > 0, f'Failed to get token record for {token_address}'
         if curr.rowcount > 0:
             assert curr.rowcount == 1
             id_, name, symbol = curr.fetchone()
         else:
             # we need to insert it
-            curr.execute('LOCK TABLE tokens')
+            # curr.execute('LOCK TABLE tokens')
             curr.execute(
                 '''
                 SELECT id, name, symbol FROM tokens WHERE address = %s

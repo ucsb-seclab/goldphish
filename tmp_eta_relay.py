@@ -1,11 +1,12 @@
 import datetime
+import subprocess
 import time
 from backtest.utils import connect_db
 
 db = connect_db()
 curr = db.cursor()
 
-TARGET_PRIORITY = 49
+TARGET_PRIORITY = 29
 
 curr.execute(
     '''
@@ -20,11 +21,18 @@ curr.execute(
 
 print(f'Have {n_blocks_to_target:,} blocks in total to relay to complete to priority {TARGET_PRIORITY}')
 
+def push_msg(s):
+    subprocess.call(['push', s])
+
 last_marks = []
 last_ts = []
 
+crossed_thirty = False
+last_priority = None
+
+
 while True:
-    time.sleep(5)
+    time.sleep(10)
     db.rollback()
     curr.execute('select count(*) from candidate_arbitrage_reshoot_blocks where completed_on is not null')
     (n_blocks,) = curr.fetchone()
@@ -32,6 +40,7 @@ while True:
     last_ts.append(time.time())
     last_marks = last_marks[-500:]
     last_ts = last_ts[-500:]
+
 
     if len(last_marks) >= 2:
         curr.execute(
@@ -44,6 +53,18 @@ while True:
             '''
         )
         (priority_in_progress,) = curr.fetchone()
+
+        # if not crossed_thirty:
+        #     if priority_in_progress > 29:
+        #         push_msg('30 days relayed')
+        #         crossed_thirty = True
+
+        # if last_priority is None:
+        #     last_priority = priority_in_progress
+        # else:
+        #     if last_priority != priority_in_progress:
+        #         push_msg(f'Just completed priority={last_priority}')
+        #         last_priority = priority_in_progress
 
         curr.execute(
             '''

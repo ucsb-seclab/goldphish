@@ -93,12 +93,12 @@ def scrape_range(curr: psycopg2.extensions.cursor) -> typing.Tuple[int, int]:
         '''
     )
     (last_end,) = curr.fetchone()
-    if False: # last_end is not None: TODO put this back
+    if last_end is not None: # TODO put this back
         start_block = last_end + 1
     else:
         curr.execute('SELECT MIN(block_number) FROM sample_arbitrages')
         (start_block,) = curr.fetchone()
-        start_block = 14319428
+        # start_block = 14319428
     
     curr.execute('SELECT MAX(block_number) FROM sample_arbitrages')
     (end_block,) = curr.fetchone()
@@ -106,6 +106,8 @@ def scrape_range(curr: psycopg2.extensions.cursor) -> typing.Tuple[int, int]:
 
 
 def scrape_v4(w3: web3.Web3, curr: psycopg2.extensions.cursor, start_block: int, end_block: int):
+    start_block = 14324573
+
     l.info('scraping v4')
     zerox_proxy: web3.contract.Contract = w3.eth.contract(
         address = '0xDef1C0ded9bec7F1a1670819833240f027b25EfF',
@@ -224,6 +226,8 @@ def scrape_v3(w3: web3.Web3, curr: psycopg2.extensions.cursor, start_block: int,
         exchange_extended = '0x' + addr[2:].rjust(64, '0')
         exchanges_extended.append(exchange_extended)
 
+    exchanges_extended = set(bytes.fromhex(x[2:]) for x in exchange_extended)
+
     curr.execute(
         '''
         CREATE TEMP TABLE tmp_zeroxs (exchange_id INTEGER NOT NULL, txn_hash BYTEA NOT NULL);
@@ -244,18 +248,19 @@ def scrape_v3(w3: web3.Web3, curr: psycopg2.extensions.cursor, start_block: int,
 
         f: web3._utils.filters.Filter = w3.eth.filter({
             'address': '0x61935CbDd02287B511119DDb11Aeb42F1593b7Ef',
-            'topics': ['0x6869791f0a34781b29882982cc39e882768cf2c96995c2a110c577c53bc932d5', exchanges_extended],
+            'topics': ['0x6869791f0a34781b29882982cc39e882768cf2c96995c2a110c577c53bc932d5'],
             'fromBlock': batch_start,
             'toBlock': batch_end_exclusive,
         })
         logs = f.get_all_entries()
 
-        l.debug(f'Have {len(logs):,} for this batch')
+        l.debug(f'Have {len(logs):,} logs for this batch')
 
         n_marked = 0
         for log in logs:
             fill = zerox.events.Fill().processLog(log)
-            assert fill['args']['makerAddress'] in exchanges
+            if fill['args']['makerAddress'] not in exchanges:
+                continue
 
             curr.execute(
                 'INSERT INTO tmp_zeroxs (exchange_id, txn_hash) VALUES (%s, %s)',
