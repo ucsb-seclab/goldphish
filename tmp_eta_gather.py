@@ -25,8 +25,8 @@ while True:
     (n_ress_completed,) = curr.fetchone()
     last_marks.append(n_ress_completed)
     last_ts.append(time.time())
-    last_marks = last_marks[-100:]
-    last_ts = last_ts[-100:]
+    last_marks = last_marks[-400:]
+    last_ts = last_ts[-400:]
 
     if len(last_marks) >= 2:
         period_ress = last_marks[-1] - last_marks[0]

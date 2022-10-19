@@ -55,6 +55,10 @@ class TooLittleInput(Exception):
     def __init__(self, *args) -> None:
         super().__init__(*args)
 
+class TokenNotAvailable(Exception):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
 
 class BalancerPricer(BaseExchangePricer):
     RELEVANT_LOGS = [
@@ -166,11 +170,9 @@ class BalancerPricer(BaseExchangePricer):
         _tokens = self.get_tokens(block_identifier)
 
         if token_in not in _tokens:
-            l.warning(f'Token not available: {self.address} {token_in}')
-            return 0, 0.0
-        elif token_out not in _tokens:
-            l.warning(f'Token not available: {self.address} {token_out}')
-            return 0, 0.0
+            raise TokenNotAvailable(f'Token {token_in} not available in {self.address} at {block_identifier}')
+        if token_out not in _tokens:
+            raise TokenNotAvailable(f'Token {token_out} not available in {self.address} at {block_identifier}')
 
         token_weight_in  = self.get_denorm_weight(token_in,  block_identifier)
         token_weight_out = self.get_denorm_weight(token_out, block_identifier)

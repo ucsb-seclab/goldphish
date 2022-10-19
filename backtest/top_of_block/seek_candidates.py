@@ -34,7 +34,7 @@ LOG_BATCH_SIZE = 100
 DEBUG = False
 
 TMP_REMOVE_ME_FOR_FIXUP_ONLY = True
-find_circuit.monitor.TMP_FIXUP_REMOVE_ME = TMP_REMOVE_ME_FOR_FIXUP_ONLY
+# find_circuit.monitor.TMP_FIXUP_REMOVE_ME = TMP_REMOVE_ME_FOR_FIXUP_ONLY
 
 def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.Callable[[web3.Web3, argparse.Namespace], None]]:
     parser_name = 'seek-candidates'

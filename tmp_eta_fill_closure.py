@@ -6,29 +6,19 @@ from backtest.utils import connect_db
 db = connect_db()
 curr = db.cursor()
 
-TARGET_PRIORITY = 39
-
 curr.execute(
     '''
     SELECT COUNT(*)
-    FROM candidate_arbitrage_reshoot_blocks
-    WHERE priority <= %s
+    FROM top_candidate_arbitrage_campaigns
     ''',
-    (TARGET_PRIORITY,)
 )
 
-(n_blocks_to_target,) = curr.fetchone()
+(n_campaigns,) = curr.fetchone()
 
-print(f'Have {n_blocks_to_target:,} blocks in total to relay to complete to priority {TARGET_PRIORITY}')
-
-def push_msg(s):
-    subprocess.call(['push', s])
+print(f'Have {n_campaigns:,} campaigns in total')
 
 last_marks = []
 last_ts = []
-
-crossed_thirty = False
-last_priority = None
 
 
 while True:

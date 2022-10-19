@@ -58,8 +58,8 @@ def main():
     start_block, end_block = scrape_range(curr)
     l.info(f'scraping from {start_block:,} to {end_block:,}')
     
-    # scrape_v3(w3, curr, start_block, end_block)
-    scrape_v4(w3, curr, start_block, end_block)
+    scrape_v3(w3, curr, start_block, end_block)
+    # scrape_v4(w3, curr, start_block, end_block)
 
 
 def setup_db(curr: psycopg2.extensions.cursor):

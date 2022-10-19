@@ -141,7 +141,7 @@ def fill_txn_coinbase_transfers(
                 queue = [resp['result']]
                 while len(queue) > 0:
                     item = queue.pop()
-                    if w3.toChecksumAddress(item['to']) == miner:
+                    if w3.toChecksumAddress(item['to']) == miner and 'value' in item:
                         xfer_amt += int(item['value'][2:], base=16)
                     queue += item.get('calls', [])
 

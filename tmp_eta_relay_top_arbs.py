@@ -37,7 +37,7 @@ while True:
         '''
         SELECT SUM(cnt)::integer
         FROM (SELECT * FROM top_candidate_arbitrage_reservations WHERE claimed_on IS NOT NULL) tcar
-        JOIN tmp_count_by_block tcb ON tcar.start_block <= tcb.block_number AND tcb.block_number <= tcar.progress
+        JOIN tmp_count_by_block tcb ON tcar.start_block <= tcb.block_number AND tcb.block_number <= LEAST(tcar.end_block, tcar.progress)
         '''
     )
     (n_processed,) = curr.fetchone()

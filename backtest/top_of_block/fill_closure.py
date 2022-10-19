@@ -42,27 +42,65 @@ def fill_closure(w3: web3.Web3, args: argparse.Namespace):
     db = connect_db()
     curr = db.cursor()
 
+
+    if args.fixup_db:
+        split_reservations(curr)
+        db.commit()
+        return
+
     if args.setup_db:
         setup_db(curr)
         db.commit()
         l.info('Setup db')
         return
 
-    l.info(f'Filling closure...')
+    if args.worker_name is None:
+        print('Must supply worker_name', file=sys.stderr)
+        exit(1)
 
+    l.info(f'Filling closure...')
+    while True:
+        db.commit()
+        curr.execute(
+            '''
+            SELECT id, start_block, end_block
+            FROM top_candidate_closure_reservations
+            WHERE claimed_on IS NULL
+            ORDER BY id ASC
+            FOR UPDATE SKIP LOCKED
+            ''',
+        )
+        if curr.rowcount == 0:
+            print('Done')
+            break
+
+        (id_, start_block, end_block) = curr.fetchone()
+        curr.execute('UPDATE top_candidate_closure_reservations SET claimed_on = now()::timestamp, worker = %s WHERE id = %s', (args.worker_name, id_))
+        db.commit()
+
+        process_reservation(curr, w3, start_block, end_block, id_)
+        curr.execute('UPDATE top_candidate_closure_reservations SET completed_on = now()::timestamp WHERE id = %s', (id_,))
+        db.commit()
+
+
+
+def process_reservation(curr: psycopg2.extensions.cursor, w3: web3.Web3, start_block: int, end_block: int, reservation_id: int):
     curr.execute(
         '''
-        SELECT id
+        SELECT id, start_block
         FROM top_candidate_arbitrage_campaigns tcac
-        WHERE NOT EXISTS(SELECT FROM top_candidate_arbitrage_campaign_terminations WHERE tcac.id = campaign_id)
-        '''
+        WHERE NOT EXISTS(SELECT FROM top_candidate_arbitrage_campaign_terminations WHERE tcac.id = campaign_id) AND
+            %s <= tcac.start_block AND tcac.start_block <= %s
+        ORDER BY start_block ASC
+        ''',
+        (start_block, end_block)
     )
     n_to_check = curr.rowcount
     l.info(f'Have {n_to_check:,} top arbitrage campaigns to check for terminating transaction')
 
     t_start = time.time()
     t_last_update = t_start
-    for i, (id_,) in enumerate(curr.fetchall()):
+    for i, (id_, start_block) in enumerate(curr.fetchall()):
         if time.time() > t_last_update + 10:
             # do an update
             t_last_update = time.time()
@@ -73,10 +111,13 @@ def fill_closure(w3: web3.Web3, args: argparse.Namespace):
             eta = datetime.timedelta(seconds=eta_s)
             l.info(f'{i:,} of {n_to_check:,} ({i / n_to_check * 100:.2f}%) ETA {eta}')
             if not DEBUG:
-                db.commit()
+                curr.execute('UPDATE top_candidate_closure_reservations SET progress = %s WHERE id = %s', (start_block, reservation_id,))
+                curr.connection.commit()
         check_campaign_termination(w3, curr, id_)
+
     if not DEBUG:
-        db.commit()
+        curr.execute('UPDATE top_candidate_closure_reservations SET progress = end_block WHERE id = %s', (reservation_id,))
+        curr.connection.commit()
 
 
 def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, id_: int):
@@ -132,7 +173,7 @@ def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, 
     terminal_threshold = min(10 ** 18, max_profit // 2)
     l.debug(f'Terminal threshold: {terminal_threshold / (10 ** 18):.3f} ETH')
 
-    # see at which block it drops below 50%
+    # see at which block it drops below 50% or 1 ETH, whichever is lowerst
     idx_last_in_campaign = idx_max_profit
     for i, (block_number, profit) in enumerate(block_with_profit[idx_max_profit+1:]):
         if profit <= terminal_threshold:
@@ -237,7 +278,14 @@ def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, 
         l.debug(f'Applying transaction index #{txn_idx}: {txn_hash.hex()}')
 
         for pricer in pricers:
-            pricer.observe_block(logs, force_load = True)
+            try:
+                pricer.observe_block(logs, force_load = True)
+            except Exception as e:
+                if 'cannot force load on GULP' in str(e):
+                    l.critical('Cannot force load on gulp, giving up....')
+                    break
+                else:
+                    raise
 
 
         maybe_fa = detect_arbitrages_bisection(
@@ -282,9 +330,70 @@ def check_campaign_termination(w3: web3.Web3, curr: psycopg2.extensions.cursor, 
 def setup_db(curr: psycopg2.extensions.cursor):
     curr.execute(
         '''
+        CREATE TABLE IF NOT EXISTS top_candidate_closure_reservations (
+            id INTEGER NOT NULL PRIMARY KEY,
+            start_block  INTEGER NOT NULL,
+            end_block    INTEGER NOT NULL,
+            worker       TEXT,
+            progress     INTEGER,
+            claimed_on   TIMESTAMP WITHOUT TIME ZONE,
+            heartbeat    TIMESTAMP WITHOUT TIME ZONE,
+            completed_on TIMESTAMP WITHOUT TIME ZONE
+        );
+
         CREATE TABLE IF NOT EXISTS top_candidate_arbitrage_campaign_terminations (
             campaign_id INTEGER PRIMARY KEY NOT NULL REFERENCES top_candidate_arbitrage_campaigns (id) ON DELETE CASCADE,
             terminating_transaction BYTEA
         );
         '''
     )
+
+    curr.execute('SELECT COUNT(*) FROM top_candidate_closure_reservations')
+    (n_res,) = curr.fetchone()
+    if n_res == 0:
+        l.info('Filling reservations')
+        curr.execute(
+            '''
+            INSERT INTO top_candidate_closure_reservations (id, start_block, end_block)
+            SELECT priority, start_block, end_block
+            FROM block_samples
+            '''
+        )
+        l.info(f'Filled {curr.rowcount:,} reservations')
+
+def split_reservations(curr: psycopg2.extensions.cursor):
+    curr.execute('SELECT MAX(id) FROM top_candidate_closure_reservations')
+    (max_id,) = curr.fetchone()
+    curr.execute(
+        '''
+        SELECT id, start_block, end_block
+        FROM top_candidate_closure_reservations
+        WHERE claimed_on is null
+        '''
+    )
+    l.info(f'Splitting up {curr.rowcount} reservations')
+    next_id = max_id + 1
+    for id_, start_block, end_block in curr.fetchall():
+        curr.execute(
+            '''
+            DELETE FROM top_candidate_closure_reservations WHERE id = %s
+            ''',
+            (id_,)
+        )
+        midpoint = (start_block + end_block) // 2
+        curr.execute(
+            '''
+            INSERT INTO top_candidate_closure_reservations (id, start_block, end_block)
+            VALUES (%s, %s, %s)
+            ''',
+            (next_id, start_block, midpoint)
+        )
+        curr.execute(
+            '''
+            INSERT INTO top_candidate_closure_reservations (id, start_block, end_block)
+            VALUES (%s, %s, %s)
+            ''',
+            (next_id + 1, midpoint + 1, end_block)
+        )
+        next_id += 2
+    input('ENTER to continue')

@@ -32,6 +32,8 @@ l = logging.getLogger(__name__)
 uv2_factory: web3.contract.Contract = web3.Web3().eth.contract(address=b'\x00'*20, abi=get_abi('uniswap_v2/IUniswapV2Factory.json'))
 uv3_factory: web3.contract.Contract = web3.Web3().eth.contract(address=b'\x00'*20, abi=get_abi('uniswap_v3/IUniswapV3Factory.json'))
 
+DEBUG = False
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--fill', action='store_true', help='fill the work queue', dest='fill')
@@ -285,8 +287,8 @@ def get_reservations(curr: psycopg2.extensions.cursor) -> typing.Iterator[typing
     Returns (reservation_id, start, end_exclusive)
     """
     while True:
-        # get a fresh transaction
-        curr.connection.commit()
+        if not DEBUG:
+            curr.connection.commit()
         curr.execute(
             '''
             SELECT id, start_block, end_block_exclusive
@@ -306,7 +308,8 @@ def get_reservations(curr: psycopg2.extensions.cursor) -> typing.Iterator[typing
 
         curr.execute('UPDATE backrun_detection_reservations SET started_on = now()::timestamp WHERE id = %s', (reservation_id,))
         assert curr.rowcount == 1
-        curr.connection.commit()
+        if not DEBUG:
+            curr.connection.commit()
         yield (reservation_id, start_block, end_block_exclusive)
 
 
@@ -354,8 +357,8 @@ def do_reorder(w3_mainnet: web3.Web3, w3_ganache: web3.Web3, curr: psycopg2.exte
     curr.execute(
         '''
         SELECT id, txn_hash
-        FROM sample_arbitrages
-        WHERE %s <= block_number AND block_number < %s
+        FROM sample_arbitrages_no_fp sa
+        WHERE %s <= block_number AND block_number < %s AND NOT EXISTS(SELECT FROM sample_arbitrage_backrun_detections WHERE sample_arbitrage_id = sa.id)
         ''',
         (reservation_start, reservation_end_exclusive),
     )
@@ -366,14 +369,16 @@ def do_reorder(w3_mainnet: web3.Web3, w3_ganache: web3.Web3, curr: psycopg2.exte
         result = test_a_reorder(curr, w3_mainnet, w3_ganache, id_, txn_hash)
         insert_reorder_result(curr, id_, txn_hash, result)
         if id_ & 0x7 == 0:
-            curr.connection.commit()
+            if not DEBUG:
+                curr.connection.commit()
 
     l.info(f'finished with reservation id={reservation_id:,}')
     curr.execute(
         'UPDATE backrun_detection_reservations SET finished_on = now()::timestamp WHERE id = %s',
         (reservation_id,)
     )
-    curr.connection.commit()
+    if not DEBUG:
+        curr.connection.commit()
 
 
 class ReshootResult:

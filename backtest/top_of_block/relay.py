@@ -31,7 +31,7 @@ import pricers
 from backtest.utils import connect_db, erc20
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
-from pricers.balancer import BalancerPricer
+from pricers.balancer import BalancerPricer, TokenNotAvailable
 from pricers.balancer_v2.liquidity_bootstrapping_pool import BalancerV2LiquidityBootstrappingPoolPricer
 from pricers.balancer_v2.weighted_pool import BalancerV2WeightedPoolPricer
 from pricers.base import BaseExchangePricer, NotEnoughLiquidityException
@@ -56,19 +56,22 @@ SHOOTER_ARTIFACT_PATH = pathlib.Path(__file__).parent.parent.parent / 'artifacts
 
 BLOCKS_PER_DAY = 6_646
 
-assert os.path.isfile(SHOOTER_ARTIFACT_PATH)
+if os.path.isfile(SHOOTER_ARTIFACT_PATH):
+    with open(SHOOTER_ARTIFACT_PATH) as fin:
+        SHOOTER_ARTIFACT = json.load(fin)
 
-with open(SHOOTER_ARTIFACT_PATH) as fin:
-    SHOOTER_ARTIFACT = json.load(fin)
+    generic_shooter: web3.contract.Contract = web3.Web3().eth.contract(address=web3.Web3.toChecksumAddress(b'\x00'*20), abi=SHOOTER_ARTIFACT['abi'])
 
-generic_shooter: web3.contract.Contract = web3.Web3().eth.contract(address=web3.Web3.toChecksumAddress(b'\x00'*20), abi=SHOOTER_ARTIFACT['abi'])
+    DO_APPROVE_SELECTOR = bytes.fromhex(
+        generic_shooter.functions.doApprove(
+            web3.Web3.toChecksumAddress(b'\x00'*20),
+            web3.Web3.toChecksumAddress(b'\x00'*20),
+        ).selector[2:]
+    )
 
-DO_APPROVE_SELECTOR = bytes.fromhex(
-    generic_shooter.functions.doApprove(
-        web3.Web3.toChecksumAddress(b'\x00'*20),
-        web3.Web3.toChecksumAddress(b'\x00'*20),
-    ).selector[2:]
-)
+else:
+    print('WARNING cannot load shooter here')
+    SHOOTER_ARTIFACT = None
 
 BANNED_TOKENS = frozenset((
     '0xD46bA6D942050d489DBd938a2C909A5d5039A161', # Ampleforth -- rebasing token, fucks up with DEX
@@ -384,29 +387,29 @@ def process_reservation(
                 banned_tokens.add(result.token_address)
                 new_banned_tokens.add(result.token_address)
                 n_banned_skipped += 1
-                results_failure[candidate.id_] = f'Broken token/s: {result.token_address}'
+                results_failure[candidate.id_] = f'Broken token: {result.token_address}'
             elif isinstance(result, DiagnosisBadExchange):
                 banned_exchanges.add(result.exchange)
                 new_banned_exchanges.add(result.exchange)
                 n_banned_skipped += 1
-                results_failure[candidate.id_] = f'Broken exchange/s: {result.exchange}'
+                results_failure[candidate.id_] = f'Bad exchange: {result.exchange}'
             elif isinstance(result, DiagnosisOther):
-                results_failure[candidate.id_] = result.reason
+                results_failure[candidate.id_] = f'Other {result.reason}'
             elif isinstance(result, DiagnosisNoArbitrageOnFeeApplied):
                 n_no_arb_on_fee += 1
-                results_failure[candidate.id_] = f'No arbitrage after applying fees'
+                results_failure[candidate.id_] = f'No arbitrage after fee'
             elif isinstance(result, DiagnosisExchangeInterference):
                 if result.token_address in interfering_tokens:
                     interfering_tokens[result.token_address].add(result.exchange_address)
                 else:
                     interfering_tokens[result.token_address] = set((result.exchange_address,))
-                results_failure[candidate.id_] = f'Token interferes with a circuit exchange'
+                results_failure[candidate.id_] = f'token-exchange interference'
             elif isinstance(result, DiagnosisIncompatibleToken):
                 if result.exchange_address in incompatible_tokens:
                     incompatible_tokens[result.exchange_address].add(result.token_address)
                 else:
                     interfering_tokens[result.exchange_address] = set((result.token_address,))
-                results_failure[candidate.id_] = f'Token incompatible with {result.exchange_address}'
+                results_failure[candidate.id_] = f'incompatible token {result.token_address} / {result.exchange_address}'
             elif isinstance(result, AutoAdaptShootSuccess):
                 results_success[candidate.id_] = result
             else:
@@ -423,6 +426,16 @@ def process_reservation(
             l.exception('could not kill proc')
 
     # assert len(results_success) + len(results_failure) == len(candidates)
+    psycopg2.extras.execute_values(
+        curr,
+        '''
+        INSERT INTO candidate_arbitrage_relay_results (candidate_arbitrage_id, shoot_success, failure_reason) VALUES %s
+        ''',
+        ((id_, False, reason) for id_, reason in results_failure.items()),
+    )
+
+    if len(results_success) > 0:
+        l.critical('Had success??????????????? weird!!!!!!!!!')
 
     # assign IDs to all the tokens fees we just inferred
     inferred_fee_with_ids: typing.Dict[TokenFee, TokenFee] = {}
@@ -533,6 +546,35 @@ def fixup_db(curr: psycopg2.extensions.cursor):
     if resp.lower() != 'yes':
         print('bye')
         return
+
+    # if True:
+    #     assert time.time() < 1665213115.1549613 + 60 * 20
+    #     curr.execute(
+    #         '''
+    #         CREATE TEMP TABLE tmp_needed_blocks AS
+    #         SELECT DISTINCT block_number
+    #         FROM (
+    #             SELECT *
+    #             FROM carr_dedup cd
+    #             WHERE NOT EXISTS(SELECT FROM candidate_arbitrage_relay_results carr WHERE carr.candidate_arbitrage_id = cd.candidate_arbitrage_id)
+    #         ) x
+    #         JOIN candidate_arbitrages ca ON ca.id = x.candidate_arbitrage_id
+    #         '''
+    #     )
+    #     print(f'Have {curr.rowcount:,} blocks to re-queue')
+    #     curr.execute(
+    #         '''
+    #         UPDATE candidate_arbitrage_reshoot_blocks carb
+    #         SET claimed_on = Null, worker = null, completed_on = null
+    #         WHERE EXISTS(SELECT FROM tmp_needed_blocks tnb WHERE tnb.block_number = carb.block_number)
+    #         '''
+    #     )
+    #     print(f'Updated {curr.rowcount} reservations')
+    #     ans = input('type yes to continue')
+    #     if ans.strip().lower() != 'yes':
+    #         curr.connection.rollback()
+    #         exit()
+    #     return
 
     curr.execute(
         '''
@@ -904,7 +946,7 @@ class CandidateArbitrage(typing.NamedTuple):
 
 def get_candidates_in_block(
         curr: psycopg2.extensions.cursor,
-        block_number: int
+        block_number: int,
     ) -> typing.List[
         CandidateArbitrage
     ]:
@@ -1906,7 +1948,12 @@ def relay_top_arbs_in_range(
             #
             # attempt to do the relaying
             l.debug(f'Relaying candidate id={candidate.id_}')
-            new_campaign_or_failure_reason = relay_top_candidate(w3, curr, account, relayer_address, timestamp_to_use, simplified_window, candidate, fa, campaign, worker_id)
+            try:
+                new_campaign_or_failure_reason = relay_top_candidate(w3, curr, account, relayer_address, timestamp_to_use, simplified_window, candidate, fa, campaign, worker_id)
+            except TokenNotAvailable as e:
+                new_campaign_or_failure_reason = f'Balancer v1: {str(e)}'
+                l.critical(f'Balancer v1 token not available: {str(e)}')
+
             assert isinstance(new_campaign_or_failure_reason, (str, TopArbCampaign)), f'unexpected new_campaign={repr(new_campaign)}'
 
             if isinstance(new_campaign_or_failure_reason, str):
@@ -2360,33 +2407,6 @@ def dedupe_top_arbs(curr: psycopg2.extensions.cursor):
     )
     (n_top_campaigns,) = curr.fetchone()
 
-    # # just do a poly(n) comparison, it's rather small iirc
-
-    # campaigns_by_key = collections.defaultdict(lambda: [])
-
-    # curr.execute(
-    #     '''
-    #     SELECT id, start_block, end_block, exchanges, directions
-    #     FROM top_candidate_arbitrage_campaigns
-    #     '''
-    # )
-    # for id_, start_block, end_block, exchanges, directions in curr:
-    #     exchanges = tuple((e.tobytes() for e in exchanges))
-    #     directions = tuple((d.tobytes() for d in directions))
-    #     k = (exchanges, directions)
-
-    #     campaigns_by_key[k].append((id_, start_block, end_block))
-
-    # l.info(f'Have {len(campaigns_by_key):,} sorts of campaign to look through')
-
-    # for (exchanges, directions), campaigns in campaigns_by_key.items():
-
-    #     # build a conflict graph
-    #     g = nx.Graph()
-
-    #     for id1, start_block1, end_block1 in campaigns:
-    #         for id2, start_block2
-
 
     curr.execute(
         '''
@@ -2415,53 +2435,33 @@ def dedupe_top_arbs(curr: psycopg2.extensions.cursor):
     components: typing.Set[int] = list(nx.connected_components(g))
     l.info(f'Have {len(components)} conflict clusters')
 
+    to_remove = set()
+    to_keep = set()
     for c in components:
-        # there should be one campaign that covers all others...
-        min_block = min(g.nodes[x]['start_block'] for x in c)
-        max_block = max(g.nodes[x]['end_block'] for x in c)
-
-        # see if there's one that meets crieteria
+        # use the one with the longest duration, idk
+        longest_dur = -1
+        longest_dur_id = None
         for id_ in c:
-            if g.nodes[id_]['start_block'] == min_block and g.nodes[id_]['end_block'] == max_block:
-                break
-        else:
-            curr.execute(
-                '''
-                SELECT start_block
-                FROM block_samples
-                WHERE %s <= start_block and start_block <= %s
-                ORDER BY start_block ASC
-                ''',
-                (min_block, max_block)
-            )
-            for (s,) in curr:
-                print(f'boundary: {s:,}')
+            duration = g.nodes[id_]['end_block'] - g.nodes[id_]['start_block'] + 1
+            assert duration > 0
+            if duration > longest_dur:
+                longest_dur = duration
+                longest_dur_id = id_
 
-            intervals = [(g.nodes[x]['start_block'], g.nodes[x]['end_block'], x) for x in c]
-            intervals = sorted(intervals)
-            for s, e, i in intervals:
-                print(s, e, i)
-            import pdb; pdb.set_trace()
+        to_remove.update(set(c).difference([id_,]))
+        to_keep.add(id_)
 
-        # # ensure they all overlap, otherwise this is awkawrd ...
-        # for id1 in c:
-        #     for id2 in c:
-        #         if id1 > id2:
-        #             continue
-                
-        #         dat1 = g.nodes[id1]
-        #         dat2 = g.nodes[id2]
+    assert len(to_keep.intersection(to_remove)) == 0
 
-        #         if dat2['start_block'] <= dat1['start_block'] <= dat2['end_block']:
-        #             continue
-        #         if dat2['start_block'] <= dat1['end_block'] <= dat2['end_block']:
-        #             continue
-        #         if dat1['start_block'] <= dat2['end_block'] <= dat1['end_block']:
-        #             continue
+    l.info(f'Removing {len(to_remove):,} campaigns...')
 
-        #         import pdb; pdb.set_trace()
-
-    # l.info(f'Removing {len(to_rm):,} campaigns...')
+    curr.execute(
+        '''
+        UPDATE top_candidate_arbitrage_campaigns SET removed = true WHERE id = ANY (%s)
+        ''',
+        (list(to_remove),)
+    )
+    curr.connection.commit()
 
     exit()
 

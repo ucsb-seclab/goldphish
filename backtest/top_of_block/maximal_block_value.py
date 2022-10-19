@@ -26,6 +26,8 @@ def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.
     parser: argparse.ArgumentParser = subparser.add_parser(parser_name)
 
     parser.add_argument('--setup-db', action='store_true', help='Setup the database (run before mass scan)')
+    parser.add_argument('--priority', type=int)
+
 
     return parser_name, find_mev
 
@@ -41,12 +43,13 @@ def find_mev(w3: web3.Web3, args: argparse.Namespace):
 
     l.info('starting mev-finding')
 
-    for priority in range(1, 29+1):
-        curr.execute(f'SELECT start_block, end_block FROM block_samples WHERE priority = %s', (priority,))
-        assert curr.rowcount == 1
-        start_block, end_block = curr.fetchone()
+    assert 0 <= args.priority <= 29
 
-        analyze_blocks(curr, start_block, end_block)
+    curr.execute(f'SELECT start_block, end_block FROM block_samples WHERE priority = %s', (args.priority,))
+    assert curr.rowcount == 1
+    start_block, end_block = curr.fetchone()
+
+    analyze_blocks(curr, start_block, end_block)
 
 
 def setup_db(curr: psycopg2.extensions.cursor):
