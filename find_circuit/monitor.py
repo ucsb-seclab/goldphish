@@ -44,6 +44,7 @@ def profitable_circuits(
         block_number: int,
         timestamp: typing.Optional[int] = None,
         only_weth_pivot = False,
+        detection_func = detect_arbitrages_bisection,
     ) -> typing.Iterator[FoundArbitrage]:
     elapsed = 0
     it_pcs = propose_circuits(modified_pairs_last_block, pool, block_number)
@@ -81,7 +82,7 @@ def profitable_circuits(
             circuits_considered.add(k)
 
             elapsed += time.time() - t_start
-            yield from detect_arbitrages_bisection(item, block_number, timestamp = timestamp, only_weth_pivot = only_weth_pivot)
+            yield from detection_func(item, block_number, timestamp = timestamp, only_weth_pivot = only_weth_pivot)
         except StopIteration:
             break
     utils.profiling.inc_measurement('propose-circuit', elapsed)

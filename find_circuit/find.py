@@ -23,6 +23,8 @@ from utils.profiling import profile, inc_measurement
 
 l = logging.getLogger(__name__)
 
+count_model_queries = 0
+
 class FeeTransferCalculator:
 
     def out_from_transfer(self, token: str, from_: str, to_: str, amount: int) -> int:
@@ -96,6 +98,8 @@ class PricingCircuit:
         """
         Run the circuit with the given amount_in, returning the amount_out
         """
+        global count_model_queries
+
         last_token = self.pivot_token
         curr_amt = amount_in
         for i, (p, (t_in, t_out)) in enumerate(zip(self._circuit, self._directions)):
@@ -109,6 +113,7 @@ class PricingCircuit:
             else:
                 next_exchange_addr = None
 
+            count_model_queries += 1
             curr_amt = fee_transfer_calculator.out_from_transfer(last_token, p.address, next_exchange_addr, curr_amt)
 
             assert curr_amt >= 0, 'negative token balance is not possible'
@@ -128,6 +133,7 @@ class PricingCircuit:
         """
         Run the circuit with the given amount_in, returning the new marginal price of this circuit
         """
+        global count_model_queries
         # some tokens charge a fee when you transfer -- attempt to account for this
         # in a hacky way by sending in 10 ** 18 units, assume 1:1 conversion at
         # each exchange point, and seeing how much you would get out the other end.
@@ -153,6 +159,7 @@ class PricingCircuit:
             else:
                 next_exchange_addr = None
 
+            count_model_queries += 1
             curr_amt = fee_transfer_calculator.out_from_transfer(last_token, p.address, next_exchange_addr, curr_amt)
 
             quantized_transfer_fee = fee_transfer_calculator.out_from_transfer(last_token, p.address, next_exchange_addr, quantized_transfer_fee)
@@ -189,7 +196,7 @@ def detect_arbitrages_bisection(
         timestamp: typing.Optional[int] = None,
         only_weth_pivot = False,
         try_all_directions = True,
-        fee_transfer_calculator: FeeTransferCalculator = DEFAULT_FEE_TRANSFER_CALCULATOR
+        fee_transfer_calculator: FeeTransferCalculator = DEFAULT_FEE_TRANSFER_CALCULATOR,
     ) -> typing.List[FoundArbitrage]:
     ret = []
 

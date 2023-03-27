@@ -16,6 +16,8 @@ class Token(typing.NamedTuple):
 
 
 _token_cache: typing.Dict[str, Token] = {}
+def get_cached_token(address: str) -> typing.Optional[Token]:
+    return _token_cache.get(address, None)
 
 
 def _get_name_and_symbol(w3: web3.Web3, address: str, block_identifier: int) -> typing.Tuple[str, str]:
@@ -98,7 +100,6 @@ def get_token(
             id_, name, symbol = curr.fetchone()
         else:
             # we need to insert it
-            # curr.execute('LOCK TABLE tokens')
             curr.execute(
                 '''
                 SELECT id, name, symbol FROM tokens WHERE address = %s

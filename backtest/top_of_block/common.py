@@ -269,19 +269,7 @@ class WrappedFoundArbitrage:
     def tokens(self) -> typing.Set[str]:
         return self.fa.tokens
 
-warned = False
-
-def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor, tmpdir: str, ___limit_to_balancer: bool = False) -> PricerPool:
-    global warned
-    if ___limit_to_balancer and not warned:
-        warned = True
-        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
-        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
-        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
-        l.critical('If you do not know what this message is something went wrong')
-        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
-        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
-        l.critical('Limiting to balancer!!!!!!!! Hope this is intentional!!!!!')
+def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor, tmpdir: str) -> PricerPool:
     #
     # load known pricer pool
     #
@@ -322,7 +310,7 @@ def load_pool(w3: web3.Web3, curr: psycopg2.extensions.cursor, tmpdir: str, ___l
                 eta = datetime.timedelta(seconds=eta_sec)
                 l.info(f'Loaded {n_loaded:,} of {n_exchanges:,} ({n_loaded / n_exchanges * 100:.2f}%) ETA {eta}')
 
-    if not ___limit_to_balancer:
+    if True:
         l.debug('Loading uniswap v2 ...')
 
         curr.execute(

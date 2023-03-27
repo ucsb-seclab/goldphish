@@ -22,6 +22,7 @@ import backtest.top_of_block.fill_arb_duration
 import backtest.top_of_block.generate_sample
 import backtest.top_of_block.fill_top_arbitrages
 import backtest.top_of_block.fill_closure
+import backtest.top_of_block.profile_seek_candidates
 
 from utils import connect_web3, setup_logging
 
@@ -61,6 +62,9 @@ def main():
     handlers[cmd] = handler
 
     cmd, handler = backtest.top_of_block.fill_closure.add_args(subparser)
+    handlers[cmd] = handler
+
+    cmd, handler = backtest.top_of_block.profile_seek_candidates.add_args(subparser)
     handlers[cmd] = handler
 
     args = parser.parse_args()

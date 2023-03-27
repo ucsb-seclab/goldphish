@@ -500,7 +500,7 @@ class BalancerPricer(BaseExchangePricer):
 
         c1 = c0 + (b // 2)
 
-        assert c1 >= c0 # idk what this is for but it's in Balancer code
+        assert c1 >= c0, f'{c1} >= {c0}' # idk what this is for but it's in Balancer code
 
         c2 = c1 // b
 

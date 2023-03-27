@@ -51,14 +51,17 @@ def main():
 
     l.debug(f'Connected to web3, chainId={w3.eth.chain_id}')
 
-    pg_user = os.getenv('PG_USER')
-    pg_pass = os.getenv('PG_PASS')
+    pg_host = os.getenv('PSQL_HOST', 'ethereum-measurement-pg')
+    pg_port = int(os.getenv('PSQL_PORT', '5432'))
+    pg_user = os.getenv('PSQL_USER', 'measure')
+    pg_pass = os.getenv('PSQL_PASS', 'password')
+    pg_db   = 'mainnet'
     db_mainnet = psycopg2.connect(
-        host = '127.0.0.1',
-        port = 5432,
+        host = pg_host,
+        port = pg_port,
         user = pg_user,
         password = pg_pass,
-        database = 'mainnet',
+        database = pg_db,
     )
     db.autocommit = False
     l.debug(f'connected to postgresql (mainnet)')

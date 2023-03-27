@@ -24,6 +24,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-v', '--verbose', action='store_true', dest='verbose')
     parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
+    parser.add_argument('--n-workers', type=int)
+    parser.add_argument('--id', type=int)
 
     args = parser.parse_args()
     if args.worker_name is None:
@@ -55,11 +57,17 @@ def main():
 
     setup_db(curr)
 
-    start_block, end_block = scrape_range(curr)
+    curr.execute('SELECT MIN(start_block), MAX(end_block) FROM block_samples')
+    start_block, end_block = curr.fetchone()
     l.info(f'scraping from {start_block:,} to {end_block:,}')
+
+    assert args.id < args.n_workers
+
+    if args.id == 0:
+        if time.time() > 1668735514.6559494 + 60 * 60 * 24:
+            scrape_v3(w3, curr, start_block, end_block)
     
-    scrape_v3(w3, curr, start_block, end_block)
-    # scrape_v4(w3, curr, start_block, end_block)
+    scrape_v4(w3, curr, start_block, end_block, args.id, args.n_workers)
 
 
 def setup_db(curr: psycopg2.extensions.cursor):
@@ -76,38 +84,7 @@ def setup_db(curr: psycopg2.extensions.cursor):
     )
 
 
-def scrape_range(curr: psycopg2.extensions.cursor) -> typing.Tuple[int, int]:
-    l.debug('computing work range')
-    curr.execute(
-        '''
-        SELECT max(block_number)
-        FROM sample_arbitrages sa
-        JOIN sample_arbitrage_cycles sac ON sac.sample_arbitrage_id = sa.id
-        JOIN sample_arbitrage_cycle_exchanges sace ON sace.cycle_id = sac.id
-        JOIN sample_arbitrage_cycle_exchange_items sacei ON sacei.cycle_exchange_id = sace.id
-        WHERE EXISTS(
-            SELECT 1
-            FROM sample_arbitrage_cycle_exchange_item_is_zerox is_zerox
-            WHERE is_zerox.sample_arbitrage_cycle_exchange_item_id = sacei.id
-        )
-        '''
-    )
-    (last_end,) = curr.fetchone()
-    if last_end is not None: # TODO put this back
-        start_block = last_end + 1
-    else:
-        curr.execute('SELECT MIN(block_number) FROM sample_arbitrages')
-        (start_block,) = curr.fetchone()
-        # start_block = 14319428
-    
-    curr.execute('SELECT MAX(block_number) FROM sample_arbitrages')
-    (end_block,) = curr.fetchone()
-    return start_block, end_block
-
-
-def scrape_v4(w3: web3.Web3, curr: psycopg2.extensions.cursor, start_block: int, end_block: int):
-    start_block = 14324573
-
+def scrape_v4(w3: web3.Web3, curr: psycopg2.extensions.cursor, start_block: int, end_block: int, id_: int, n_workers: int):
     l.info('scraping v4')
     zerox_proxy: web3.contract.Contract = w3.eth.contract(
         address = '0xDef1C0ded9bec7F1a1670819833240f027b25EfF',
@@ -118,7 +95,7 @@ def scrape_v4(w3: web3.Web3, curr: psycopg2.extensions.cursor, start_block: int,
     curr.execute(
         '''
         SELECT distinct sa.id
-        FROM sample_arbitrages sa
+        FROM (SELECT * FROM sample_arbitrages WHERE MOD(id, %(n_workers)s) = %(worker_id)s) sa
         JOIN sample_arbitrage_cycles sac ON sac.sample_arbitrage_id = sa.id
         JOIN sample_arbitrage_cycle_exchanges sace ON sace.cycle_id = sac.id
         JOIN sample_arbitrage_cycle_exchange_items sacei ON sacei.cycle_exchange_id = sace.id
@@ -126,9 +103,14 @@ def scrape_v4(w3: web3.Web3, curr: psycopg2.extensions.cursor, start_block: int,
         WHERE NOT EXISTS(SELECT 1 FROM uniswap_v2_exchanges e WHERE e.address = sae.address) AND
               NOT EXISTS(SELECT 1 FROM uniswap_v3_exchanges e WHERE e.address = sae.address) AND
               NOT EXISTS(SELECT 1 FROM sushiv2_swap_exchanges e WHERE e.address = sae.address) AND
-              %s <= sa.block_number AND sa.block_number <= %s
+              %(start_block)s <= sa.block_number AND sa.block_number <= %(end_block)s
         ''',
-        (start_block, end_block),
+        {
+            'n_workers': n_workers,
+            'worker_id': id_,
+            'start_block': start_block,
+            'end_block': end_block
+        }
     )
     l.debug(f'have {curr.rowcount} transactions to look through for zeroex v4')
     all_arb_ids: typing.List[int] = [x for (x,) in curr]
@@ -205,6 +187,8 @@ def scrape_v4(w3: web3.Web3, curr: psycopg2.extensions.cursor, start_block: int,
                     assert curr.rowcount == 1
                     l.info(f'Marked {address} as zerox in 0x{txn_hash.hex()}')
 
+    l.info('Done scrape')
+    curr.connection.commit()
 
 
 def scrape_v3(w3: web3.Web3, curr: psycopg2.extensions.cursor, start_block: int, end_block: int):

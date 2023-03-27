@@ -5,7 +5,7 @@ import typing
 import psycopg2.extensions
 import web3
 from backtest.gather_samples.models import Arbitrage
-from backtest.gather_samples.tokens import get_token
+from backtest.gather_samples.tokens import Token, get_token, get_cached_token
 import cachetools
 
 l = logging.getLogger(__name__)
@@ -63,10 +63,11 @@ def setup_db(curr: psycopg2.extensions.cursor):
         );
 
         CREATE TABLE IF NOT EXISTS sample_arbitrage_cycle_exchanges (
-            id          SERIAL PRIMARY KEY NOT NULL,
-            cycle_id    INTEGER NOT NULL REFERENCES sample_arbitrage_cycles(id) ON DELETE CASCADE,
-            token_in    INTEGER NOT NULL REFERENCES tokens(id),
-            token_out   INTEGER NOT NULL REFERENCES tokens(id)
+            id           SERIAL PRIMARY KEY NOT NULL,
+            exchange_idx SMALLINT NOT NULL,
+            cycle_id     INTEGER NOT NULL REFERENCES sample_arbitrage_cycles(id) ON DELETE CASCADE,
+            token_in     INTEGER NOT NULL REFERENCES tokens(id),
+            token_out    INTEGER NOT NULL REFERENCES tokens(id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_sample_arbitrage_cycle_exchanges_cycle_id ON sample_arbitrage_cycle_exchanges (cycle_id);
@@ -103,8 +104,45 @@ def stable_hash_addr(baddr: bytes) -> int:
         ret = ret ^ int.from_bytes(baddr[i * 4 : (i + 1) * 4], byteorder=sys.byteorder, signed=False)
     return abs(ret) & 0x7fffffff
 
-
 LOCK_MASK = 0xffff
+
+def get_and_insert_tokens(
+        w3: web3.Web3,
+        curr: psycopg2.extensions.cursor,
+        addresses: typing.List[str],
+        block_hint: int,
+    ) -> typing.List[Token]:
+    ret = [None] * len(addresses)
+
+    needs_lookup: typing.List[typing.Tuple[int, str]] = []
+    for i, address in enumerate(addresses):
+        token = get_cached_token(address)
+        if token is not None:
+            ret[i] = token
+        else:
+            needs_lookup.append((i, address))
+
+    # look up the ids
+    locks_needed = set()
+    for _, address in needs_lookup:
+        locks_needed.add(stable_hash_addr(bytes.fromhex(address[2:])) & LOCK_MASK)
+
+    if len(locks_needed) > 0:
+        l.debug(f'locking {len(locks_needed)} locks for exchange inserts')
+        start = time.time()
+        for lock in sorted(locks_needed):
+            curr.execute('SELECT pg_advisory_xact_lock(3334::integer, %s::integer)', (lock,))
+        elapsed = time.time() - start
+        l.debug(f'spent {elapsed:.3f} seconds waiting for exchange insert lock(s)')
+
+        # we have exclusive access -- see if we won the races
+        for i, address in needs_lookup:
+            token = get_token(w3, curr, address, block_hint)
+            assert token is not None
+            ret[i] = token
+
+    return ret
+
 
 _exchange_cache = cachetools.LRUCache(maxsize=10_000)
 def get_exchange_ids(curr: psycopg2.extensions.cursor, addresses: typing.List[str]) -> typing.List[int]:
@@ -155,15 +193,17 @@ def get_exchange_ids(curr: psycopg2.extensions.cursor, addresses: typing.List[st
 
     return ret
 
-
 def insert_arbs(w3: web3.Web3, curr: psycopg2.extensions.cursor, arbs: typing.List[Arbitrage]):
     if len(arbs) == 0:
         return
 
     all_exchanges = set()
+    all_tokens = set()
     for arb in arbs:
         if arb.only_cycle is not None:
             for exc in arb.only_cycle.cycle:
+                all_tokens.add(exc.token_in)
+                all_tokens.add(exc.token_out)
                 for exc_item in exc.items:
                     all_exchanges.add(exc_item.address)
 
@@ -171,6 +211,11 @@ def insert_arbs(w3: web3.Web3, curr: psycopg2.extensions.cursor, arbs: typing.Li
     exchange_ids = get_exchange_ids(curr, all_exchanges)
     exchange_to_ids = {k: v for k, v in zip(all_exchanges, exchange_ids)}
     assert len(exchange_to_ids) == len(all_exchanges)
+
+    all_tokens = sorted(list(all_tokens))
+    max_block = max(arb.block_number for arb in arbs)
+    # do not need output -- it is cached
+    get_and_insert_tokens(w3, curr, all_tokens, max_block)
 
     already_inserted = set()
     for arb in arbs:
@@ -222,17 +267,18 @@ def _insert_arb(w3: web3.Web3, curr: psycopg2.extensions.cursor, arb: Arbitrage,
         assert curr.rowcount == 1
         (cycle_id,) = curr.fetchone()
 
-        for exchange in arb.only_cycle.cycle:
+        for exchange_idx, exchange in enumerate(arb.only_cycle.cycle):
             token_in = get_token(w3, curr, exchange.token_in, arb.block_number)
             token_out = get_token(w3, curr, exchange.token_out, arb.block_number)
             curr.execute(
                 '''
-                INSERT INTO sample_arbitrage_cycle_exchanges (cycle_id, token_in, token_out)
-                VALUES (%s, %s, %s)
+                INSERT INTO sample_arbitrage_cycle_exchanges (cycle_id, exchange_idx, token_in, token_out)
+                VALUES (%s, %s, %s, %s)
                 RETURNING id
                 ''',
                 (
                     cycle_id,
+                    exchange_idx,
                     token_in.id,
                     token_out.id,
                 )

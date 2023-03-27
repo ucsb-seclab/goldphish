@@ -1,3 +1,4 @@
+import random
 import collections
 import itertools
 import logging
@@ -22,13 +23,15 @@ l = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
+    parser.add_argument('--setup-db', action='store_true', dest='setup_db')
+
 
     args = parser.parse_args()
     if args.worker_name is None:
         args.worker_name = socket.gethostname()
     job_name = 'gather_samples'
 
-    setup_logging(job_name, worker_name = args.worker_name)
+    setup_logging(job_name, worker_name = args.worker_name, stdout_level=logging.INFO)
 
     try:
         l.info('booting up sample arbitrage scraper')
@@ -36,14 +39,16 @@ def main():
         db = connect_db()
         curr = db.cursor()
 
-        setup_db(curr)
         curr.execute('SELECT MIN(start_block), MAX(end_block) FROM block_samples')
+        start_block, end_block = curr.fetchone()
 
+        if args.setup_db:
+            setup_db(curr)
 
-        start_block = 15721079 - (6_646) * 14
-        end_block = 15721079
-        # start_block, end_block = curr.fetchone()
-        setup_reservations(curr, start_block, end_block)
+            # start_block = 15721079 - (6_646) * 14
+            # end_block = 15721079
+            setup_reservations(curr, start_block, end_block)
+            return
 
         web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
 
@@ -222,12 +227,16 @@ def setup_reservations(curr: psycopg2.extensions.cursor, start_block: int, end_b
             raise Exception('stop')
     else:
         l.debug(f'inserting reservations')
+        block_ranges = []
         for i in itertools.count():
             this_start_block = i * BATCH_SIZE_BLOCKS + start_block
             this_end_block = min(end_block_inclusive + 1, (i + 1) * BATCH_SIZE_BLOCKS + start_block)
             if this_start_block > end_block_inclusive:
                 break
-
+            block_ranges.append((this_start_block, this_end_block))
+        
+        random.shuffle(block_ranges)
+        for this_start_block, this_end_block in block_ranges:
             curr.execute(
                 '''
                 INSERT INTO gather_sample_arbitrages_reservations (from_block, to_block_exclusive)

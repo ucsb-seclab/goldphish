@@ -46,7 +46,7 @@ def generate_sample(w3: web3.Web3, args: argparse.Namespace):
         return
 
     MIN_BLOCK =  9_569_113
-    MAX_BLOCK = 15_111_000
+    MAX_BLOCK = 15_965_926
 
     l.info('assigning sample labels')
     # assign sample groups

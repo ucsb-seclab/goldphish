@@ -33,7 +33,7 @@ LOG_BATCH_SIZE = 100
 
 DEBUG = False
 
-TMP_REMOVE_ME_FOR_FIXUP_ONLY = True
+TMP_REMOVE_ME_FOR_FIXUP_ONLY = False
 # find_circuit.monitor.TMP_FIXUP_REMOVE_ME = TMP_REMOVE_ME_FOR_FIXUP_ONLY
 
 def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.Callable[[web3.Web3, argparse.Namespace], None]]:
@@ -604,6 +604,9 @@ def get_relevant_logs(
         batch_start_block: int,
         batch_end_block: int
     ) -> typing.Iterator[typing.Tuple[int, typing.List[web3.types.LogReceipt]]]:
+    """
+    Get logs relevant to the given pricer pool's pricers.
+    """
 
     assert batch_start_block <= batch_end_block
 
@@ -611,6 +614,9 @@ def get_relevant_logs(
 
     with utils.profiling.profile('get_logs'):
 
+        # NOTE: turns out geth's log filtering is slower than
+        # just returning all logs and filtering in python; this
+        # is why we use the latter strategy
         f: web3._utils.filters.Filter = w3.eth.filter({
             'fromBlock': batch_start_block,
             'toBlock': batch_end_block,

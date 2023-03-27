@@ -9,6 +9,11 @@ from backtest.gather_samples.models import Arbitrage, ArbitrageCycle, ArbitrageC
 
 l = logging.getLogger(__name__)
 
+KNOWN_ROUTERS = set([
+    '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D',
+    '0xE592427A0AEce92De3Edee1F18E0157C05861564',
+    '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45'
+])
 
 def get_arbitrage_if_exists(
         w3: web3.Web3,
@@ -18,35 +23,36 @@ def get_arbitrage_if_exists(
     full_txn = w3.eth.get_transaction_receipt('0x' + tx_hash.hex())
     return get_arbitrage_from_receipt_if_exists(full_txn, txns)
 
+ERC20TransactionArgs = typing.TypedDict('ERC20TransactionArgs', {
+    'to':   str,
+    'from': str,
+    'value': int,
+})
+
+ERC20Transaction = typing.TypedDict(
+    'ERC20Transaction',
+    {
+        'address': str,
+        'transactionHash': bytes,
+        'args': ERC20TransactionArgs,
+    }
+)
+MovementDesc = typing.TypedDict(
+    'MovementDesc',
+    {
+        'in': typing.List[ERC20Transaction],
+        'out': typing.List[ERC20Transaction],
+    }
+)
 
 def get_arbitrage_from_receipt_if_exists(
         full_txn: web3.types.TxReceipt,
-        txns: typing.List,
+        txns: typing.List[ERC20Transaction],
+        least_profitable = False,
     ):
-    addr_to_movements = collections.defaultdict(lambda: {'in': [], 'out': []})
-    for txn in txns:
-        to_addr = txn['args']['to']
-        from_addr = txn['args']['from']
-        addr_to_movements[to_addr]['in'].append(txn)
-        addr_to_movements[from_addr]['out'].append(txn)
+    addr_to_movements = get_addr_to_movements(txns)
 
-    potential_exchanges = set()
-    for addr in addr_to_movements:
-        ins  = addr_to_movements[addr]['in']
-        outs = addr_to_movements[addr]['out']
-        if len(ins) == 0 or len(outs) == 0:
-            # not an exchange, did not both send a token and receive a token
-            continue
-
-        # make sure that the sender 'from' address is not marked as an exchange
-        if addr == full_txn['from']:
-            continue
-
-        in_coins  = set(x['address'] for x in ins)
-        out_coins = set(x['address'] for x in outs)
-        if len(in_coins) == 1 and len(out_coins) == 1 and in_coins != out_coins:
-            # one token in, another token out
-            potential_exchanges.add(addr)
+    potential_exchanges = get_potential_exchanges(full_txn, addr_to_movements)
 
     if len(potential_exchanges) <= 1:
         # not enough exchanges to make a cycle
@@ -57,6 +63,7 @@ def get_arbitrage_from_receipt_if_exists(
     # Build the digraph of this exchange
     g = nx.DiGraph()
     for addr in potential_exchanges:
+        addr: str
         ins  = addr_to_movements[addr]['in']
         outs = addr_to_movements[addr]['out']
         in_coins  = set(x['address'] for x in ins)
@@ -66,11 +73,11 @@ def get_arbitrage_from_receipt_if_exists(
         coin_in = next(in_coins.__iter__())
         coin_out = next(out_coins.__iter__())
 
-        in_log = next(ins.__iter__())
-        out_log = next(outs.__iter__())
+        # in_log = next(ins.__iter__())
+        # out_log = next(outs.__iter__())
 
-        coin_in_amt = in_log['args']['value']
-        coin_out_amt = out_log['args']['value']
+        coin_in_amt = sum(x['args']['value'] for x in ins)
+        coin_out_amt = sum(x['args']['value'] for x in outs)
 
         item = (
             ArbitrageCycleExchangeItem(
@@ -78,8 +85,8 @@ def get_arbitrage_from_receipt_if_exists(
                 amount_in=coin_in_amt,
                 amount_out=coin_out_amt,
             ),
-            in_log,
-            out_log,
+            ins,
+            outs,
         )
 
         if not g.has_edge(coin_in, coin_out):
@@ -160,11 +167,13 @@ def get_arbitrage_from_receipt_if_exists(
         for u, v in zip(first_cycle, first_cycle[1:] + [first_cycle[0]]):
             exchange = g[u][v]['exchange']
             assert isinstance(exchange, ArbitrageCycleExchange)
-            for _, in_log, out_log in exchange.items:
-                addr_to_movements_in_cycle[in_log['args']['from']]['outs'].add(in_log)
-                addr_to_movements_in_cycle[in_log['args']['to']]['ins'].add(in_log)
-                addr_to_movements_in_cycle[out_log['args']['from']]['outs'].add(out_log)
-                addr_to_movements_in_cycle[out_log['args']['to']]['ins'].add(out_log)
+            for _, in_logs, out_logs in exchange.items:
+                for in_log in in_logs:
+                    addr_to_movements_in_cycle[in_log['args']['from']]['outs'].add(in_log)
+                    addr_to_movements_in_cycle[in_log['args']['to']]['ins'].add(in_log)
+                for out_log in out_logs:
+                    addr_to_movements_in_cycle[out_log['args']['from']]['outs'].add(out_log)
+                    addr_to_movements_in_cycle[out_log['args']['to']]['ins'].add(out_log)
 
         # maps (account address) -> (token address) |-> (net movement, int)
         token_movement_sums = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
@@ -175,11 +184,16 @@ def get_arbitrage_from_receipt_if_exists(
                 token_movement_sums[addr][out_xfer['address']] -= out_xfer['args']['value']
 
 
+        if least_profitable == False:
+            optimizing_test = lambda x, y: x > y
+        else:
+            assert least_profitable == True
+            optimizing_test = lambda x, y: x < y
         #
         # Find the addresses which hold condition (a)
         #
         addrs_condition_a: typing.List[typing.Tuple[str, str, int]] = []
-        addrs_condition_a_with_profit = []
+        addrs_condition_a_most_optimal = []
         for account_addr, token_movements in token_movement_sums.items():
             tokens_in = set(x['address'] for x in addr_to_movements_in_cycle[account_addr]['ins'])
             tokens_out = set(x['address'] for x in addr_to_movements_in_cycle[account_addr]['outs'])
@@ -188,24 +202,33 @@ def get_arbitrage_from_receipt_if_exists(
             if len(both_in_and_out) > 0:
                 # we're comparing apples to oranges here.... that's fine, it's an
                 # arbitrary tiebreaker
-                most_profit_token = None
-                most_profit = float('-inf')
+                
+                optimizing_token = None
+                if least_profitable == False:
+                    most_optimal_amt = float('-inf')
+                else:
+                    assert least_profitable == True
+                    most_optimal_amt = float('inf')
+
                 for token_addr in both_in_and_out:
                     net_movement = token_movements[token_addr]
-                    if net_movement > most_profit:
-                        most_profit_token = token_addr
-                        most_profit = net_movement
+                    if optimizing_test(net_movement, most_optimal_amt):
+                        optimizing_token = token_addr
+                        most_optimal_amt = net_movement
 
-                report = (account_addr, most_profit_token, most_profit)
-                if most_profit > 0:
-                    addrs_condition_a_with_profit.append(report)
-                if most_profit != 0:
+                report = (account_addr, optimizing_token, most_optimal_amt)
+                if optimizing_test(most_optimal_amt, 0):
+                    addrs_condition_a_most_optimal.append(report)
+                if most_optimal_amt != 0:
                     addrs_condition_a.append(report)
 
-        if len(addrs_condition_a_with_profit) > 0:
-            most_profitable_cond_a = max(addrs_condition_a_with_profit, key=lambda x: x[2])
+        if len(addrs_condition_a_most_optimal) > 0:
+            if least_profitable == False:
+                most_optimal_cond_a = max(addrs_condition_a_most_optimal, key=lambda x: x[2])
+            else:
+                most_optimal_cond_a = min(addrs_condition_a_most_optimal, key=lambda x: x[2])
             # easy, we found the pivot account
-            profiter, token, amount = most_profitable_cond_a
+            profiter, token, amount = most_optimal_cond_a
             only_cycle = ArbitrageCycle(
                 cycle = parsed_cycle,
                 profit_token = token,
@@ -249,8 +272,13 @@ def get_arbitrage_from_receipt_if_exists(
 
             assert len(type_b_tokens) > 0
 
-            most_profit = float('-inf')
-            most_profit_token = None
+            optimizing_token = None
+
+            if least_profitable == False:
+                most_optimal_amt = float('-inf')
+            else:
+                assert least_profitable == True
+                most_optimal_amt = float('inf')
             for tok in type_b_tokens:
                 senders = token_addr_to_only_sent_addresses[tok]
                 receivers = token_addr_to_only_received_addresses[tok]
@@ -263,33 +291,79 @@ def get_arbitrage_from_receipt_if_exists(
                     amount_received += token_movement_sums[receiver][tok]
 
                 profit = amount_received - amount_sent
-                if profit > most_profit:
-                    most_profit = profit
-                    most_profit_token = tok
+                if optimizing_test(profit, most_optimal_amt):
+                    most_optimal_amt = profit
+                    optimizing_token = tok
 
-            if most_profit > 0 or len(addrs_condition_a) == 0:
+            if optimizing_test(most_optimal_amt, 0):
+                # print(f'hmmmmmmmmm {full_txn["transactionHash"].hex()}')
+                # import pdb; pdb.set_trace()
                 # found a token that made profit, but not sure who the profiter is
                 only_cycle = ArbitrageCycle(
                     cycle = parsed_cycle,
-                    profit_token = most_profit_token,
+                    profit_token = optimizing_token,
                     profit_taker = None,
-                    profit_amount = most_profit,
+                    profit_amount = most_optimal_amt,
                 )
-            elif len(addrs_condition_a) > 0:
-                profiter, token, amount = addrs_condition_a[0]
-                only_cycle = ArbitrageCycle(
-                    cycle = parsed_cycle,
-                    profit_token = most_profit_token,
-                    profit_taker = None,
-                    profit_amount = most_profit,
-                )
-                l.debug(f'negative proit cycle!!!!')
+            # elif len(addrs_condition_a) > 0:
+            #     profiter, token, amount = addrs_condition_a[0]
+            #     only_cycle = ArbitrageCycle(
+            #         cycle = parsed_cycle,
+            #         profit_token = optimizing_token,
+            #         profit_taker = None,
+            #         profit_amount = most_optimal_amt,
+            #     )
+            #     l.debug(f'negative proit cycle!!!!')
             else:
-                l.info(f'addrs condition a {addrs_condition_a}')
-                l.info(f'type b tokens {type_b_tokens}')
-                raise Exception(f'Processing arbitrage {full_txn["transactionHash"].hex()}')
+                l.debug('did not have profit in the right direction')
+                return None
+                # l.info(f'addrs condition a {addrs_condition_a}')
+                # l.info(f'type b tokens {type_b_tokens}')
+                # raise Exception(f'Processing arbitrage {full_txn["transactionHash"].hex()}')
 
         arb = arb._replace(only_cycle=only_cycle)
 
     return arb
 
+def get_addr_to_movements(
+        txns: typing.List[ERC20Transaction],
+    ) -> typing.Dict[str, MovementDesc]:
+    addr_to_movements: typing.Dict[str, MovementDesc] = collections.defaultdict(lambda: {'in': [], 'out': []})
+    for txn in txns:
+        to_addr = txn['args']['to']
+        from_addr = txn['args']['from']
+        addr_to_movements[to_addr]['in'].append(txn)
+        addr_to_movements[from_addr]['out'].append(txn)
+
+    return addr_to_movements
+
+def get_potential_exchanges(
+        full_txn: web3.types.TxReceipt,
+        addr_to_movements: typing.Dict[str, MovementDesc],
+    ) -> typing.Set[str]:
+    potential_exchanges = set()
+    for addr in addr_to_movements:
+        if addr.startswith('0x' + '00' * 17):
+            # l.warning(f'Ignoring zero address as exchange')
+            continue
+        if addr in KNOWN_ROUTERS:
+            # l.warning(f'Ignoring router as exchange')
+            continue
+
+        ins  = addr_to_movements[addr]['in']
+        outs = addr_to_movements[addr]['out']
+        if len(ins) == 0 or len(outs) == 0:
+            # not an exchange, did not both send a token and receive a token
+            continue
+
+        # make sure that the sender 'from' address is not marked as an exchange
+        if addr == full_txn['from']:
+            continue
+
+        in_coins  = set(x['address'] for x in ins)
+        out_coins = set(x['address'] for x in outs)
+        if len(in_coins) == 1 and len(out_coins) == 1 and in_coins != out_coins:
+            # one token in, another token out
+            potential_exchanges.add(addr)
+
+    return potential_exchanges
