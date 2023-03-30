@@ -42,7 +42,7 @@ def main():
 
     args = parser.parse_args()
 
-    setup_logging('fill_naive_gas_price', stdout_level=logging.DEBUG if args.verbose else logging.INFO)
+    setup_logging('fill_eth_price', stdout_level=logging.DEBUG if args.verbose else logging.INFO)
 
     db = connect_db()
     curr = db.cursor()
@@ -125,16 +125,21 @@ def main():
     t_start = last_update
     last_complete_reservation = None
     for i_res, (start_block, end_block) in enumerate(assignments):
-        if i_res > 0:
-            elapsed = time.time() - t_start
-            nps = i_res / elapsed
-            remain = len(assignments) - i_res
-            eta_s = remain / nps
-            eta = datetime.timedelta(seconds=eta_s)
-            print(F'Finished {i_res / len(assignments) * 100:.2f}% ETA {eta}')
 
         to_insert = []
         for block_number in range(start_block, end_block + 1):
+
+            if last_update + 30 < time.time():
+                last_update = time.time()
+                elapsed = time.time() - t_start
+                nps = i_res / elapsed
+                remain = len(assignments) - i_res
+                eta_s = remain / nps
+                eta = datetime.timedelta(seconds=eta_s)
+                pct_done_assignment = (block_number - start_block) / (end_block - start_block + 1)
+                pct_done = (i_res + pct_done_assignment) / len(assignments)
+                l.info(F'Finished {pct_done * 100:.2f}% ETA {eta}')
+
             if block_number % 50 != 0:
                 continue
             try:
@@ -177,15 +182,15 @@ def setup_db(curr: psycopg2.extensions.cursor):
 def finalize(curr: psycopg2.extensions.cursor):
     curr.execute('SELECT MIN(start_block), MAX(end_block) FROM block_samples')
     start_block, end_block = curr.fetchone()
-    # curr.execute(
-    #     '''
-    #     CREATE TABLE eth_price_blocks AS
-    #     SELECT block_number, (SELECT eth_price_usd FROM eth_prices ep WHERE ep.block_number < s.block_number ORDER BY block_number DESC LIMIT 1) eth_price_usd
-    #     FROM generate_series(%s, %s) AS s(block_number)
-    #     ''',
-    #     (start_block, end_block),
-    # )
-    # assert curr.rowcount > 0
+    curr.execute(
+        '''
+        CREATE TABLE eth_price_blocks AS
+        SELECT block_number, (SELECT eth_price_usd FROM eth_prices ep WHERE ep.block_number < s.block_number ORDER BY block_number DESC LIMIT 1) eth_price_usd
+        FROM generate_series(%s, %s) AS s(block_number)
+        ''',
+        (start_block, end_block),
+    )
+    assert curr.rowcount > 0
 
     curr.execute('SELECT eth_price_usd FROM eth_prices ORDER BY block_number ASC LIMIT 1')
     (first_eth_price,) = curr.fetchone()
@@ -205,7 +210,7 @@ def finalize(curr: psycopg2.extensions.cursor):
     )
     l.debug(f'fixed bottom {curr.rowcount} entries')
 
-    # curr.execute('CREATE INDEX idx_eth_pr_blocks_block_number ON eth_price_blocks (block_number)')
+    curr.execute('CREATE INDEX idx_eth_pr_blocks_block_number ON eth_price_blocks (block_number)')
 
 
 if __name__ == '__main__':

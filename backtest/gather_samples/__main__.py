@@ -48,6 +48,7 @@ def main():
             # start_block = 15721079 - (6_646) * 14
             # end_block = 15721079
             setup_reservations(curr, start_block, end_block)
+            l.info('Setup db')
             return
 
         web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')

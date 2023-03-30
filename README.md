@@ -1,76 +1,210 @@
-# GoldPhish - an ethereum arbitrage searcher & shooter
+# Goldphish - historical ethereum arbitrage analysis
 
-GoldPhish is an arbitrage shooter for the Ethereum blockchain.
+Goldphish is an arbitrage analyzer for the ethereum blockchain.
 
-It is planned to support Uniswap v3, v2, and SushiSwap (which is uniswap v2 abi-compatible).
 
-## Planning
+# Building
 
-### Invocation ABI
+This system is dockerized.
+To build, run `docker build -t goldphish .`
+
+# Setup
+
+This system requires access to a postgresql database and a go-ethereum (geth) archive node with a websocket JSON-rpc server.
+At the time of writing, an archive node consumes around 12 terabytes of space -- be warned!
+
+
+## Postgresql
+
+We run postgres dockerized. For convenience, we also run it on a separate docker network (so we can get dns-resolution).
+
+To create the network:
 
 ```
-ARBITRAGE WITH UNISWAP V3
-==========================
+docker network create ethereum-measurement-net
+```
 
-function selector = 00000000
+Pull the docker image,
 
-# First 32 bytes:
-ffff # block target
-    / # FLAGS
-    /fffffffffffffffffff # amount in (brief)
-                        ffffffffffffffffffffffffffffffffffffffff # flash swap addr
+```
+docker pull postgres:14
+```
 
-FLAGS:
-_ _ x x
-| | +-+--- belongs to amount in (brief)
-| +------- 0 = send to self, 1 = send to next exchange addr
-+--------- flash swap: zeroForOne
+Then spawn postgres. **NOTE: we are running with a weak password and open port (BAD!!!)**
 
-IF amount in == 0, use extradata below
+Replace `YOUR_DATA_DIR_HERE` with the path to a directory that has at least 2T storage space, this is where your postgresql database files will live.
 
-Extradata, if included (following 32 bytes)
-ffffffffffffffffffffffffffffffffffffffffffffffff # amount in, (extended) flash swap
-                                                ffffffffffffffff # coinbase xfer (wei)
+```
+docker run \
+    -d \
+    --name ethereum-measurement-pg \
+    -e POSTGRES_PASSWORD=password \
+    -e POSTGRES_USER=measure \
+    -e POSTGRES_DB=eth_measure_db \
+    -p 0.0.0.0:5410:5432 \
+    -v YOUR_DATA_DIR_HERE:/var/lib/postgresql/data \
+    --network ethereum-measurement-net \
+    postgres:14
+```
 
-# Following: series of Action records
+Let's configure it to allow more connections. Edit `YOUR_DATA_DIR_HERE/postgresql.conf` and change:
 
-f # FLAGS
- fffffffffffffffffffffff # amountOut (v2) / amountIn (v3) or, when amountOut can be inferred in uniswap v2, amountIn (see NOTE about amount in below)
-                        ffffffffffffffffffffffffffffffffffffffff # exchange address
-FLAGS:
-_ _ _ _ x x x x
-+-+ | +--- uniswap v2/v3 (0 = v2)
- |  +----- zeroForOne
- +-------- recipient (0 = self, 1 = msg.sender, 2 = next exchange, 3 = separate_profits)
+```diff
+- max_connections = 100
++ max_connections = 100
+...
+- shared_buffers = 128MB
++ shared_buffers = 512MB
+```
 
-When Uniswap v2, check if next exchange address is zero; if so, this is the amount to forward from self
-ffffffffffffffffffffffff # amountInFromSelf
-                        0000000000000000000000000000000000000000 # must = 0
+And then restart the container:
 
-When recipient = 3
-f # FLAGS
- fffffffffffffffffffffff # the amount of WETH to take as profit
-                        ffffffffffffffffffffffffffffffffffffffff # exchange address (uniswap v2)
-FLAGS:
-1 1 _ 0 x x x x
-+-+ |
- |  |
- |  +---------- zeroForOne (in order to sell other token and buy WETH)
- +------------- indicates this splits-out profits
-
-NOTE:
-  When splitting out funds, uniswap v2 address is assumed to be already funded completely.
-  We assume forwarding the unspent remainder of funds to the next uniswap v2 address; if none is found,
-  we send them to msg.sender.
-
-
-ARBITRAGE WITH ONLY UNISWAP V2
-==============================
-
-NOTE: this does NOT support flash-swaps
-
-Function selector: 00000001
+```
+docker container restart ethereum-measurement-pg
+```
 
 
 
+# Getting Started
+
+## Storage dir setup
+
+We need a directory to persist some information (and logs), which we will call `STORAGE_DIR`. It should have this structure:
+
+```
+.
+logs/
+tmp/
+```
+
+## Setup block samples
+
+We parallelize work by chunks of blocks about 1 day long. Generate this table:
+
+```bash
+docker run \
+    --rm \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.top_of_block \
+    generate-sample
+```
+
+You should see logged `generated sample`.
+
+## Scrape exchanges
+
+You will need to scrape the list of Uniswap, Sushiswap, Shibaswap, and Balancer exchanges.
+
+Get started by setting up the database:
+
+```bash
+docker run \
+    --rm \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    goldphish \
+    python3 -m backtest.gather_samples \
+    --setup-db
+```
+
+And then also here:
+
+```bash
+docker run \
+    --rm \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_known_exchanges \
+    --setup-db
+```
+
+And finally, run the scrape:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_known_exchanges
+```
+
+You should see an ETA printed.
+
+## Scrape ethereum price
+
+This scrapes the USD price of ETH using either the the Chainlink oracle, or if an early block, the MakerDAO price oracle.
+
+First, setup the db:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_eth_price \
+    --setup-db
+```
+
+Then, run the scrape. Here we use N_WORKERS to represent the number of worker-processes you would like to use. We set it to 50.
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_many_fill_eth_price.sh \
+    $N_WORKERS
+```
+
+Finalize the work (abt 1min):
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_eth_price \
+    --finalize
+```
+
+Scrape arbitrages. This takes a while! We chose 50 workers. Be sure that you increased your postgresql connections.
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_many_gather_samples.sh \
+    $N_WORKERS
+```
+
+You can watch the ETA here, in another bash session. This takes about 1-2 days.
+If you would like to perform this on multiple machines, that is okay!
+Get the docker container on the second (third, fourth...) machine and launch it similar to the command below.
+Except, you'll want to set the environment variables PSQL_HOST and PSQL_PORT appropriately
+(ie, your database machine's ip and port). Set these with `-e PSQL_HOST=xxx.xxx.xxx.xxx` etc.
+
+Scrape work is processed in random order, so the ETA should be somewhat reliable.
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    goldphish \
+    python3 tmp_eta_gather.py
 ```

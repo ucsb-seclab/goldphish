@@ -5,6 +5,8 @@ from backtest.utils import connect_db
 db = connect_db()
 curr = db.cursor()
 
+print('monitoring ETA')
+
 curr.execute(
     '''
     SELECT COUNT(*)

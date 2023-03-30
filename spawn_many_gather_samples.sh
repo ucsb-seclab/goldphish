@@ -6,7 +6,7 @@ N_WORKERS=$1
 
 echo "[*] spawning $N_WORKERS gatherers";
 
-PREFIX=$3
+PREFIX=$2
 
 if [[ "$PREFIX" -ne '' ]];
 then

@@ -149,7 +149,6 @@ def main():
 def setup_db(curr: psycopg2.extensions.cursor, all_scrapers: typing.List[BaseLogScraper]):
     for scraper in all_scrapers:
         scraper.prime(curr)
-    input('Processed, ENTER to continue')
 
 
 if __name__ == '__main__':
