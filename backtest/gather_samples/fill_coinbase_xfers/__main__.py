@@ -3,6 +3,7 @@ import logging
 import os
 import socket
 import time
+from tkinter import N
 import psycopg2
 import psycopg2.extensions
 
@@ -51,20 +52,24 @@ def main():
 
     l.debug(f'Connected to web3, chainId={w3.eth.chain_id}')
 
-    pg_host = os.getenv('PSQL_HOST', 'ethereum-measurement-pg')
-    pg_port = int(os.getenv('PSQL_PORT', '5432'))
-    pg_user = os.getenv('PSQL_USER', 'measure')
-    pg_pass = os.getenv('PSQL_PASS', 'password')
-    pg_db   = 'mainnet'
-    db_mainnet = psycopg2.connect(
-        host = pg_host,
-        port = pg_port,
-        user = pg_user,
-        password = pg_pass,
-        database = pg_db,
-    )
-    db.autocommit = False
-    l.debug(f'connected to postgresql (mainnet)')
+    if False:
+        # we have a separate DB with traces for mainnet, but we can also use geth directly
+        pg_host = os.getenv('PSQL_HOST', 'ethereum-measurement-pg')
+        pg_port = int(os.getenv('PSQL_PORT', '5432'))
+        pg_user = os.getenv('PSQL_USER', 'measure')
+        pg_pass = os.getenv('PSQL_PASS', 'password')
+        pg_db   = 'mainnet'
+        db_mainnet = psycopg2.connect(
+            host = pg_host,
+            port = pg_port,
+            user = pg_user,
+            password = pg_pass,
+            database = pg_db,
+        )
+        db.autocommit = False
+        l.debug(f'connected to postgresql (mainnet)')
+    else:
+        db_mainnet = None
 
     fill_txn_coinbase_transfers(w3, db, db_mainnet, args.id, args.n_workers)
 
@@ -77,7 +82,8 @@ def fill_txn_coinbase_transfers(
         n_workers: int,
     ):
     curr_mine = db_mine.cursor()
-    curr_mainnet = db_mainnet.cursor()
+    if db_mainnet is not None:
+        curr_mainnet = db_mainnet.cursor()
 
     curr_mine.execute(
         '''
@@ -93,13 +99,17 @@ def fill_txn_coinbase_transfers(
     blocks_to_process = sorted(x for (x,) in curr_mine)
 
     for block_number in blocks_to_process:
-        curr_mainnet.execute('SELECT miner FROM blocks WHERE block_number = %s', (block_number,))
-        if curr_mainnet.rowcount == 1:
-            assert curr_mainnet.rowcount == 1, f'expected to find one miner for block_number = {block_number}'
-            (miner,) = curr_mainnet.fetchone()
-        else:
+        miner = None
+        if curr_mainnet is not None:
+            curr_mainnet.execute('SELECT miner FROM blocks WHERE block_number = %s', (block_number,))
+            if curr_mainnet.rowcount == 1:
+                assert curr_mainnet.rowcount == 1, f'expected to find one miner for block_number = {block_number}'
+                (miner,) = curr_mainnet.fetchone()
+
+        if miner is None:
             block = w3.eth.get_block(block_number)
             miner = w3.toChecksumAddress(block['miner'])
+
         assert w3.isChecksumAddress(miner)
         bminer = bytes.fromhex(miner[2:])
         l.debug(f'block {block_number} was mined by {miner}')
@@ -119,23 +129,26 @@ def fill_txn_coinbase_transfers(
         arbs = [(aid, '0x' + txn_hash.tobytes().hex()) for aid, txn_hash in curr_mine]
         for arbitrage_id, txn_hash in arbs:
 
-            # use block_number so it can make use of the index ?          
-            curr_mainnet.execute('SELECT EXISTS(SELECT 1 FROM traces WHERE block_number = %s AND transaction_hash = %s)', (block_number, txn_hash,))
-            (has_txn,) = curr_mainnet.fetchone()
-            if has_txn == True:
-                curr_mainnet.execute(
-                    '''
-                    SELECT value
-                    FROM traces
-                    WHERE block_number = %s AND transaction_hash = %s AND receiver = %s
-                    ''',
-                    (block_number, txn_hash, miner),
-                )
+            xfer_amt = None
+            if db_mainnet is not None:
+                # use block_number so it can make use of the index ?          
+                curr_mainnet.execute('SELECT EXISTS(SELECT 1 FROM traces WHERE block_number = %s AND transaction_hash = %s)', (block_number, txn_hash,))
+                (has_txn,) = curr_mainnet.fetchone()
+                if has_txn == True:
+                    curr_mainnet.execute(
+                        '''
+                        SELECT value
+                        FROM traces
+                        WHERE block_number = %s AND transaction_hash = %s AND receiver = %s
+                        ''',
+                        (block_number, txn_hash, miner),
+                    )
 
-                xfer_amt = 0
-                for (v,) in curr_mainnet:
-                    xfer_amt += v
-            else:
+                    xfer_amt = 0
+                    for (v,) in curr_mainnet:
+                        xfer_amt += v
+
+            if xfer_amt is None:
                 assert has_txn == False
                 l.warning(f'Using backup call dumper')
                 resp = w3.provider.make_request('debug_traceTransaction', [txn_hash, {'tracer': 'callTracer'}])

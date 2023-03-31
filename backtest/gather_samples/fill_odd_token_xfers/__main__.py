@@ -34,7 +34,7 @@ def main():
 
     args = parser.parse_args()
 
-    setup_logging('fill_naive_gas_price', stdout_level=logging.DEBUG if args.verbose else logging.INFO)
+    setup_logging('fill_odd_token_xfers', stdout_level=logging.DEBUG if args.verbose else logging.INFO)
 
     db = connect_db()
     curr = db.cursor()
@@ -65,7 +65,6 @@ def main():
             SELECT id, txn_hash
             FROM sample_arbitrages
             WHERE %s <= block_number AND block_number <= %s
-                AND NOT EXISTS(SELECT FROM sample_arbitrage_false_positives WHERE sample_arbitrage_id = id)
             ''',
             (start_block, end_block),
         )

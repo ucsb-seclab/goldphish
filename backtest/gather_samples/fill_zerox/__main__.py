@@ -23,6 +23,8 @@ l = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-v', '--verbose', action='store_true', dest='verbose')
+    parser.add_argument('--v4', action='store_true', dest='v4')
+    parser.add_argument('--v3', action='store_true', dest='v3')
     parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
     parser.add_argument('--n-workers', type=int)
     parser.add_argument('--id', type=int)
@@ -61,13 +63,15 @@ def main():
     start_block, end_block = curr.fetchone()
     l.info(f'scraping from {start_block:,} to {end_block:,}')
 
-    assert args.id < args.n_workers
 
-    if args.id == 0:
-        if time.time() > 1668735514.6559494 + 60 * 60 * 24:
-            scrape_v3(w3, curr, start_block, end_block)
-    
-    scrape_v4(w3, curr, start_block, end_block, args.id, args.n_workers)
+    if args.v3:
+        scrape_v3(w3, curr, start_block, end_block)
+    elif args.v4:
+        assert args.id < args.n_workers
+        scrape_v4(w3, curr, start_block, end_block, args.id, args.n_workers)
+    else:
+        print('must supply --v4 or --v3')
+        exit(1)
 
 
 def setup_db(curr: psycopg2.extensions.cursor):
@@ -82,6 +86,7 @@ def setup_db(curr: psycopg2.extensions.cursor):
             ON sample_arbitrage_cycle_exchange_item_is_zerox (sample_arbitrage_cycle_exchange_item_id);
         '''
     )
+    curr.connection.commit()
 
 
 def scrape_v4(w3: web3.Web3, curr: psycopg2.extensions.cursor, start_block: int, end_block: int, id_: int, n_workers: int):

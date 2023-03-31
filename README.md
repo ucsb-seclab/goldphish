@@ -51,7 +51,7 @@ Let's configure it to allow more connections. Edit `YOUR_DATA_DIR_HERE/postgresq
 
 ```diff
 - max_connections = 100
-+ max_connections = 100
++ max_connections = 1000
 ...
 - shared_buffers = 128MB
 + shared_buffers = 512MB
@@ -179,7 +179,9 @@ docker run \
     --finalize
 ```
 
-Scrape arbitrages. This takes a while! We chose 50 workers. Be sure that you increased your postgresql connections.
+## Scrape arbitrages.
+
+This takes a while! We chose 50 workers. Be sure that you increased your postgresql connections.
 
 ```bash
 docker run \
@@ -208,3 +210,168 @@ docker run \
     goldphish \
     python3 tmp_eta_gather.py
 ```
+
+## Load flashbots transactions
+
+This scrapes flashbots transaction from their server.
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.load_flashbots
+```
+
+We scrape linearly in time. Since activity is greater as time goes on, expect the ETA to grow as blocks per second slows. This is a common issue with linear scans.
+
+
+It should take about 5 hours. This could probably be made faster by varying the http request batch sizes a bit smarter.
+
+## Attribute exchanges to 0x
+
+We need to figure out which exchanges were, in fact, 0x exchanges. This needs to be run twice, first for v3, then for v4.
+
+First, v3 (should take about 30min - 1 hour):
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_zerox --v3
+```
+
+Then, v4 (NOTE: This is parallelized, so a bit faster. we picked 50 workers.):
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_many_fill_zerox.sh \
+    $N_WORKERS
+```
+
+## Fill back-runners
+
+Do transaction re-ordering to determine who was backrunning. First, setup db:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_backrunners --setup-db
+```
+
+Then, do the reordering. This is parallelized -- will take a while!
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_many_backrunner_detect.sh \
+    $N_WORKERS
+```
+
+You can watch the ETA here:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    goldphish \
+    python3 tmp_eta_fill_backrunner.py
+```
+
+## Compute the table of false-positives
+
+Setup some tables:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_odd_token_xfers --setup-db
+```
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_odd_token_xfers --setup-db
+```
+
+Fill odd token transfer table (mistaken NFTs)
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_many_fill_odd_tokens.sh \
+    $N_WORKERS
+```
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_false_positive
+```
+
+## Scrape direct-to-miner coinbase transfers
+
+Setup DB:
+
+## Compute naive gas-price oracle
+
+First, set-up the database
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_naive_gas_price --setup-db
+```
+
+Then, run the job (NOTE: this is parallelized).
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_many_gas_price_fill.sh \
+    $N_WORKERS
+```
+

@@ -36,7 +36,7 @@ DEBUG = False
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--fill', action='store_true', help='fill the work queue', dest='fill')
+    parser.add_argument('--setup-db', action='store_true', dest='setup_db')
     parser.add_argument('-v', '--verbose', action='store_true', dest='verbose')
     parser.add_argument('--worker-name', type=str, default=None, help='worker name for log, must be POSIX path-safe')
     args = parser.parse_args()
@@ -134,8 +134,8 @@ def main():
 
     ganache_proc = None
     try:
-        setup_db(curr)
-        if args.fill:
+        if args.setup_db:
+            setup_db(curr)
             fill_queue(curr)
         else:
             ganache_proc, ganache_w3 = open_ganache()
@@ -177,14 +177,6 @@ def setup_db(curr: psycopg2.extensions.cursor):
         '''
     )
     curr.connection.commit()
-
-    # see if we need to fill queue    
-    curr.execute('SELECT count(*) FROM backrun_detection_reservations')
-
-
-    (n_rows,) = curr.fetchone()
-    if n_rows == 0:
-        l.warning('Queue not created. Please run the fill procedure.')
 
 
 def fill_queue(curr: psycopg2.extensions.cursor):
