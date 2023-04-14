@@ -3,7 +3,7 @@
 # utility for spawning a whole bunch of relayers
 N_WORKERS=$1
 
-echo "[*] spawning many top candidate arbitrage seekers";
+echo "[*] spawning many top candidate arbitrage fillers";
 
 if [[ "$PREFIX" -ne '' ]];
 then

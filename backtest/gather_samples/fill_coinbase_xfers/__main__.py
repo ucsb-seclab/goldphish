@@ -3,14 +3,13 @@ import logging
 import os
 import socket
 import time
-from tkinter import N
 import psycopg2
 import psycopg2.extensions
 
 import web3
 from backtest.utils import connect_db
 
-from utils import setup_logging
+from utils import setup_logging, connect_web3
 
 
 l = logging.getLogger(__name__)
@@ -31,20 +30,14 @@ def main():
     job_name = 'fill_coinbase_xfers'
 
 
-    setup_logging(job_name, worker_name = args.worker_name, root_dir='/data/robert/ethereum-arb/storage')
+    setup_logging(job_name, worker_name = args.worker_name)
 
     db = connect_db()
     curr = db.cursor()
 
     web3_host = os.getenv('WEB3_HOST', 'ws://172.17.0.1:8546')
 
-    w3 = web3.Web3(web3.WebsocketProvider(
-        web3_host,
-        websocket_timeout=60 * 5,
-        websocket_kwargs={
-            'max_size': 1024 * 1024 * 1024, # 1 Gb max payload
-        },
-    ))
+    w3 = connect_web3()
 
     if not w3.isConnected():
         l.error(f'Could not connect to web3')
@@ -100,7 +93,7 @@ def fill_txn_coinbase_transfers(
 
     for block_number in blocks_to_process:
         miner = None
-        if curr_mainnet is not None:
+        if db_mainnet is not None:
             curr_mainnet.execute('SELECT miner FROM blocks WHERE block_number = %s', (block_number,))
             if curr_mainnet.rowcount == 1:
                 assert curr_mainnet.rowcount == 1, f'expected to find one miner for block_number = {block_number}'
@@ -149,9 +142,7 @@ def fill_txn_coinbase_transfers(
                         xfer_amt += v
 
             if xfer_amt is None:
-                assert has_txn == False
-                l.warning(f'Using backup call dumper')
-                resp = w3.provider.make_request('debug_traceTransaction', [txn_hash, {'tracer': 'callTracer'}])
+                resp = w3.provider.make_request('debug_traceTransaction', [txn_hash, {'tracer': 'callTracer', 'timeout': '5m'}])
 
                 xfer_amt = 0
                 queue = [resp['result']]

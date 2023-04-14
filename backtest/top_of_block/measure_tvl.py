@@ -44,6 +44,9 @@ def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.
 def measure_tvl(w3: web3.Web3, args: argparse.Namespace):
     l.info('Starting TVL measurement')
 
+    l.warning('This script is not yet implemented. Exiting.')
+    exit(1)
+
     db = connect_db()
     curr = db.cursor()
 

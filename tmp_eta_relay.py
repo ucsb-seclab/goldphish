@@ -6,7 +6,7 @@ from backtest.utils import connect_db
 db = connect_db()
 curr = db.cursor()
 
-TARGET_PRIORITY = 39
+TARGET_PRIORITY = 30
 
 curr.execute(
     '''

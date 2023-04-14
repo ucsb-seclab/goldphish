@@ -71,24 +71,6 @@ def do_fill_duration(w3: web3.Web3, args: argparse.Namespace):
         return
 
     if args.fill_modified:
-        # curr.execute(
-        #     '''
-        #     SELECT COUNT(*)
-        #     FROM (
-        #         SELECT distinct block_number
-        #         FROM exchanges_updated_in_block eub
-        #         WHERE EXISTS(SELECT FROM balancer_exchanges be WHERE be.address = eub.exchange_address) OR
-        #             EXISTS(SELECT FROM balancer_v2_exchanges be WHERE be.address = eub.exchange_address)
-        #     ) a
-        #     '''
-        # )
-        # (n_blocks_balancer_update,) = curr.fetchone()
-
-        # curr.execute('SELECT MIN(start_block), MAX(end_block) FROM block_samples')
-        # start_block, end_block = curr.fetchone()
-
-        # l.info(f'Have {n_blocks_balancer_update:,} blocks with a Balancer update ({n_blocks_balancer_update / (end_block - start_block + 1) * 100:.2f}%)')
-        # exit()
         assert args.id >= 0 and args.n_workers > 0 and args.id < args.n_workers
         fill_modified_exchanges(w3,args, curr)
         return
@@ -746,12 +728,14 @@ def fill_modified_exchanges(w3: web3.Web3, args: argparse.Namespace, curr: psyco
     BATCH_SIZE = 200
 
     with tempfile.TemporaryDirectory(dir='/mnt/goldphish/tmp') as tmpdir:
-        pool = load_pool(w3, curr, tmpdir, ___limit_to_balancer = True)
+        pool = load_pool(w3, curr, tmpdir)
         pool.warm(our_slice_start - 1)
         l.info(f'Warmed pool, starting....')
 
         t_start = time.time()
         t_last_update = time.time()
+
+        balancer_rows = []
 
         for i in itertools.count():
             batch_start = our_slice_start + BATCH_SIZE * i
@@ -776,7 +760,6 @@ def fill_modified_exchanges(w3: web3.Web3, args: argparse.Namespace, curr: psyco
             logs = get_relevant_logs(w3, pool, batch_start, batch_end)
 
             for block_number, block_logs in logs:
-                n_balancer_updates = 0
                 update = pool.observe_block(block_number, block_logs)
                 reverse_update = collections.defaultdict(lambda: []) # lazy-filled later
                 updated_exchanges = set().union(*update.values())
@@ -794,48 +777,58 @@ def fill_modified_exchanges(w3: web3.Web3, args: argparse.Namespace, curr: psyco
                         
                         inserted_pairs = set()
                         for pair in reverse_update[updated]:
+                            # order the pair
                             b1, b2 = (bytes.fromhex(pair[0][2:]), bytes.fromhex(pair[1][2:]))
                             if b1 > b2:
                                 pair = (pair[1], pair[0])
 
                             # avoid inserting dupes
+                            # - is this necessary?
                             if pair in inserted_pairs:
                                 continue
                             inserted_pairs.add(pair)
 
-                            t1_id = get_token(w3, curr, pair[0], block_number).id
-                            t2_id = get_token(w3, curr, pair[1], block_number).id
+                            balancer_rows.append((block_number, updated, pair[0], pair[1]))
 
-                            curr.execute(
-                                '''
-                                INSERT INTO balancer_tokens_updated_in_block (block_number, exchange_address, token1_id, token2_id)
-                                VALUES (%(block_number)s, %(exchange_address)s, %(t1_id)s, %(t1_id)s)
-                                ''',
-                                {
-                                    'block_number':     block_number,
-                                    'exchange_address': bytes.fromhex(updated[2:]),
-                                    't1_id': t1_id,
-                                    't2_id': t2_id,
-                                }
-                            )
-                            assert curr.rowcount == 1, f'Potentially did not find one of tokens {pair}'
-                            n_balancer_updates += 1
+                    curr.execute(
+                        '''
+                        INSERT INTO exchanges_updated_in_block (block_number, exchange_address)
+                        VALUES (%s, %s)
+                        ''',
+                        (
+                            block_number,
+                            bytes.fromhex(updated[2:]),
+                        )
+                    )
 
-                    # curr.execute(
-                    #     '''
-                    #     INSERT INTO exchanges_updated_in_block (block_number, exchange_address)
-                    #     VALUES (%s, %s)
-                    #     ''',
-                    #     (
-                    #         block_number,
-                    #         bytes.fromhex(updated[2:]),
-                    #     )
-                    # )
-                if n_balancer_updates > 0:
-                    l.debug(f'block {block_number:,} had {n_balancer_updates:,} balancer token updates inserted')
+        l.info(f'Inserting {len(balancer_rows)} balancer rows')
+        if not DEBUG:
+            curr.connection.commit()
+        curr.execute('LOCK TABLE balancer_tokens_updated_in_block')
+        l.debug('Locked table')
 
-    if not DEBUG:
-        curr.connection.commit()
+        # build the list of rows to insert
+        rows = []
+        for block_number, updated, t1, t2 in balancer_rows:
+            t1_id = get_token(w3, curr, t1, block_number).id
+            t2_id = get_token(w3, curr, t2, block_number).id
+
+            rows.append((block_number, bytes.fromhex(updated[2:]), t1_id, t2_id))
+
+        # insert the rows
+        psycopg2.extras.execute_values(
+            curr,
+            '''
+            INSERT INTO balancer_tokens_updated_in_block (block_number, exchange_address, token1_id, token2_id)
+            VALUES %s
+            ''',
+            rows,
+        )
+
+        l.info('Inserting done')
+        if not DEBUG:
+            curr.connection.commit()
+
     l.info('Done')
 
 
@@ -878,7 +871,7 @@ def setup_db(
         CREATE INDEX IF NOT EXISTS idx_candidate_arbitrage_campaigns_bne ON candidate_arbitrage_campaigns (block_number_end);
 
         CREATE TABLE IF NOT EXISTS candidate_arbitrage_campaign_member (
-            candidate_arbitrage_id       BIGINTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
+            candidate_arbitrage_id       BIGINT NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
             candidate_arbitrage_campaign INTEGER NOT NULL REFERENCES candidate_arbitrage_campaigns (id) ON DELETE CASCADE,
             profit_after_fee_wei         NUMERIC(78, 0) NOT NULL
         );

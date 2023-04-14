@@ -27,8 +27,6 @@ def add_args(subparser: argparse._SubParsersAction) -> typing.Tuple[str, typing.
 
     parser.add_argument('--setup-db', action='store_true', help='Setup the database (before run)')
 
-    parser.add_argument('--fill-samples', type=bool, help='fill top sample arbitrages (step 1)')
-
     parser.add_argument('--id', type=int, help='worker id, required for processing', default=0)
     parser.add_argument('--n-workers', type=int, help='number of workers', default=1)
 

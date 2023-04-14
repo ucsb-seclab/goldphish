@@ -111,7 +111,7 @@ def get_token(
                 assert curr.rowcount == 1
                 id_, name, symbol = curr.fetchone()
             else:
-                # we won the race
+                # we (maybe) won the race
                 name, symbol = _get_name_and_symbol(w3, token_address, block_identifier)
                 curr.execute(
                     '''

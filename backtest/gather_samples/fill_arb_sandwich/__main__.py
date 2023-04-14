@@ -36,7 +36,7 @@ def main():
     if args.worker_name is None:
         args.worker_name = socket.gethostname()
     job_name = 'fill_sandwich'
-    setup_logging(job_name, worker_name = args.worker_name, root_dir='/data/robert/ethereum-arb/storage')
+    setup_logging(job_name, worker_name = args.worker_name)
 
     db = connect_db()
     curr = db.cursor()

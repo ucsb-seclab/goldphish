@@ -109,9 +109,9 @@ def relay(w3: web3.Web3, args: argparse.Namespace):
 
     if args.setup_db:
         setup_db(curr)
-        # fill_relay_queue(curr)
-        # fill_relay_top_arbs_queue(curr)
-        input('commit?')
+        fill_relay_queue(curr)
+        fill_relay_top_arbs_queue(curr)
+        # input('commit?')
         db.commit()
         return
 
@@ -434,9 +434,6 @@ def process_reservation(
         ((id_, False, reason) for id_, reason in results_failure.items()),
     )
 
-    if len(results_success) > 0:
-        l.critical('Had success??????????????? weird!!!!!!!!!')
-
     # assign IDs to all the tokens fees we just inferred
     inferred_fee_with_ids: typing.Dict[TokenFee, TokenFee] = {}
     for success in results_success.values():
@@ -658,19 +655,19 @@ def setup_db(curr: psycopg2.extensions.cursor):
         CREATE INDEX IF NOT EXISTS idx_top_candidate_arbitrage_reservations ON top_candidate_arbitrage_reservations (claimed_on);
 
         CREATE TABLE IF NOT EXISTS candidate_arbitrage_relay_results (
-            candidate_arbitrage_id BIGINTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
+            candidate_arbitrage_id BIGINT NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
             shoot_success          BOOLEAN NOT NULL,
             failure_reason         TEXT,
             gas_used               INTEGER CHECK ((shoot_success = true and gas_used is not null) OR (shoot_success = false and gas_used is null)),
             had_fee_on_xfer_token  BOOLEAN,
-            real_profit_before_fee NUMERIC(78, 0) NOT NULL
+            real_profit_before_fee NUMERIC(78, 0)
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_arbitrage_relay_results_candidate_arbitrage_id ON candidate_arbitrage_relay_results (candidate_arbitrage_id);
         CREATE INDEX IF NOT EXISTS idx_candidate_arbitrage_relay_results_shoot_success ON candidate_arbitrage_relay_results (shoot_success);
 
         CREATE TABLE IF NOT EXISTS candidate_arbitrage_relay_results_used_fees (
-            candidate_arbitrage_id BIGINTEGER NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
+            candidate_arbitrage_id BIGINT NOT NULL REFERENCES candidate_arbitrages (id) ON DELETE CASCADE,
             fee_used               INTEGER NOT NULL REFERENCES inferred_token_fee_on_transfer (id) ON DELETE CASCADE
         );
 
@@ -1765,6 +1762,10 @@ def relay_top_arbs_in_range(
         (reservation_start_block,)
     )
     (lowest_block_with_large_arb,) = curr.fetchone()
+    if lowest_block_with_large_arb is None:
+        l.info('no large arbitrages in this reservation, done')
+        return
+
     l.info(f'starting at block {lowest_block_with_large_arb:,}')
 
     curr.execute('SELECT MAX(end_block) FROM block_samples')

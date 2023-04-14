@@ -657,7 +657,7 @@ def process_candidates(
             continue
 
         if False:
-            # some debugging
+            # this is for debugging
             exchange_outs = {}
             amount = p.amount_in
             for exc, (token_in, token_out) in zip(p.circuit, p.directions):
@@ -694,10 +694,10 @@ def process_candidates(
 
 
         # this is potentially profitable, log as a candidate
+        dxns = [bytes.fromhex(t[2:]) for t, _ in p.directions]
 
         # ONLY IF IT DOESNT EXIST ALREADY
         if TMP_REMOVE_ME_FOR_FIXUP_ONLY:
-            dxns = [bytes.fromhex(t[2:]) for t, _ in p.directions]
             curr.execute(
                 '''
                 SELECT EXISTS(

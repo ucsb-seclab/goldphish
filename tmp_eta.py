@@ -40,6 +40,8 @@ while True:
 
     curr.execute('select sum(progress - block_number_start + 1) from candidate_arbitrage_reservations where progress is not null and claimed_on is not null')
     (n_blocks,) = curr.fetchone()
+    if n_blocks is None:
+        n_blocks = 0
     last_marks.append(n_blocks)
     last_ts.append(time.time())
     last_marks = last_marks[-1000:]

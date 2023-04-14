@@ -259,9 +259,24 @@ docker run \
     $N_WORKERS
 ```
 
+## Scrape direct-to-miner coinbase transfers
+
+NOTE: This will take a LONG time!
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_fill_coinbase_xfer.sh \
+    $N_WORKERS
+```
+
 ## Fill back-runners
 
-Do transaction re-ordering to determine who was backrunning. First, setup db:
+Do transaction re-ordering to determine who was backrunning. First, setup db and fill the work queue:
 
 ```bash
 docker run \
@@ -273,7 +288,7 @@ docker run \
     python3 -m backtest.gather_samples.fill_backrunners --setup-db
 ```
 
-Then, do the reordering. This is parallelized -- will take a while!
+Then, do the reordering. This is parallelized -- will take a while! You might want to spawn more workers on more machines. If you do that, be sure to specify the postgresql host/port as an environment variable (see section "Scrape Arbitrages").
 
 ```bash
 docker run \
@@ -344,10 +359,6 @@ docker run \
     python3 -m backtest.gather_samples.fill_false_positive
 ```
 
-## Scrape direct-to-miner coinbase transfers
-
-Setup DB:
-
 ## Compute naive gas-price oracle
 
 First, set-up the database
@@ -375,3 +386,208 @@ docker run \
     $N_WORKERS
 ```
 
+## Find arbitrages used in sandwich-attacks
+
+First, set-up the database
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.gather_samples.fill_arb_sandwich --setup-db
+```
+
+Run the scrape:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_fill_arb_sandwich.sh \
+    $N_WORKERS
+```
+
+You can view the ETA here:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    goldphish \
+    python3 tmp_eta_fill_arb_sandwich.py
+```
+
+## Scrape for candidate arbitrages
+
+THIS TAKES A LONG TIME!
+
+Run the historical arbitrage opportunity search algorithm. You will likely need to have several hundred workers across several machines. We find that each worker will peg a CPU core -- ie, this is CPU-bound, so adding many more workers than CPU cores is not recommended.
+
+About 500 workers should finish the job in about under 1 month.
+
+Set up the job:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.top_of_block seek-candidates --setup-db
+```
+
+And run the job. Here we show explicitly how to set the postgresql host IP and port number. This is not necessary if you are on the same docker network as the database (then defaults work fine).
+One can request cancellation of work by sending SIGHUP to the worker python processes, each worker should cleanly stop its current work unit and break off any remaining work into a new unit.
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    -e PSQL_PORT=5041 \
+    -e PSQL_HOST=XXX.XXX.XXX.XXX \
+    goldphish \
+    ./spawn_many_searchers.sh \
+    $N_WORKERS
+```
+
+You can view the ETA here. Note that some warm-up time is required before the ETA computation works.
+During the start, the ETA will slowly rise, as the easier (early-history) blocks are processed.
+ETA will also under-estimate time remaining toward the end of the run, as the parallelism decreases because no work-units remain.
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    goldphish \
+    python3 tmp_eta.py
+```
+
+## Fill table with top candidate arbitrages
+
+Set up database:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.top_of_block fill-top-arbs --setup-db
+```
+
+Run the fill:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_many_fill_top_arbitrages.sh \
+    $N_WORKERS
+```
+
+## Execute arbitrages
+
+This executes the candidate arbitrages, to check profitability. Takes quite a while!
+
+This has two modes: 'all' and 'top arbitrages'. The 'all' mode runs arbitrages in order of decreasing priority. Priority was determined when generating block samples (a few steps back), and is a shuffle of the blockchain broken into day-long segments. This facilitates random sampling, presuming (and I do) that you do not have time to execute the entire thing. 'Top arbitrages' mode will relay all of the _large_ arbitrages.
+
+
+Setup DB
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.top_of_block do-relay --setup-db
+```
+
+Run 'all'
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_many_relayers.sh \
+    $N_WORKERS
+```
+
+Watch the ETA at:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    goldphish \
+    python3 tmp_eta_relay.py
+```
+
+Run 'top arbitrages'. First, we need to fill this record of exchange modification history.
+
+To do that, first set-up the db:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    python3 -m backtest.top_of_block do-arb-duration --setup-db
+```
+
+Then do the run:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_many_fill_modifications.sh \
+    $N_WORKERS
+```
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    -e WEB3_HOST=ws://$GETH_NODE \
+    goldphish \
+    ./spawn_many_relay_top_arbs.sh \
+    $N_WORKERS
+```
+
+Watch the ETA at:
+
+```bash
+docker run \
+    --rm -t \
+    --network ethereum-measurement-net \
+    -v $STORAGE_DIR:/mnt/goldphish \
+    goldphish \
+    python3 tmp_eta_relay_top_arbs.py
+```
