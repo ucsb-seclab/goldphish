@@ -3,6 +3,19 @@
 Goldphish is an arbitrage analyzer for the ethereum blockchain.
 
 
+# Overview
+
+The entrypoints into this project are largely broken into two parts:
+
+1. Historical scrape of performed arbitrages -- found in `backtest/gather_samples`
+2. Arbitrage seeking through history -- found in `backtest/top_of_block`
+
+Models for the exchanges are in `pricers/`.
+
+The transaction relayer smart contract is in `contracts/`.
+
+The optimization procedure is in `find_circuit/find.py`.
+
 # Building
 
 This system is dockerized.
